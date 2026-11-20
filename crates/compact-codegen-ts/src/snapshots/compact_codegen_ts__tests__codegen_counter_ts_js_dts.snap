@@ -1,0 +1,158 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+import CompactStandardLibrary;
+
+export ledger round: Counter;
+
+export circuit increment(): [] {
+  round.increment(1);
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	increment(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	increment(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {
+	readonly round: bigint;
+};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return { round: __compactRuntime.decodeCounter(state, 0) };
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = { increment: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			return {
+				result: [],
+				context
+			};
+		} };
+		this.circuits = { increment: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			return {
+				result: [],
+				context
+			};
+		} };
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return { round: __compactRuntime.decodeCounter(state, 0) };
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = { increment: (context) => {
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			return {
+				result: [],
+				context
+			};
+		} };
+		this.circuits = { increment: (context) => {
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			return {
+				result: [],
+				context
+			};
+		} };
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	increment(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	increment(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {
+	readonly round: bigint;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}

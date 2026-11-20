@@ -1,0 +1,25 @@
+---
+source: crates/compact-parser/src/lib.rs
+---
+// Counter example
+import CompactStandardLibrary;
+
+export ledger round: Counter;
+
+export circuit increment(): [] {
+  round.increment(1);
+}
+===
+Program
+  ImportDecl CompactStandardLibrary
+  LedgerDecl [export] round
+    TypeNamed Counter
+  CircuitDecl [export] increment
+    ReturnType
+      TypeTuple
+    Block
+      ExprStmt
+        CallExpr
+          MemberExpr .increment
+            IdentExpr round
+          IntLitExpr 1

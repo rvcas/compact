@@ -1,0 +1,23 @@
+[package]
+name = "compact-driver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-artifacts.workspace = true
+compact-ast.workspace = true
+compact-circuit.workspace = true
+compact-codegen-ts.workspace = true
+compact-codegen-zkir.workspace = true
+compact-diagnostics.workspace = true
+compact-fmt.workspace = true
+compact-hir.workspace = true
+compact-parser.workspace = true
+compact-span.workspace = true
+miette.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

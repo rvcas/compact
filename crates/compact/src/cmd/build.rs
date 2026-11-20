@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use miette::miette;
+use compact_driver::BuildOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct BuildArgs {
@@ -23,9 +23,11 @@ impl BuildArgs {
 }
 
 pub fn build(args: BuildArgs) -> miette::Result<()> {
-    Err(miette!(
-        "build is not yet implemented (source: {}, target: {})",
-        args.source.display(),
-        args.target.display()
-    ))
+    compact_driver::build(&BuildOptions {
+        source: args.source,
+        target: args.target,
+        skip_zk: args.skip_zk,
+    })?;
+
+    Ok(())
 }

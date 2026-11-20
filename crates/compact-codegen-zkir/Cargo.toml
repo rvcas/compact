@@ -1,0 +1,22 @@
+[package]
+name = "compact-codegen-zkir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-circuit.workspace = true
+hex.workspace = true
+midnight-base-crypto.workspace = true
+midnight-serialize.workspace = true
+midnight-transient-crypto.workspace = true
+midnight-zkir.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+compact-hir.workspace = true
+compact-parser.workspace = true
+compact-span.workspace = true
+compact-test-utils.workspace = true

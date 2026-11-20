@@ -7,6 +7,44 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-clap = "4.6"
-miette = "7.6"
+# Internal crates
+compact-artifacts = { path = "crates/compact-artifacts" }
+compact-ast = { path = "crates/compact-ast" }
+compact-circuit = { path = "crates/compact-circuit" }
+compact-codegen-ts = { path = "crates/compact-codegen-ts" }
+compact-codegen-zkir = { path = "crates/compact-codegen-zkir" }
+compact-diagnostics = { path = "crates/compact-diagnostics" }
+compact-driver = { path = "crates/compact-driver" }
+compact-fmt = { path = "crates/compact-fmt" }
+compact-hir = { path = "crates/compact-hir" }
+compact-parser = { path = "crates/compact-parser" }
+compact-span = { path = "crates/compact-span" }
+compact-test-utils = { path = "crates/compact-test-utils" }
 
+# External dependencies
+clap = "4.6"
+hex = "0.4"
+indoc = "2.0"
+insta = "1.49"
+miette = "7.6"
+midnight-base-crypto = "1.1"
+midnight-serialize = "1.2"
+midnight-transient-crypto = "3.1"
+midnight-zkir = { git = "https://github.com/midnightntwrk/midnight-zkir.git", tag = "zkir-3.2.1" }
+oxc_allocator = "0.158"
+oxc_ast = "0.158"
+oxc_codegen = "0.158"
+oxc_isolated_declarations = "0.158"
+oxc_semantic = "0.158"
+oxc_span = "0.158"
+oxc_str = "0.158"
+oxc_syntax = "0.158"
+oxc_transformer = "0.158"
+rayon = "1.11"
+serde = "1.0"
+serde_json = "1.0"
+sha2 = "0.11"
+soa-rs = "1.0"
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = "1"

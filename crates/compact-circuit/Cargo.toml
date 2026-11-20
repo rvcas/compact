@@ -1,0 +1,8 @@
+[package]
+name = "compact-circuit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-hir.workspace = true
+compact-span.workspace = true

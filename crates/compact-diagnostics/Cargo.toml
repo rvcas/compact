@@ -1,0 +1,9 @@
+[package]
+name = "compact-diagnostics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-span.workspace = true
+miette.workspace = true
+thiserror.workspace = true

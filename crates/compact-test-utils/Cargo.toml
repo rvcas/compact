@@ -1,0 +1,8 @@
+[package]
+name = "compact-test-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indoc.workspace = true
+insta.workspace = true

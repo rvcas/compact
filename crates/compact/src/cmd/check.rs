@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use miette::miette;
+use compact_driver::CheckOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct CheckArgs {
@@ -16,8 +16,9 @@ impl CheckArgs {
 }
 
 pub fn check(args: CheckArgs) -> miette::Result<()> {
-    Err(miette!(
-        "check is not yet implemented (source: {})",
-        args.source.display()
-    ))
+    compact_driver::check(&CheckOptions {
+        source: args.source,
+    })?;
+
+    Ok(())
 }

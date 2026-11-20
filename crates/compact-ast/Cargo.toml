@@ -1,0 +1,8 @@
+[package]
+name = "compact-ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-span.workspace = true
+soa-rs.workspace = true

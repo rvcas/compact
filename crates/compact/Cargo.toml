@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+compact-driver.workspace = true
 miette = { workspace = true, features = ["fancy"] }

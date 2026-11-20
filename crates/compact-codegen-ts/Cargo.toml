@@ -1,0 +1,22 @@
+[package]
+name = "compact-codegen-ts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compact-hir.workspace = true
+compact-span.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_codegen.workspace = true
+oxc_isolated_declarations.workspace = true
+oxc_semantic.workspace = true
+oxc_span.workspace = true
+oxc_str.workspace = true
+oxc_syntax.workspace = true
+oxc_transformer.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+compact-parser.workspace = true
+compact-test-utils.workspace = true

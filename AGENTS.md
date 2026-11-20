@@ -32,7 +32,8 @@ Engineering guide for porting the Compact compiler toolchain from Chez Scheme (`
   - Use `clap` for CLI parsing across `compactc`, `format`, and `fixup`.
   - CLI command handlers must be thin wrappers that call directly into testable library functions.
 - **Diagnostics (`miette`):**
-  - Use `miette` for rendering compiler errors, warnings, and source spans.
+  - Use `miette` for rendering compiler errors, warnings, and source spans (`#[derive(miette::Diagnostic)]` on structured diagnostic/error types).
+  - Keep `miette::Result` strictly at the CLI boundary (`crates/compact`). Library crates must return concrete typed `thiserror` error enums or `DiagnosticBag`.
 - **Progress / Status Output:**
   - Implement Cargo-style status/progress line printing (e.g., phase/file progress) as a separate concern from `miette` diagnostic rendering.
 

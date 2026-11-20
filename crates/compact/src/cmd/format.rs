@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use miette::miette;
+use compact_driver::FormatFileOptions;
 
 use super::DEFAULT_LINE_LENGTH;
 
@@ -25,8 +25,17 @@ impl FormatArgs {
 }
 
 pub fn format(args: FormatArgs) -> miette::Result<()> {
-    Err(miette!(
-        "format is not yet implemented (source: {})",
-        args.source.display()
-    ))
+    let write_stdout = args.target.is_none();
+
+    let formatted = compact_driver::format_file(&FormatFileOptions {
+        source: args.source,
+        target: args.target,
+        line_length: args.line_length,
+    })?;
+
+    if write_stdout {
+        print!("{formatted}");
+    }
+
+    Ok(())
 }

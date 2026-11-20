@@ -1,0 +1,21 @@
+---
+source: crates/compact-parser/src/lib.rs
+---
+export circuit add(a: Field, b: Field): Field {
+  return a + b;
+}
+===
+Program
+  CircuitDecl [export] add
+    Params
+      Param a
+        TypeNamed Field
+      Param b
+        TypeNamed Field
+    ReturnType
+      TypeNamed Field
+    Block
+      ReturnStmt
+        BinaryExpr +
+          IdentExpr a
+          IdentExpr b

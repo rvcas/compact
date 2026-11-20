@@ -1,0 +1,16 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+// Counter contract
+import   CompactStandardLibrary ;
+export  ledger   round : Counter ;
+export circuit increment( ):[]{round.increment( 1 );}
+===
+// Counter contract
+import CompactStandardLibrary;
+
+export ledger round: Counter;
+
+export circuit increment(): [] {
+  round.increment(1);
+}
