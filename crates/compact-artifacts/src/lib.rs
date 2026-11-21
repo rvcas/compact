@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use compact_hir::{LedgerAdt, Program, Type};
+use compact_hir::{LedgerAdt, LedgerField, Program, Type};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -55,7 +55,7 @@ struct LedgerFieldInfo {
     ty: Value,
 }
 
-fn type_to_json(ty: &Type) -> Value {
+fn type_to_json(program: &Program, ty: &Type) -> Value {
     let mut map = Map::new();
     match ty {
         Type::Field => {
@@ -72,11 +72,31 @@ fn type_to_json(ty: &Type) -> Value {
             map.insert("type-name".into(), Value::String("Tuple".into()));
             map.insert(
                 "types".into(),
-                Value::Array(elems.iter().map(type_to_json).collect()),
+                Value::Array(elems.iter().map(|e| type_to_json(program, e)).collect()),
             );
         }
-        Type::Adt(LedgerAdt::Counter) => {
+        Type::Enum(id) => {
+            let decl = program.enum_decl(*id);
+            map.insert("type-name".into(), Value::String("Enum".into()));
+            map.insert("name".into(), Value::String(decl.name.clone()));
+            map.insert(
+                "elements".into(),
+                Value::Array(decl.variants.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+    Value::Object(map)
+}
+
+fn ledger_field_type_to_json(program: &Program, field: &LedgerField) -> Value {
+    let mut map = Map::new();
+    match field.adt {
+        LedgerAdt::Counter => {
             map.insert("type-name".into(), Value::String("Counter".into()));
+        }
+        LedgerAdt::Cell => {
+            map.insert("type-name".into(), Value::String("Cell".into()));
+            map.insert("type".into(), type_to_json(program, &field.value_type));
         }
     }
     Value::Object(map)
@@ -97,10 +117,10 @@ pub fn render_contract_info(program: &Program) -> String {
                 .iter()
                 .map(|p| ArgInfo {
                     name: p.name.clone(),
-                    ty: type_to_json(&p.ty),
+                    ty: type_to_json(program, &p.ty),
                 })
                 .collect(),
-            result_type: type_to_json(&c.ret_type),
+            result_type: type_to_json(program, &c.ret_type),
         })
         .collect();
 
@@ -111,7 +131,7 @@ pub fn render_contract_info(program: &Program) -> String {
             name: f.name.clone(),
             exported: f.exported,
             sealed: f.sealed,
-            ty: type_to_json(&f.ty),
+            ty: ledger_field_type_to_json(program, f),
         })
         .collect();
 
@@ -189,8 +209,8 @@ fn dir_entry(dir: &Path) -> std::io::Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use compact_hir::lower;
     use compact_parser::parse;
+    use compact_sema::check;
     use compact_span::SourceMap;
     use compact_test_utils::assert_compact_snapshot;
 
@@ -202,9 +222,9 @@ mod tests {
         let file = sm.get(id);
         let parsed = parse(file);
         assert!(!parsed.diagnostics.has_errors());
-        let lowered = lower(file, &parsed.ast);
-        assert!(!lowered.diagnostics.has_errors());
-        render_contract_info(&lowered.program)
+        let checked = check(file, &parsed.ast);
+        assert!(!checked.diagnostics.has_errors());
+        render_contract_info(&checked.program)
     }
 
     #[test]

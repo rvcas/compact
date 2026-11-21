@@ -1,17 +1,17 @@
 use std::fmt::Write as _;
-use std::sync::Arc;
 
-use compact_circuit::{CircuitInstr, ProofCircuit};
+use compact_circuit::{CircuitInstr, CircuitVal, CircuitVar, ProofCircuit};
 use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use midnight_serialize::tagged_serialize;
-use midnight_transient_crypto::curve::Fr;
 use midnight_transient_crypto::proofs::Zkir;
-use midnight_zkir::ir::{Instruction, IrMinorVersion, IrSource, Operand};
+use midnight_zkir::IrSource;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ZkirError {
+    #[error("failed to load generated ZKIR for circuit `{circuit}`: {message}")]
+    LoadIr { circuit: String, message: String },
     #[error("failed to serialize bzkir for circuit `{circuit}`: {message}")]
     SerializeBzkir { circuit: String, message: String },
     #[error("failed to initialize Midnight data provider: {0}")]
@@ -51,36 +51,15 @@ pub struct CircuitModelSummary {
     pub rows: usize,
 }
 
-/// Lower a flattened proof circuit into Midnight's native [`IrSource`], canonical
-/// `.zkir` JSON, and tagged `.bzkir` bytes.
+/// Lower a flattened proof circuit into canonical `.zkir` v3.1 JSON, validate and
+/// hydrate Midnight's native [`IrSource`], and produce tagged `.bzkir` bytes.
 pub fn generate_zkir(circuit: &ProofCircuit) -> Result<GeneratedZkir, ZkirError> {
-    let mut instructions = Vec::with_capacity(circuit.instructions.len());
-    for instr in &circuit.instructions {
-        match instr {
-            CircuitInstr::Impact { guard, op } => {
-                let guard_op = Operand::Immediate(Fr::from(u64::from(*guard)));
-                let inputs = op
-                    .assemble()
-                    .into_iter()
-                    .map(|word| Operand::Immediate(Fr::from(word)))
-                    .collect();
-                instructions.push(Instruction::Impact {
-                    guard: guard_op,
-                    inputs,
-                });
-            }
-        }
-    }
+    let json = format_circuit_zkir(circuit);
+    let ir = IrSource::load(json.as_bytes()).map_err(|e| ZkirError::LoadIr {
+        circuit: circuit.name.clone(),
+        message: e.to_string(),
+    })?;
 
-    let ir = IrSource {
-        version: IrMinorVersion::V1,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        do_communications_commitment: true,
-        instructions: Arc::new(instructions),
-    };
-
-    let json = format_zkir_json(&ir);
     let mut bzkir = Vec::new();
     tagged_serialize(&ir, &mut bzkir).map_err(|e| ZkirError::SerializeBzkir {
         circuit: circuit.name.clone(),
@@ -139,56 +118,168 @@ pub fn compile_keys(ir: &IrSource) -> Result<CompiledKeys, ZkirError> {
     })
 }
 
-/// Format an [`IrSource`] into canonical upstream `.zkir` v3.1 JSON.
-fn format_zkir_json(ir: &IrSource) -> String {
-    let minor = match ir.version {
-        IrMinorVersion::V0 => 0,
-        IrMinorVersion::V1 => 1,
-        _ => 2,
-    };
+fn var_name(circuit: &ProofCircuit, var: CircuitVar) -> String {
+    let hint = &circuit.var_names[var.id as usize];
+    format!("%{hint}.{}", var.id)
+}
 
+/// Format a signed integer immediate into ZKIR v3 little-endian hex (`"0x00"`, `"-0x02"`, ...),
+/// matching `zkir-field-rep->string` in `print-zkir-v3.ss`.
+fn format_imm(val: i128) -> String {
+    let mut s = String::new();
+    let mut n = if val < 0 {
+        s.push_str("-0x");
+        val.unsigned_abs()
+    } else {
+        s.push_str("0x");
+        val as u128
+    };
+    loop {
+        let byte = (n & 0xff) as u8;
+        write!(s, "{byte:02x}").unwrap();
+        n >>= 8;
+        if n == 0 {
+            break;
+        }
+    }
+    s
+}
+
+fn format_val(circuit: &ProofCircuit, val: CircuitVal) -> String {
+    match val {
+        CircuitVal::Var(v) => format!("\"{}\"", var_name(circuit, v)),
+        CircuitVal::Imm(n) => format!("\"{}\"", format_imm(n)),
+    }
+}
+
+/// Format a [`ProofCircuit`] into canonical upstream `.zkir` v3.1 JSON.
+fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
     let mut out = String::new();
     writeln!(out, "{{").unwrap();
-    writeln!(out, "  \"version\": {{ \"major\": 3, \"minor\": {minor} }},").unwrap();
-    writeln!(
-        out,
-        "  \"do_communications_commitment\": {},",
-        ir.do_communications_commitment
-    )
-    .unwrap();
-    writeln!(out, "  \"inputs\": [").unwrap();
-    writeln!(out, "  ],").unwrap();
-    writeln!(out, "  \"outputs\": [").unwrap();
-    writeln!(out, "  ],").unwrap();
-    writeln!(out, "  \"instructions\": [").unwrap();
+    writeln!(out, "  \"version\": {{ \"major\": 3, \"minor\": 1 }},").unwrap();
+    writeln!(out, "  \"do_communications_commitment\": true,").unwrap();
 
-    for (idx, instr) in ir.instructions.iter().enumerate() {
-        let comma = if idx + 1 < ir.instructions.len() {
+    writeln!(out, "  \"inputs\": [").unwrap();
+    for (idx, &inp) in circuit.inputs.iter().enumerate() {
+        let comma = if idx + 1 < circuit.inputs.len() { "," } else { "" };
+        writeln!(
+            out,
+            "    {{ \"name\": \"{}\", \"type\": \"Scalar<BLS12-381>\" }}{comma}",
+            var_name(circuit, inp)
+        )
+        .unwrap();
+    }
+    writeln!(out, "  ],").unwrap();
+
+    writeln!(out, "  \"outputs\": [").unwrap();
+    for idx in 0..circuit.output_count {
+        let comma = if idx + 1 < circuit.output_count { "," } else { "" };
+        writeln!(out, "    \"Scalar<BLS12-381>\"{comma}").unwrap();
+    }
+    writeln!(out, "  ],").unwrap();
+
+    writeln!(out, "  \"instructions\": [").unwrap();
+    for (idx, instr) in circuit.instructions.iter().enumerate() {
+        let comma = if idx + 1 < circuit.instructions.len() {
             ","
         } else {
             ""
         };
         match instr {
-            Instruction::Impact { guard, inputs } => {
-                let guard_json = serde_json::to_string(guard).unwrap();
-                let inputs_json: Vec<_> = inputs
-                    .iter()
-                    .map(|op| serde_json::to_string(op).unwrap())
-                    .collect();
+            CircuitInstr::PublicInput { guard, output } => {
+                let guard_str = match guard {
+                    Some(g) => format_val(circuit, *g),
+                    None => "null".to_owned(),
+                };
                 writeln!(
                     out,
-                    "    {{ \"op\": \"impact\", \"guard\": {guard_json}, \"inputs\": [{}] }}{comma}",
-                    inputs_json.join(", ")
+                    "    {{ \"op\": \"public_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"{}\", \"guard\": {guard_str} }}{comma}",
+                    var_name(circuit, *output)
                 )
                 .unwrap();
             }
-            other => {
-                let serialized = serde_json::to_string(other).unwrap();
-                writeln!(out, "    {serialized}{comma}").unwrap();
+            CircuitInstr::Impact { guard, op } => {
+                let guard_str = format_val(circuit, *guard);
+                let inputs: Vec<_> = op
+                    .assemble()
+                    .into_iter()
+                    .map(|v| format_val(circuit, v))
+                    .collect();
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"impact\", \"guard\": {guard_str}, \"inputs\": [{}] }}{comma}",
+                    inputs.join(", ")
+                )
+                .unwrap();
+            }
+            CircuitInstr::TestEq { a, b, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"test_eq\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, *a),
+                    format_val(circuit, *b)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Not { a, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"not\", \"output\": \"{}\", \"a\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, *a)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Add { a, b, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"add\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, *a),
+                    format_val(circuit, *b)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Neg { a, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"neg\", \"output\": \"{}\", \"a\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, *a)
+                )
+                .unwrap();
+            }
+            CircuitInstr::CondSelect { bit, a, b, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"cond_select\", \"output\": \"{}\", \"bit\": {}, \"a\": {}, \"b\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, *bit),
+                    format_val(circuit, *a),
+                    format_val(circuit, *b)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Assert { cond } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"assert\", \"cond\": {} }}{comma}",
+                    format_val(circuit, *cond)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Output { vals } => {
+                let rendered: Vec<_> = vals.iter().map(|v| format_val(circuit, *v)).collect();
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"output\", \"vals\": [{}] }}{comma}",
+                    rendered.join(", ")
+                )
+                .unwrap();
             }
         }
     }
-
     writeln!(out, "  ]").unwrap();
     writeln!(out, "}}").unwrap();
     out
@@ -197,36 +288,42 @@ fn format_zkir_json(ir: &IrSource) -> String {
 #[cfg(test)]
 mod tests {
     use compact_circuit::lower_to_circuits;
-    use compact_hir::lower;
     use compact_parser::parse;
+    use compact_sema::check;
     use compact_span::SourceMap;
     use compact_test_utils::assert_compact_snapshot;
-    use midnight_zkir::IrSource;
 
     use super::{analyze_model, generate_zkir};
 
-    fn compile_to_zkir(src: &str) -> String {
+    fn compile_all_zkir(src: &str) -> String {
         let mut sm = SourceMap::new();
-        let id = sm.add_file("counter.compact", src);
+        let id = sm.add_file("test.compact", src);
         let file = sm.get(id);
         let parsed = parse(file);
         assert!(!parsed.diagnostics.has_errors());
-        let lowered = lower(file, &parsed.ast);
-        assert!(!lowered.diagnostics.has_errors());
-        let circuits = lower_to_circuits(&lowered.program);
-        assert_eq!(circuits.circuits.len(), 1);
-        let generated = generate_zkir(&circuits.circuits[0]).unwrap();
-
-        // Round-trip verify with midnight-zkir's own JSON loader!
-        let reloaded = IrSource::load(generated.json.as_bytes()).unwrap();
-        assert_eq!(reloaded, generated.ir);
-
-        // Validate offline Halo2 circuit synthesis model!
-        let model = analyze_model(&generated.ir);
-        assert!(model.k > 0);
-        assert!(model.rows > 0);
-
-        generated.json
+        let checked = check(file, &parsed.ast);
+        assert!(
+            !checked.diagnostics.has_errors(),
+            "unexpected sema errors: {:?}",
+            checked.diagnostics
+        );
+        let circuits = lower_to_circuits(&checked.program);
+        let mut out = String::new();
+        for (i, c) in circuits.circuits.iter().enumerate() {
+            let generated = generate_zkir(c).unwrap();
+            // Validate offline Halo2 circuit synthesis model via midnight-zkir!
+            let model = analyze_model(&generated.ir);
+            assert!(model.k > 0);
+            assert!(model.rows > 0);
+            if circuits.circuits.len() > 1 {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&format!("=== {}.zkir ===\n", c.name));
+            }
+            out.push_str(&generated.json);
+        }
+        out
     }
 
     #[test]
@@ -241,7 +338,36 @@ mod tests {
               round.increment(1);
             }
             "#,
-            compile_to_zkir
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_cell_enum_helper_and_ternary() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            enum STATE { unset, set }
+
+            export ledger value: Field;
+            ledger state: STATE;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            export circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "already set");
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            export circuit get(): Field {
+              return in_state(STATE.set) ? value : 0 as Field;
+            }
+            "#,
+            compile_all_zkir
         );
     }
 }

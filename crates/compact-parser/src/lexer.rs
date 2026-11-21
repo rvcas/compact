@@ -199,6 +199,10 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                     TokenTag::Dot
                 }
             }
+            b'?' => {
+                pos += 1;
+                TokenTag::Question
+            }
             b'+' => {
                 pos += 1;
                 TokenTag::Plus

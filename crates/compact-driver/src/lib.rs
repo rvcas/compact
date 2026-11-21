@@ -11,8 +11,9 @@ use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
 use compact_codegen_zkir::{ZkirError, compile_keys, generate_zkir};
 use compact_diagnostics::DiagnosticBag;
 use compact_fmt::{FormatOptions, format_ast};
-use compact_hir::{Program as HirProgram, lower};
+use compact_hir::Program as HirProgram;
 use compact_parser::parse;
+use compact_sema::check as sema_check;
 use compact_span::SourceMap;
 use miette::Diagnostic;
 use rayon::prelude::*;
@@ -105,8 +106,8 @@ pub fn build_with_reporter(
     let ast = parsed.diagnostics.into_result(parsed.ast)?;
 
     reporter.status("Checking", &source_display);
-    let lowered = lower(file, &ast);
-    let hir = lowered.diagnostics.into_result(lowered.program)?;
+    let checked = sema_check(file, &ast);
+    let hir = checked.diagnostics.into_result(checked.program)?;
 
     // Lower proof circuits.
     let circuit_prog = lower_to_circuits(&hir);
@@ -274,8 +275,8 @@ pub fn check_with_reporter(
 
     let parsed = parse(file);
     let ast = parsed.diagnostics.into_result(parsed.ast)?;
-    let lowered = lower(file, &ast);
-    let hir = lowered.diagnostics.into_result(lowered.program)?;
+    let checked = sema_check(file, &ast);
+    let hir = checked.diagnostics.into_result(checked.program)?;
 
     reporter.status(
         "Finished",

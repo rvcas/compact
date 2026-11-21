@@ -1,5 +1,5 @@
 ---
-source: crates/compact-hir/src/lib.rs
+source: crates/compact-sema/src/lib.rs
 ---
 import CompactStandardLibrary;
 
@@ -10,6 +10,6 @@ export circuit increment(): [] {
 }
 ===
 HirProgram
-  LedgerField #0 export  round: Adt(Counter) @ path=[0]
-  Circuit #0 increment (exported=true, pure=false, proof=true) -> Tuple([])
+  LedgerField #0 export round: Counter<Uint<64>> @ path=[0]
+  Circuit #0 increment (exported=true, pure=false, proof=true) -> []
     ExprStmt LedgerCall { field: LedgerFieldId(0), op: CounterIncrement, args: [Expr { kind: IntLit(1), ty: Uint(16), span: Span { start: 114, end: 115 } }] }

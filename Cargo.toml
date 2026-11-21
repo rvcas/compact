@@ -18,6 +18,7 @@ compact-driver = { path = "crates/compact-driver" }
 compact-fmt = { path = "crates/compact-fmt" }
 compact-hir = { path = "crates/compact-hir" }
 compact-parser = { path = "crates/compact-parser" }
+compact-sema = { path = "crates/compact-sema" }
 compact-span = { path = "crates/compact-span" }
 compact-test-utils = { path = "crates/compact-test-utils" }
 

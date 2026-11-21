@@ -94,6 +94,7 @@ pub enum TokenTag {
     Comma,
     Dot,
     DotDot,
+    Question,
     Plus,
     Minus,
     Star,
@@ -150,6 +151,7 @@ impl TokenTag {
             Self::Comma => ",",
             Self::Dot => ".",
             Self::DotDot => "..",
+            Self::Question => "?",
             Self::Plus => "+",
             Self::Minus => "-",
             Self::Star => "*",
@@ -203,6 +205,10 @@ pub enum NodeTag {
     Root,
     /// `import <ident>;` — `main_token = import`, `data = (name_tok, 0)`.
     ImportDecl,
+    /// `[export] enum <name> { <variant>, ... }`
+    /// `main_token = enum`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+3] = [name_tok, variants_start, variants_end]` (variant `TokenIndex`es).
+    EnumDecl,
     /// `[export] [sealed] ledger <name>: <type>;`
     /// `main_token = ledger`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+2] = [name_tok, type_node]`.
@@ -219,6 +225,13 @@ pub enum NodeTag {
     TypeTuple,
     /// Block `{ <stmt>* }` — `main_token = '{'`, `data = (extra_start, extra_end)`.
     Block,
+    /// `const <name>[: <type>] = <expr>;`
+    /// `main_token = const`, `data = (extra_start, semi_tok)`,
+    /// `extra_data[extra_start..+3] = [name_tok, opt_type_node, init_expr]`.
+    ConstStmt,
+    /// `<lhs> = <rhs>;` — `main_token = '='`, `data = (extra_start, semi_tok)`,
+    /// `extra_data[extra_start..+2] = [lhs_node, rhs_node]`.
+    AssignStmt,
     /// Expression statement `<expr>;` — `data = (expr_node, semi_tok)`.
     ExprStmt,
     /// `return [<expr>];` — `main_token = return`, `data = (opt_expr_node, semi_tok)`.
@@ -227,6 +240,10 @@ pub enum NodeTag {
     IdentExpr,
     /// Integer literal expression — `main_token = nat_tok`.
     IntLitExpr,
+    /// Boolean literal expression (`true` / `false`) — `main_token = bool_tok`.
+    BoolLitExpr,
+    /// String literal expression — `main_token = string_tok`.
+    StringLitExpr,
     /// Tuple literal expression `[<expr>, ...]` — `main_token = '['`, `data = (extra_start, extra_end)`.
     TupleExpr,
     /// Member access `<lhs>.<field>` — `main_token = '.'`, `data = (lhs_node, field_tok)`.
@@ -235,8 +252,21 @@ pub enum NodeTag {
     /// `main_token = '('`, `data = (extra_start, rparen_tok)`,
     /// `extra_data[extra_start..+3] = [callee_node, args_start, args_end]`.
     CallExpr,
+    /// Unary expression `<op><expr>` — `main_token = op_tok`, `data = (operand_node, 0)`.
+    UnaryExpr,
     /// Binary expression `<lhs> <op> <rhs>` — `main_token = op_tok`, `data = (lhs_node, rhs_node)`.
     BinaryExpr,
+    /// Ternary expression `<cond> ? <then> : <else>`
+    /// `main_token = '?'`, `data = (extra_start, 0)`,
+    /// `extra_data[extra_start..+3] = [cond_node, then_node, else_node]`.
+    TernaryExpr,
+    /// Cast expression `<expr> as <type>` — `main_token = as`, `data = (expr_node, type_node)`.
+    CastExpr,
+    /// `assert(<cond>, <msg>)` — `main_token = assert`, `data = (extra_start, rparen_tok)`,
+    /// `extra_data[extra_start..+2] = [cond_node, msg_node]`.
+    AssertExpr,
+    /// `disclose(<expr>)` — `main_token = disclose`, `data = (expr_node, rparen_tok)`.
+    DiscloseExpr,
 }
 
 /// Fixed-width payload stored alongside every AST node (Zig-style two-word `Data`).
@@ -270,6 +300,15 @@ pub struct ImportDecl {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct EnumDecl {
+    pub enum_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub variants_start: u32,
+    pub variants_end: u32,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct LedgerDecl {
     pub ledger_token: TokenIndex,
     pub name_token: TokenIndex,
@@ -297,12 +336,45 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct ConstStmt {
+    pub const_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub ty: Option<NodeIndex>,
+    pub init: NodeIndex,
+    pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssignStmt {
+    pub eq_token: TokenIndex,
+    pub lhs: NodeIndex,
+    pub rhs: NodeIndex,
+    pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CallExpr {
     pub lparen_token: TokenIndex,
     pub rparen_token: TokenIndex,
     pub callee: NodeIndex,
     pub args_start: u32,
     pub args_end: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TernaryExpr {
+    pub question_token: TokenIndex,
+    pub cond: NodeIndex,
+    pub then_branch: NodeIndex,
+    pub else_branch: NodeIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssertExpr {
+    pub assert_token: TokenIndex,
+    pub cond: NodeIndex,
+    pub msg: NodeIndex,
+    pub rparen_token: TokenIndex,
 }
 
 /// Flat Structure-of-Arrays AST inspired by Zig's `std.zig.Ast`.
@@ -384,6 +456,13 @@ impl Ast {
             .map(NodeIndex)
     }
 
+    pub fn extra_tokens(&self, start: u32, end: u32) -> impl Iterator<Item = TokenIndex> + '_ {
+        self.extra_data[start as usize..end as usize]
+            .iter()
+            .copied()
+            .map(TokenIndex)
+    }
+
     pub fn root_decls(&self) -> impl Iterator<Item = NodeIndex> + '_ {
         debug_assert_eq!(self.node_tag(NodeIndex::ROOT), NodeTag::Root);
         let data = self.node_data(NodeIndex::ROOT);
@@ -396,6 +475,19 @@ impl Ast {
         ImportDecl {
             import_token: self.node_main_token(node),
             name_token: TokenIndex(data.lhs),
+        }
+    }
+
+    pub fn enum_decl(&self, node: NodeIndex) -> EnumDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::EnumDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        EnumDecl {
+            enum_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            variants_start: self.extra_data[base + 1],
+            variants_end: self.extra_data[base + 2],
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
         }
     }
 
@@ -437,6 +529,31 @@ impl Ast {
         }
     }
 
+    pub fn const_stmt(&self, node: NodeIndex) -> ConstStmt {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ConstStmt);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ConstStmt {
+            const_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            ty: NodeIndex(self.extra_data[base + 1]).into_option(),
+            init: NodeIndex(self.extra_data[base + 2]),
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
+    pub fn assign_stmt(&self, node: NodeIndex) -> AssignStmt {
+        debug_assert_eq!(self.node_tag(node), NodeTag::AssignStmt);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        AssignStmt {
+            eq_token: self.node_main_token(node),
+            lhs: NodeIndex(self.extra_data[base]),
+            rhs: NodeIndex(self.extra_data[base + 1]),
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
     pub fn call_expr(&self, node: NodeIndex) -> CallExpr {
         debug_assert_eq!(self.node_tag(node), NodeTag::CallExpr);
         let data = self.node_data(node);
@@ -447,6 +564,30 @@ impl Ast {
             callee: NodeIndex(self.extra_data[base]),
             args_start: self.extra_data[base + 1],
             args_end: self.extra_data[base + 2],
+        }
+    }
+
+    pub fn ternary_expr(&self, node: NodeIndex) -> TernaryExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::TernaryExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        TernaryExpr {
+            question_token: self.node_main_token(node),
+            cond: NodeIndex(self.extra_data[base]),
+            then_branch: NodeIndex(self.extra_data[base + 1]),
+            else_branch: NodeIndex(self.extra_data[base + 2]),
+        }
+    }
+
+    pub fn assert_expr(&self, node: NodeIndex) -> AssertExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::AssertExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        AssertExpr {
+            assert_token: self.node_main_token(node),
+            cond: NodeIndex(self.extra_data[base]),
+            msg: NodeIndex(self.extra_data[base + 1]),
+            rparen_token: TokenIndex(data.rhs),
         }
     }
 
@@ -465,6 +606,17 @@ impl Ast {
                 self.node_span(first).merge(self.node_span(last))
             }
             NodeTag::ImportDecl => main.merge(self.token_span(TokenIndex(data.lhs))),
+            NodeTag::EnumDecl => {
+                let decl = self.enum_decl(node);
+                let mut span = main.merge(self.token_span(decl.name_token));
+                if let Some(last) = self
+                    .extra_tokens(decl.variants_start, decl.variants_end)
+                    .last()
+                {
+                    span = span.merge(self.token_span(last));
+                }
+                span
+            }
             NodeTag::LedgerDecl => {
                 let decl = self.ledger_decl(node);
                 main.merge(self.node_span(decl.type_node))
@@ -474,13 +626,26 @@ impl Ast {
                 main.merge(self.node_span(decl.body))
             }
             NodeTag::Param => main.merge(self.node_span(NodeIndex(data.lhs))),
-            NodeTag::TypeNamed | NodeTag::IdentExpr | NodeTag::IntLitExpr => main,
+            NodeTag::TypeNamed
+            | NodeTag::IdentExpr
+            | NodeTag::IntLitExpr
+            | NodeTag::BoolLitExpr
+            | NodeTag::StringLitExpr => main,
             NodeTag::TypeTuple | NodeTag::TupleExpr | NodeTag::Block => {
                 let mut span = main;
                 if let Some(last) = self.extra_nodes(data.lhs, data.rhs).last() {
                     span = span.merge(self.node_span(last));
                 }
                 span
+            }
+            NodeTag::ConstStmt => {
+                let stmt = self.const_stmt(node);
+                main.merge(self.token_span(stmt.semi_token))
+            }
+            NodeTag::AssignStmt => {
+                let stmt = self.assign_stmt(node);
+                self.node_span(stmt.lhs)
+                    .merge(self.token_span(stmt.semi_token))
             }
             NodeTag::ExprStmt => self
                 .node_span(NodeIndex(data.lhs))
@@ -500,9 +665,22 @@ impl Ast {
                 self.node_span(call.callee)
                     .merge(self.token_span(call.rparen_token))
             }
+            NodeTag::UnaryExpr => main.merge(self.node_span(NodeIndex(data.lhs))),
             NodeTag::BinaryExpr => self
                 .node_span(NodeIndex(data.lhs))
                 .merge(self.node_span(NodeIndex(data.rhs))),
+            NodeTag::TernaryExpr => {
+                let t = self.ternary_expr(node);
+                self.node_span(t.cond).merge(self.node_span(t.else_branch))
+            }
+            NodeTag::CastExpr => self
+                .node_span(NodeIndex(data.lhs))
+                .merge(self.node_span(NodeIndex(data.rhs))),
+            NodeTag::AssertExpr => {
+                let a = self.assert_expr(node);
+                main.merge(self.token_span(a.rparen_token))
+            }
+            NodeTag::DiscloseExpr => main.merge(self.token_span(TokenIndex(data.rhs))),
         }
     }
 
@@ -530,6 +708,21 @@ impl Ast {
                     out,
                     "{pad}ImportDecl {}",
                     self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+            }
+            NodeTag::EnumDecl => {
+                let decl = self.enum_decl(node);
+                let mods_str = if decl.exported { "[export] " } else { "" };
+                let variants: Vec<_> = self
+                    .extra_tokens(decl.variants_start, decl.variants_end)
+                    .map(|t| self.token_text(t, source))
+                    .collect();
+                writeln!(
+                    out,
+                    "{pad}EnumDecl {mods_str}{} {{ {} }}",
+                    self.token_text(decl.name_token, source),
+                    variants.join(", ")
                 )
                 .unwrap();
             }
@@ -618,6 +811,25 @@ impl Ast {
                     self.dump_node(stmt, source, indent + 1, out);
                 }
             }
+            NodeTag::ConstStmt => {
+                let stmt = self.const_stmt(node);
+                writeln!(
+                    out,
+                    "{pad}ConstStmt {}",
+                    self.token_text(stmt.name_token, source)
+                )
+                .unwrap();
+                if let Some(ty) = stmt.ty {
+                    self.dump_node(ty, source, indent + 1, out);
+                }
+                self.dump_node(stmt.init, source, indent + 1, out);
+            }
+            NodeTag::AssignStmt => {
+                let stmt = self.assign_stmt(node);
+                writeln!(out, "{pad}AssignStmt").unwrap();
+                self.dump_node(stmt.lhs, source, indent + 1, out);
+                self.dump_node(stmt.rhs, source, indent + 1, out);
+            }
             NodeTag::ExprStmt => {
                 writeln!(out, "{pad}ExprStmt").unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
@@ -640,6 +852,22 @@ impl Ast {
                 writeln!(
                     out,
                     "{pad}IntLitExpr {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+            }
+            NodeTag::BoolLitExpr => {
+                writeln!(
+                    out,
+                    "{pad}BoolLitExpr {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+            }
+            NodeTag::StringLitExpr => {
+                writeln!(
+                    out,
+                    "{pad}StringLitExpr {}",
                     self.token_text(self.node_main_token(node), source)
                 )
                 .unwrap();
@@ -667,6 +895,15 @@ impl Ast {
                     self.dump_node(arg, source, indent + 1, out);
                 }
             }
+            NodeTag::UnaryExpr => {
+                writeln!(
+                    out,
+                    "{pad}UnaryExpr {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
             NodeTag::BinaryExpr => {
                 writeln!(
                     out,
@@ -676,6 +913,28 @@ impl Ast {
                 .unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
                 self.dump_node(NodeIndex(data.rhs), source, indent + 1, out);
+            }
+            NodeTag::TernaryExpr => {
+                let t = self.ternary_expr(node);
+                writeln!(out, "{pad}TernaryExpr").unwrap();
+                self.dump_node(t.cond, source, indent + 1, out);
+                self.dump_node(t.then_branch, source, indent + 1, out);
+                self.dump_node(t.else_branch, source, indent + 1, out);
+            }
+            NodeTag::CastExpr => {
+                writeln!(out, "{pad}CastExpr").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+                self.dump_node(NodeIndex(data.rhs), source, indent + 1, out);
+            }
+            NodeTag::AssertExpr => {
+                let a = self.assert_expr(node);
+                writeln!(out, "{pad}AssertExpr").unwrap();
+                self.dump_node(a.cond, source, indent + 1, out);
+                self.dump_node(a.msg, source, indent + 1, out);
+            }
+            NodeTag::DiscloseExpr => {
+                writeln!(out, "{pad}DiscloseExpr").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
             }
         }
     }

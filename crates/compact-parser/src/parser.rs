@@ -91,9 +91,12 @@ impl<'a> Parser<'a> {
     fn parse_program_element(&mut self) -> Option<NodeIndex> {
         match self.peek() {
             TokenTag::Import => self.parse_import_decl(),
-            TokenTag::Export | TokenTag::Sealed | TokenTag::Ledger | TokenTag::Pure | TokenTag::Circuit => {
-                self.parse_decl()
-            }
+            TokenTag::Export
+            | TokenTag::Sealed
+            | TokenTag::Ledger
+            | TokenTag::Pure
+            | TokenTag::Circuit
+            | TokenTag::Enum => self.parse_decl(),
             other => {
                 let tok = self.current_tok();
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -133,6 +136,7 @@ impl<'a> Parser<'a> {
         }
 
         match self.peek() {
+            TokenTag::Enum => self.parse_enum_decl(flags),
             TokenTag::Ledger => self.parse_ledger_decl(flags),
             TokenTag::Circuit => self.parse_circuit_decl(flags),
             other => {
@@ -141,13 +145,41 @@ impl<'a> Parser<'a> {
                     self.file,
                     self.ast.token_span(tok),
                     format!(
-                        "expected `ledger` or `circuit` after modifiers, found `{}`",
+                        "expected `enum`, `ledger`, or `circuit` after modifiers, found `{}`",
                         other.as_str()
                     ),
                 ));
                 None
             }
         }
+    }
+
+    fn parse_enum_decl(&mut self, flags: u32) -> Option<NodeIndex> {
+        let enum_tok = self.expect(TokenTag::Enum)?;
+        let name_tok = self.expect(TokenTag::Ident)?;
+        self.expect(TokenTag::LBrace)?;
+        let mut variants = Vec::new();
+        while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
+            let vtok = self.expect(TokenTag::Ident)?;
+            variants.push(vtok.0);
+            if self.peek() == TokenTag::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenTag::RBrace)?;
+        // Optional trailing semicolon after enum (allowed in Compact)
+        if self.peek() == TokenTag::Semi {
+            self.advance();
+        }
+        let (vstart, vend) = self.ast.push_extra_slice(&variants);
+        let (extra_start, _) = self.ast.push_extra_slice(&[name_tok.0, vstart, vend]);
+        Some(self.ast.push_node(
+            NodeTag::EnumDecl,
+            enum_tok,
+            NodeData::new(extra_start, flags),
+        ))
     }
 
     fn parse_ledger_decl(&mut self, flags: u32) -> Option<NodeIndex> {
@@ -275,39 +307,93 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Option<NodeIndex> {
-        if self.peek() == TokenTag::Return {
-            let ret_tok = self.advance();
-            let expr = if self.peek() == TokenTag::Semi {
-                NodeIndex::NONE
-            } else {
-                self.parse_expr()?
-            };
-            let semi = self.expect(TokenTag::Semi)?;
-            return Some(self.ast.push_node(
-                NodeTag::ReturnStmt,
-                ret_tok,
-                NodeData::new(expr.0, semi.0),
-            ));
+        match self.peek() {
+            TokenTag::Return => {
+                let ret_tok = self.advance();
+                let expr = if self.peek() == TokenTag::Semi {
+                    NodeIndex::NONE
+                } else {
+                    self.parse_expr()?
+                };
+                let semi = self.expect(TokenTag::Semi)?;
+                Some(self.ast.push_node(
+                    NodeTag::ReturnStmt,
+                    ret_tok,
+                    NodeData::new(expr.0, semi.0),
+                ))
+            }
+            TokenTag::Const => {
+                let const_tok = self.advance();
+                let name_tok = self.expect(TokenTag::Ident)?;
+                let ty = if self.peek() == TokenTag::Colon {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    NodeIndex::NONE
+                };
+                self.expect(TokenTag::Eq)?;
+                let init = self.parse_expr()?;
+                let semi = self.expect(TokenTag::Semi)?;
+                let (extra_start, _) = self.ast.push_extra_slice(&[name_tok.0, ty.0, init.0]);
+                Some(self.ast.push_node(
+                    NodeTag::ConstStmt,
+                    const_tok,
+                    NodeData::new(extra_start, semi.0),
+                ))
+            }
+            _ => {
+                let expr = self.parse_expr()?;
+                if self.peek() == TokenTag::Eq {
+                    let eq_tok = self.advance();
+                    let rhs = self.parse_expr()?;
+                    let semi = self.expect(TokenTag::Semi)?;
+                    let (extra_start, _) = self.ast.push_extra_slice(&[expr.0, rhs.0]);
+                    Some(self.ast.push_node(
+                        NodeTag::AssignStmt,
+                        eq_tok,
+                        NodeData::new(extra_start, semi.0),
+                    ))
+                } else {
+                    let semi = self.expect(TokenTag::Semi)?;
+                    Some(self.ast.push_node(
+                        NodeTag::ExprStmt,
+                        self.ast.node_main_token(expr),
+                        NodeData::new(expr.0, semi.0),
+                    ))
+                }
+            }
         }
-
-        let expr = self.parse_expr()?;
-        let semi = self.expect(TokenTag::Semi)?;
-        Some(self.ast.push_node(
-            NodeTag::ExprStmt,
-            self.ast.node_main_token(expr),
-            NodeData::new(expr.0, semi.0),
-        ))
     }
 
     fn parse_expr(&mut self) -> Option<NodeIndex> {
-        self.parse_additive_expr()
+        self.parse_ternary_expr()
     }
 
-    fn parse_additive_expr(&mut self) -> Option<NodeIndex> {
-        let mut lhs = self.parse_postfix_expr()?;
-        while matches!(self.peek(), TokenTag::Plus | TokenTag::Minus) {
+    fn parse_ternary_expr(&mut self) -> Option<NodeIndex> {
+        let cond = self.parse_equality_expr()?;
+        if self.peek() == TokenTag::Question {
+            let q_tok = self.advance();
+            let then_branch = self.parse_expr()?;
+            self.expect(TokenTag::Colon)?;
+            let else_branch = self.parse_expr()?;
+            let (extra_start, _) =
+                self.ast
+                    .push_extra_slice(&[cond.0, then_branch.0, else_branch.0]);
+            Some(self.ast.push_node(
+                NodeTag::TernaryExpr,
+                q_tok,
+                NodeData::new(extra_start, 0),
+            ))
+        } else {
+            Some(cond)
+        }
+    }
+
+    fn parse_equality_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_additive_expr()?;
+        while matches!(self.peek(), TokenTag::EqEq | TokenTag::BangEq) {
             let op_tok = self.advance();
-            let rhs = self.parse_postfix_expr()?;
+            let rhs = self.parse_additive_expr()?;
             lhs = self.ast.push_node(
                 NodeTag::BinaryExpr,
                 op_tok,
@@ -315,6 +401,45 @@ impl<'a> Parser<'a> {
             );
         }
         Some(lhs)
+    }
+
+    fn parse_additive_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_cast_expr()?;
+        while matches!(self.peek(), TokenTag::Plus | TokenTag::Minus) {
+            let op_tok = self.advance();
+            let rhs = self.parse_cast_expr()?;
+            lhs = self.ast.push_node(
+                NodeTag::BinaryExpr,
+                op_tok,
+                NodeData::new(lhs.0, rhs.0),
+            );
+        }
+        Some(lhs)
+    }
+
+    fn parse_cast_expr(&mut self) -> Option<NodeIndex> {
+        let mut expr = self.parse_unary_expr()?;
+        while self.peek() == TokenTag::As {
+            let as_tok = self.advance();
+            let ty = self.parse_type()?;
+            expr = self
+                .ast
+                .push_node(NodeTag::CastExpr, as_tok, NodeData::new(expr.0, ty.0));
+        }
+        Some(expr)
+    }
+
+    fn parse_unary_expr(&mut self) -> Option<NodeIndex> {
+        if matches!(self.peek(), TokenTag::Bang | TokenTag::Minus) {
+            let op_tok = self.advance();
+            let operand = self.parse_unary_expr()?;
+            return Some(self.ast.push_node(
+                NodeTag::UnaryExpr,
+                op_tok,
+                NodeData::new(operand.0, 0),
+            ));
+        }
+        self.parse_postfix_expr()
     }
 
     fn parse_postfix_expr(&mut self) -> Option<NodeIndex> {
@@ -373,6 +498,45 @@ impl<'a> Parser<'a> {
                     self.ast
                         .push_node(NodeTag::IntLitExpr, tok, NodeData::default()),
                 )
+            }
+            TokenTag::True | TokenTag::False => {
+                let tok = self.advance();
+                Some(
+                    self.ast
+                        .push_node(NodeTag::BoolLitExpr, tok, NodeData::default()),
+                )
+            }
+            TokenTag::String => {
+                let tok = self.advance();
+                Some(
+                    self.ast
+                        .push_node(NodeTag::StringLitExpr, tok, NodeData::default()),
+                )
+            }
+            TokenTag::Assert => {
+                let assert_tok = self.advance();
+                self.expect(TokenTag::LParen)?;
+                let cond = self.parse_expr()?;
+                self.expect(TokenTag::Comma)?;
+                let msg = self.parse_expr()?;
+                let rparen = self.expect(TokenTag::RParen)?;
+                let (extra_start, _) = self.ast.push_extra_slice(&[cond.0, msg.0]);
+                Some(self.ast.push_node(
+                    NodeTag::AssertExpr,
+                    assert_tok,
+                    NodeData::new(extra_start, rparen.0),
+                ))
+            }
+            TokenTag::Disclose => {
+                let disclose_tok = self.advance();
+                self.expect(TokenTag::LParen)?;
+                let inner = self.parse_expr()?;
+                let rparen = self.expect(TokenTag::RParen)?;
+                Some(self.ast.push_node(
+                    NodeTag::DiscloseExpr,
+                    disclose_tok,
+                    NodeData::new(inner.0, rparen.0),
+                ))
             }
             TokenTag::LBracket => {
                 let lbracket = self.advance();

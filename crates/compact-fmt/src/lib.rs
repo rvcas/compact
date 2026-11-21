@@ -69,6 +69,14 @@ impl<'a> Formatter<'a> {
     fn decl_first_token(&self, node: NodeIndex) -> TokenIndex {
         let main = self.ast.node_main_token(node);
         match self.ast.node_tag(node) {
+            NodeTag::EnumDecl => {
+                let d = self.ast.enum_decl(node);
+                if d.exported {
+                    TokenIndex(main.0.saturating_sub(1))
+                } else {
+                    main
+                }
+            }
             NodeTag::LedgerDecl => {
                 let d = self.ast.ledger_decl(node);
                 let mut offset = 0u32;
@@ -103,6 +111,24 @@ impl<'a> Formatter<'a> {
                     self.out,
                     "import {};",
                     self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+            }
+            NodeTag::EnumDecl => {
+                let decl = self.ast.enum_decl(node);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                let variants: Vec<_> = self
+                    .ast
+                    .extra_tokens(decl.variants_start, decl.variants_end)
+                    .map(|t| self.ast.token_text(t, self.source))
+                    .collect();
+                write!(
+                    self.out,
+                    "enum {} {{ {} }}",
+                    self.ast.token_text(decl.name_token, self.source),
+                    variants.join(", ")
                 )
                 .unwrap();
             }
@@ -208,6 +234,29 @@ impl<'a> Formatter<'a> {
     fn format_stmt(&mut self, node: NodeIndex) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
+            NodeTag::ConstStmt => {
+                let stmt = self.ast.const_stmt(node);
+                write!(
+                    self.out,
+                    "const {}",
+                    self.ast.token_text(stmt.name_token, self.source)
+                )
+                .unwrap();
+                if let Some(ty) = stmt.ty {
+                    self.out.push_str(": ");
+                    self.format_type(ty);
+                }
+                self.out.push_str(" = ");
+                self.format_expr(stmt.init);
+                self.out.push(';');
+            }
+            NodeTag::AssignStmt => {
+                let stmt = self.ast.assign_stmt(node);
+                self.format_expr(stmt.lhs);
+                self.out.push_str(" = ");
+                self.format_expr(stmt.rhs);
+                self.out.push(';');
+            }
             NodeTag::ExprStmt => {
                 self.format_expr(NodeIndex(data.lhs));
                 self.out.push(';');
@@ -227,7 +276,10 @@ impl<'a> Formatter<'a> {
     fn format_expr(&mut self, node: NodeIndex) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
-            NodeTag::IdentExpr | NodeTag::IntLitExpr => {
+            NodeTag::IdentExpr
+            | NodeTag::IntLitExpr
+            | NodeTag::BoolLitExpr
+            | NodeTag::StringLitExpr => {
                 self.out
                     .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
             }
@@ -264,6 +316,11 @@ impl<'a> Formatter<'a> {
                 }
                 self.out.push(')');
             }
+            NodeTag::UnaryExpr => {
+                self.out
+                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.format_expr(NodeIndex(data.lhs));
+            }
             NodeTag::BinaryExpr => {
                 self.format_expr(NodeIndex(data.lhs));
                 write!(
@@ -273,6 +330,32 @@ impl<'a> Formatter<'a> {
                 )
                 .unwrap();
                 self.format_expr(NodeIndex(data.rhs));
+            }
+            NodeTag::TernaryExpr => {
+                let t = self.ast.ternary_expr(node);
+                self.format_expr(t.cond);
+                self.out.push_str(" ? ");
+                self.format_expr(t.then_branch);
+                self.out.push_str(" : ");
+                self.format_expr(t.else_branch);
+            }
+            NodeTag::CastExpr => {
+                self.format_expr(NodeIndex(data.lhs));
+                self.out.push_str(" as ");
+                self.format_type(NodeIndex(data.rhs));
+            }
+            NodeTag::AssertExpr => {
+                let a = self.ast.assert_expr(node);
+                self.out.push_str("assert(");
+                self.format_expr(a.cond);
+                self.out.push_str(", ");
+                self.format_expr(a.msg);
+                self.out.push(')');
+            }
+            NodeTag::DiscloseExpr => {
+                self.out.push_str("disclose(");
+                self.format_expr(NodeIndex(data.lhs));
+                self.out.push(')');
             }
             _ => {}
         }
@@ -303,6 +386,20 @@ mod tests {
             import   CompactStandardLibrary ;
             export  ledger   round : Counter ;
             export circuit increment( ):[]{round.increment( 1 );}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_cell_and_enum() {
+        assert_compact_snapshot!(
+            r#"
+            enum   STATE{unset,set}
+            export ledger value:Field;
+            ledger state:STATE;
+            circuit in_state(s:STATE):Boolean{return state==s;}
+            export circuit set(v:Field):[]{assert(in_state(STATE.unset),"overwrite");const dv=disclose(v);value=dv;state=STATE.set;}
             "#,
             fmt
         );

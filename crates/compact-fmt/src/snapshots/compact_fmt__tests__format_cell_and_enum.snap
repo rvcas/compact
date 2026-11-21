@@ -1,0 +1,25 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+enum   STATE{unset,set}
+export ledger value:Field;
+ledger state:STATE;
+circuit in_state(s:STATE):Boolean{return state==s;}
+export circuit set(v:Field):[]{assert(in_state(STATE.unset),"overwrite");const dv=disclose(v);value=dv;state=STATE.set;}
+===
+enum STATE { unset, set }
+
+export ledger value: Field;
+
+ledger state: STATE;
+
+circuit in_state(s: STATE): Boolean {
+  return state == s;
+}
+
+export circuit set(v: Field): [] {
+  assert(in_state(STATE.unset), "overwrite");
+  const dv = disclose(v);
+  value = dv;
+  state = STATE.set;
+}

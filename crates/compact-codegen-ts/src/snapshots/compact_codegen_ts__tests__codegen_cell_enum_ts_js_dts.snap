@@ -1,0 +1,190 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+import CompactStandardLibrary;
+
+export enum STATE { unset, set }
+
+export ledger value: Field;
+ledger state: STATE;
+
+circuit in_state(s: STATE): Boolean {
+  return state == s;
+}
+
+export circuit set(v: Field): [] {
+  assert(in_state(STATE.unset), "already set");
+  value = disclose(v);
+  state = STATE.set;
+}
+
+export circuit get(): Field {
+  return in_state(STATE.set) ? value : 0 as Field;
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export enum STATE {
+	unset = 0,
+	set = 1
+}
+function _in_state(context: __compactRuntime.CircuitContext<unknown>, s: STATE): boolean {
+	return __compactRuntime.readCell(context, 1) === s;
+}
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type Ledger = {
+	readonly value: bigint;
+};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return { value: __compactRuntime.decodeCell(state, 0) };
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			set: (context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "already set");
+				__compactRuntime.writeCell(context, 0, v);
+				__compactRuntime.writeCell(context, 1, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint> => {
+				return {
+					result: _in_state(context, STATE.set) ? __compactRuntime.readCell(context, 0) : 0n,
+					context
+				};
+			}
+		};
+		this.circuits = {
+			set: (context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "already set");
+				__compactRuntime.writeCell(context, 0, v);
+				__compactRuntime.writeCell(context, 1, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint> => {
+				return {
+					result: _in_state(context, STATE.set) ? __compactRuntime.readCell(context, 0) : 0n,
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export let STATE = /* @__PURE__ */ function(STATE) {
+	STATE[STATE["unset"] = 0] = "unset";
+	STATE[STATE["set"] = 1] = "set";
+	return STATE;
+}({});
+function _in_state(context, s) {
+	return __compactRuntime.readCell(context, 1) === s;
+}
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return { value: __compactRuntime.decodeCell(state, 0) };
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			set: (context, v) => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "already set");
+				__compactRuntime.writeCell(context, 0, v);
+				__compactRuntime.writeCell(context, 1, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context) => {
+				return {
+					result: _in_state(context, STATE.set) ? __compactRuntime.readCell(context, 0) : 0n,
+					context
+				};
+			}
+		};
+		this.circuits = {
+			set: (context, v) => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "already set");
+				__compactRuntime.writeCell(context, 0, v);
+				__compactRuntime.writeCell(context, 1, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context) => {
+				return {
+					result: _in_state(context, STATE.set) ? __compactRuntime.readCell(context, 0) : 0n,
+					context
+				};
+			}
+		};
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export declare enum STATE {
+	unset = 0,
+	set = 1
+}
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type Ledger = {
+	readonly value: bigint;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}

@@ -1,7 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use compact_hir::{BinaryOp, Circuit, Expr, ExprKind, LedgerAdt, LedgerOp, Program as HirProgram, Stmt, Type};
+use compact_hir::{
+    BinaryOp, Circuit, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
+    Program as HirProgram, Stmt, Type, UnaryOp,
+};
 use compact_span::Span as CompactSpan;
 use oxc_allocator::{Allocator, ArenaVec, GetAllocator};
 use oxc_ast::ast::*;
@@ -12,7 +15,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{SPAN, SourceType, Span};
 use oxc_str::{Ident, Str};
 use oxc_syntax::number::NumberBase;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 use oxc_transformer::{TransformOptions, Transformer};
 use thiserror::Error;
 
@@ -69,7 +72,7 @@ pub fn generate_ts(input: &TsCodegenInput<'_>) -> Result<GeneratedTs, TsCodegenE
         .code;
 
     // 3. Strip TypeScript types in-place via oxc_semantic + oxc_transformer.
-    let sem_ret = SemanticBuilder::new().build(&ts_program);
+    let sem_ret = SemanticBuilder::new().with_enum_eval(true).build(&ts_program);
     let scoping = sem_ret.semantic.into_scoping();
     let tx_opts = TransformOptions::default();
     let tx_ret = Transformer::new(&allocator, Path::new("index.ts"), &tx_opts)
@@ -221,6 +224,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         match ty {
             Type::Field | Type::Uint(_) => TSType::new_ts_big_int_keyword(SPAN, self),
             Type::Boolean => TSType::new_ts_boolean_keyword(SPAN, self),
+            Type::Enum(id) => {
+                let decl = self.input.program.enum_decl(*id);
+                self.ts_type_ref(&decl.name, None)
+            }
             Type::Tuple(elems) => {
                 let mut ts_elems = ArenaVec::with_capacity_in(elems.len(), self);
                 for elem in elems {
@@ -228,7 +235,6 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 }
                 TSType::new_ts_tuple_type(SPAN, ts_elems, self)
             }
-            Type::Adt(LedgerAdt::Counter) => TSType::new_ts_big_int_keyword(SPAN, self),
         }
     }
 
@@ -237,6 +243,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
 
         // import * as __compactRuntime from '@midnight-ntwrk/compact-runtime';
         body.push(self.build_runtime_import());
+
+        // Emit enum declarations (exported if exported in Compact; still emitted locally if used).
+        for enum_decl in &self.input.program.enums {
+            body.push(self.build_enum_decl(enum_decl));
+        }
+
+        // Emit internal helper circuits as module-level functions so exported circuits can call them.
+        for circuit in &self.input.program.circuits {
+            if !circuit.exported {
+                body.push(self.build_helper_circuit_fn(circuit));
+            }
+        }
 
         // export type Witnesses<T> = {};
         body.push(self.build_witnesses_type());
@@ -301,6 +319,92 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             ImportOrExportKind::Value,
             self,
         )
+    }
+
+    fn build_enum_decl(&self, decl: &EnumDecl) -> Statement<'a> {
+        let span = self.oxc_span(decl.span);
+        let mut members = ArenaVec::with_capacity_in(decl.variants.len(), self);
+        for (idx, variant) in decl.variants.iter().enumerate() {
+            members.push(TSEnumMember::new(
+                SPAN,
+                TSEnumMemberName::Identifier(IdentifierName::boxed(SPAN, self.ident(variant), self)),
+                Some(self.expr_num(SPAN, idx as f64)),
+                self,
+            ));
+        }
+        let body = TSEnumBody::new(SPAN, members, self);
+        let enum_decl = Declaration::new_ts_enum_declaration(
+            span,
+            BindingIdentifier::new(span, self.ident(&decl.name), self),
+            body,
+            false,
+            false,
+            self,
+        );
+        if decl.exported {
+            Statement::new_export_declaration(span, enum_decl, self)
+        } else {
+            Statement::from(enum_decl)
+        }
+    }
+
+    fn build_helper_circuit_fn(&self, circuit: &Circuit) -> Statement<'a> {
+        let span = self.oxc_span(circuit.span);
+        let mut params = ArenaVec::new_in(self);
+        if !circuit.pure {
+            let mut ctx_targs = ArenaVec::with_capacity_in(1, self);
+            ctx_targs.push(TSType::new_ts_unknown_keyword(SPAN, self));
+            params.push(FormalParameter::new(
+                SPAN,
+                ArenaVec::new_in(self),
+                self.binding_ident(SPAN, "context"),
+                Some(self.ts_type_annotation(self.ts_runtime_type("CircuitContext", Some(ctx_targs)))),
+                None,
+                false,
+                None,
+                false,
+                false,
+                self,
+            ));
+        }
+        for p in &circuit.params {
+            params.push(FormalParameter::new(
+                self.oxc_span(p.span),
+                ArenaVec::new_in(self),
+                self.binding_ident(self.oxc_span(p.span), &p.name),
+                Some(self.ts_type_annotation(self.hir_type_to_ts(&p.ty))),
+                None,
+                false,
+                None,
+                false,
+                false,
+                self,
+            ));
+        }
+        let formal_params = FormalParameters::boxed(
+            SPAN,
+            FormalParameterKind::FormalParameter,
+            params,
+            None,
+            self,
+        );
+        let stmts = self.lower_stmts(circuit);
+        let body = FunctionBody::boxed(SPAN, ArenaVec::new_in(self), stmts, self);
+        let func = Declaration::new_function_declaration(
+            span,
+            FunctionType::FunctionDeclaration,
+            Some(BindingIdentifier::new(span, self.ident(&format!("_{}", circuit.name)), self)),
+            false,
+            false,
+            false,
+            None,
+            None,
+            formal_params,
+            Some(self.ts_type_annotation(self.hir_type_to_ts(&circuit.ret_type))),
+            Some(body),
+            self,
+        );
+        Statement::from(func)
     }
 
     fn export_type_alias(
@@ -468,7 +572,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     self.ident(&field.name),
                     self,
                 )),
-                Some(self.ts_type_annotation(self.hir_type_to_ts(&field.ty))),
+                Some(self.ts_type_annotation(self.hir_type_to_ts(&field.value_type))),
                 self,
             ));
         }
@@ -524,10 +628,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             None,
             self,
         );
-        let mut stmts = ArenaVec::new_in(self);
-        for stmt in &circuit.body {
-            stmts.push(self.lower_stmt(circuit, stmt));
-        }
+        let stmts = self.lower_stmts(circuit);
         let body = FunctionBody::boxed(SPAN, ArenaVec::new_in(self), stmts, self);
         Expression::new_arrow_function_expression(
             self.oxc_span(circuit.span),
@@ -567,17 +668,16 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             if !field.exported {
                 continue;
             }
-            // __compactRuntime.decodeCounter(state, <idx>)
+            let decode_fn = match field.adt {
+                LedgerAdt::Counter => "decodeCounter",
+                LedgerAdt::Cell => "decodeCell",
+            };
             let mut args = ArenaVec::with_capacity_in(2, self);
             args.push(Argument::from(self.expr_ident(SPAN, "state")));
             args.push(Argument::from(self.expr_num(SPAN, field.path[0] as f64)));
             let decode_call = self.expr_call(
                 self.oxc_span(field.span),
-                self.expr_member(
-                    SPAN,
-                    self.expr_ident(SPAN, "__compactRuntime"),
-                    "decodeCounter",
-                ),
+                self.expr_member(SPAN, self.expr_ident(SPAN, "__compactRuntime"), decode_fn),
                 args,
             );
             props.push(ObjectPropertyKind::new_object_property(
@@ -614,8 +714,6 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             self,
         );
 
-        // Build explicit function type for isolatedDeclarations compatibility:
-        // (state: __compactRuntime.StateValue) => Ledger
         let mut sig_params = ArenaVec::with_capacity_in(1, self);
         sig_params.push(FormalParameter::new(
             SPAN,
@@ -660,16 +758,12 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         ));
 
         let mut elements = ArenaVec::new_in(self);
-
-        // witnesses: W;
         elements.push(self.class_prop("witnesses", self.ts_type_ref("W", None)));
 
-        // circuits: Circuits<T>;
         let mut c_targs = ArenaVec::with_capacity_in(1, self);
         c_targs.push(self.ts_type_ref("T", None));
         elements.push(self.class_prop("circuits", self.ts_type_ref("Circuits", Some(c_targs))));
 
-        // impureCircuits: ImpureCircuits<T>;
         let mut ic_targs = ArenaVec::with_capacity_in(1, self);
         ic_targs.push(self.ts_type_ref("T", None));
         elements.push(self.class_prop(
@@ -677,10 +771,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             self.ts_type_ref("ImpureCircuits", Some(ic_targs)),
         ));
 
-        // constructor(witnesses: W) { ... }
         elements.push(self.build_contract_constructor());
-
-        // initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>
         elements.push(self.build_initial_state_method());
 
         let class = Class::boxed(
@@ -743,19 +834,16 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         );
 
         let mut stmts = ArenaVec::new_in(self);
-
-        // this.witnesses = witnesses;
         stmts.push(self.assign_this_prop("witnesses", self.expr_ident(SPAN, "witnesses")));
 
-        // Build object literal of impure circuit handlers
         let mut impure_props = ArenaVec::new_in(self);
         let mut all_props = ArenaVec::new_in(self);
         for circuit in &self.input.program.circuits {
             if !circuit.exported {
                 continue;
             }
-            let handler = self.build_impure_or_wrapped_circuit(circuit);
-            let prop_for_all = ObjectPropertyKind::new_object_property(
+            let handler = self.build_exported_circuit_handler(circuit);
+            all_props.push(ObjectPropertyKind::new_object_property(
                 self.oxc_span(circuit.span),
                 PropertyKind::Init,
                 PropertyKey::StaticIdentifier(IdentifierName::boxed(
@@ -768,11 +856,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 false,
                 false,
                 self,
-            );
-            all_props.push(prop_for_all);
+            ));
 
             if !circuit.pure {
-                let handler2 = self.build_impure_or_wrapped_circuit(circuit);
+                let handler2 = self.build_exported_circuit_handler(circuit);
                 impure_props.push(ObjectPropertyKind::new_object_property(
                     self.oxc_span(circuit.span),
                     PropertyKind::Init,
@@ -856,7 +943,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         )
     }
 
-    fn build_impure_or_wrapped_circuit(&self, circuit: &Circuit) -> Expression<'a> {
+    fn build_exported_circuit_handler(&self, circuit: &Circuit) -> Expression<'a> {
         let mut params = ArenaVec::with_capacity_in(circuit.params.len() + 1, self);
         let mut ctx_targs = ArenaVec::with_capacity_in(1, self);
         ctx_targs.push(self.ts_type_ref("T", None));
@@ -894,23 +981,81 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             self,
         );
 
+        let mut locals = HashMap::new();
         let mut stmts = ArenaVec::new_in(self);
+        let mut returned = false;
+
         for stmt in &circuit.body {
-            if let Stmt::Expr(expr) = stmt {
-                stmts.push(self.lower_impure_expr_stmt(expr));
+            match stmt {
+                Stmt::Const {
+                    local,
+                    name,
+                    ty,
+                    init,
+                    span,
+                } => {
+                    locals.insert(*local, name.clone());
+                    let init_expr = self.lower_expr(circuit, init, &locals);
+                    let declarator = VariableDeclarator::new(
+                        self.oxc_span(*span),
+                        self.binding_ident(self.oxc_span(*span), name),
+                        Some(self.ts_type_annotation(self.hir_type_to_ts(ty))),
+                        Some(init_expr),
+                        false,
+                        self,
+                    );
+                    let mut declarators = ArenaVec::with_capacity_in(1, self);
+                    declarators.push(declarator);
+                    stmts.push(Statement::from(Declaration::new_variable_declaration(
+                        self.oxc_span(*span),
+                        VariableDeclarationKind::Const,
+                        declarators,
+                        false,
+                        self,
+                    )));
+                }
+                Stmt::Expr(expr) => {
+                    stmts.push(Statement::new_expression_statement(
+                        self.oxc_span(expr.span),
+                        self.lower_expr(circuit, expr, &locals),
+                        self,
+                    ));
+                }
+                Stmt::Return { value, span } => {
+                    returned = true;
+                    let result_expr = value
+                        .as_ref()
+                        .map(|e| self.lower_expr(circuit, e, &locals))
+                        .unwrap_or_else(|| {
+                            Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self)
+                        });
+                    stmts.push(self.return_circuit_results(self.oxc_span(*span), result_expr));
+                }
             }
         }
 
-        // return { result: [], context, proofData: { input: [], output: [], publicTranscript: [], privateTranscriptOutputs: [] } };
-        let result_expr = if let Some(Stmt::Return {
-            value: Some(expr), ..
-        }) = circuit.body.last()
-        {
-            self.lower_expr(circuit, expr)
-        } else {
-            Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self)
-        };
+        if !returned {
+            let empty = Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self);
+            stmts.push(self.return_circuit_results(self.oxc_span(circuit.span), empty));
+        }
 
+        let mut res_targs = ArenaVec::with_capacity_in(2, self);
+        res_targs.push(self.ts_type_ref("T", None));
+        res_targs.push(self.hir_type_to_ts(&circuit.ret_type));
+
+        let body = FunctionBody::boxed(SPAN, ArenaVec::new_in(self), stmts, self);
+        Expression::new_arrow_function_expression(
+            self.oxc_span(circuit.span),
+            false,
+            None,
+            formal_params,
+            Some(self.ts_type_annotation(self.ts_runtime_type("CircuitResults", Some(res_targs)))),
+            ArrowFunctionBody::FunctionBody(body),
+            self,
+        )
+    }
+
+    fn return_circuit_results(&self, span: Span, result_expr: Expression<'a>) -> Statement<'a> {
         let mut ret_props = ArenaVec::with_capacity_in(2, self);
         ret_props.push(ObjectPropertyKind::new_object_property(
             SPAN,
@@ -932,91 +1077,271 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             false,
             self,
         ));
-        stmts.push(Statement::new_return_statement(
-            self.oxc_span(circuit.span),
+        Statement::new_return_statement(
+            span,
             Some(Expression::new_object_expression(SPAN, ret_props, self)),
-            self,
-        ));
-
-        let mut res_targs = ArenaVec::with_capacity_in(2, self);
-        res_targs.push(self.ts_type_ref("T", None));
-        res_targs.push(self.hir_type_to_ts(&circuit.ret_type));
-
-        let body = FunctionBody::boxed(SPAN, ArenaVec::new_in(self), stmts, self);
-        Expression::new_arrow_function_expression(
-            self.oxc_span(circuit.span),
-            false,
-            None,
-            formal_params,
-            Some(self.ts_type_annotation(self.ts_runtime_type("CircuitResults", Some(res_targs)))),
-            ArrowFunctionBody::FunctionBody(body),
             self,
         )
     }
 
-    fn lower_impure_expr_stmt(&self, expr: &Expr) -> Statement<'a> {
-        let span = self.oxc_span(expr.span);
-        if let ExprKind::LedgerCall { field, op, args } = &expr.kind {
-            let ledger_field = self.input.program.ledger_field(*field);
-            let mut ops = ArenaVec::new_in(self);
-            match op {
-                LedgerOp::CounterIncrement | LedgerOp::CounterDecrement => {
-                    let amount = match args.first().map(|a| &a.kind) {
-                        Some(ExprKind::IntLit(v)) => *v as f64,
-                        _ => 0.0,
-                    };
-                    let op_key = if matches!(op, LedgerOp::CounterIncrement) {
-                        "addi"
-                    } else {
-                        "subi"
-                    };
-
-                    // { idx: { cached: false, pushPath: true, path: [{ tag: 'value', value: { value: [new Uint8Array([0])], alignment: [{ tag: 'atom', value: { tag: 'bytes', length: 1 } }] } }] } }
-                    ops.push(ArrayExpressionElement::from(self.make_vm_op(
-                        "idx",
-                        vec![
-                            ("cached", self.expr_bool(span, false)),
-                            ("pushPath", self.expr_bool(span, true)),
-                            ("path", self.expr_num(span, ledger_field.path[0] as f64)),
-                        ],
-                    )));
-                    ops.push(ArrayExpressionElement::from(self.make_vm_op(
-                        op_key,
-                        vec![("immediate", self.expr_num(span, amount))],
-                    )));
-                    ops.push(ArrayExpressionElement::from(self.make_vm_op(
-                        "ins",
-                        vec![
-                            ("cached", self.expr_bool(span, true)),
-                            ("n", self.expr_num(span, ledger_field.path.len() as f64)),
-                        ],
+    fn lower_stmts(&self, circuit: &Circuit) -> ArenaVec<'a, Statement<'a>> {
+        let mut locals = HashMap::new();
+        let mut stmts = ArenaVec::new_in(self);
+        for stmt in &circuit.body {
+            match stmt {
+                Stmt::Const {
+                    local,
+                    name,
+                    ty,
+                    init,
+                    span,
+                } => {
+                    locals.insert(*local, name.clone());
+                    let init_expr = self.lower_expr(circuit, init, &locals);
+                    let declarator = VariableDeclarator::new(
+                        self.oxc_span(*span),
+                        self.binding_ident(self.oxc_span(*span), name),
+                        Some(self.ts_type_annotation(self.hir_type_to_ts(ty))),
+                        Some(init_expr),
+                        false,
+                        self,
+                    );
+                    let mut declarators = ArenaVec::with_capacity_in(1, self);
+                    declarators.push(declarator);
+                    stmts.push(Statement::from(Declaration::new_variable_declaration(
+                        self.oxc_span(*span),
+                        VariableDeclarationKind::Const,
+                        declarators,
+                        false,
+                        self,
                     )));
                 }
-                LedgerOp::CounterRead => {
-                    ops.push(ArrayExpressionElement::from(self.make_vm_op(
-                        "idx",
-                        vec![
-                            ("cached", self.expr_bool(span, false)),
-                            ("pushPath", self.expr_bool(span, false)),
-                            ("path", self.expr_num(span, ledger_field.path[0] as f64)),
-                        ],
-                    )));
+                Stmt::Expr(expr) => {
+                    stmts.push(Statement::new_expression_statement(
+                        self.oxc_span(expr.span),
+                        self.lower_expr(circuit, expr, &locals),
+                        self,
+                    ));
+                }
+                Stmt::Return { value, span } => {
+                    stmts.push(Statement::new_return_statement(
+                        self.oxc_span(*span),
+                        value.as_ref().map(|e| self.lower_expr(circuit, e, &locals)),
+                        self,
+                    ));
                 }
             }
-
-            // __compactRuntime.queryLedger(context, [...ops]);
-            let mut call_args = ArenaVec::with_capacity_in(2, self);
-            call_args.push(Argument::from(self.expr_ident(span, "context")));
-            call_args.push(Argument::from(Expression::new_array_expression(span, ops, self)));
-            let call = self.expr_call(
-                span,
-                self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "queryLedger"),
-                call_args,
-            );
-            return Statement::new_expression_statement(span, call, self);
         }
+        stmts
+    }
 
-        Statement::new_expression_statement(span, Expression::new_void_0(span, self), self)
+    fn lower_expr(
+        &self,
+        circuit: &Circuit,
+        expr: &Expr,
+        locals: &HashMap<LocalId, String>,
+    ) -> Expression<'a> {
+        let span = self.oxc_span(expr.span);
+        match &expr.kind {
+            ExprKind::IntLit(v) => Expression::new_big_int_literal(
+                span,
+                self.str_atom(&v.to_string()),
+                None,
+                oxc_syntax::number::BigintBase::Decimal,
+                self,
+            ),
+            ExprKind::BoolLit(b) => self.expr_bool(span, *b),
+            ExprKind::ParamRef(pid) => self.expr_ident(span, &circuit.params[pid.0 as usize].name),
+            ExprKind::LocalRef(lid) => self.expr_ident(span, &locals[lid]),
+            ExprKind::EnumVariant {
+                enum_id,
+                variant_idx,
+            } => {
+                let decl = self.input.program.enum_decl(*enum_id);
+                self.expr_member(
+                    span,
+                    self.expr_ident(span, &decl.name),
+                    &decl.variants[*variant_idx as usize],
+                )
+            }
+            ExprKind::Tuple(elems) => {
+                let mut arr = ArenaVec::with_capacity_in(elems.len(), self);
+                for elem in elems {
+                    arr.push(ArrayExpressionElement::from(
+                        self.lower_expr(circuit, elem, locals),
+                    ));
+                }
+                Expression::new_array_expression(span, arr, self)
+            }
+            ExprKind::Unary { op, operand } => {
+                let uop = match op {
+                    UnaryOp::Not => UnaryOperator::LogicalNot,
+                    UnaryOp::Neg => UnaryOperator::UnaryNegation,
+                };
+                Expression::new_unary_expression(
+                    span,
+                    uop,
+                    self.lower_expr(circuit, operand, locals),
+                    self,
+                )
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let bin_op = match op {
+                    BinaryOp::Add => BinaryOperator::Addition,
+                    BinaryOp::Sub => BinaryOperator::Subtraction,
+                    BinaryOp::Eq => BinaryOperator::StrictEquality,
+                    BinaryOp::Neq => BinaryOperator::StrictInequality,
+                };
+                Expression::new_binary_expression(
+                    span,
+                    self.lower_expr(circuit, lhs, locals),
+                    bin_op,
+                    self.lower_expr(circuit, rhs, locals),
+                    self,
+                )
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => Expression::new_conditional_expression(
+                span,
+                self.lower_expr(circuit, cond, locals),
+                self.lower_expr(circuit, then_branch, locals),
+                self.lower_expr(circuit, else_branch, locals),
+                self,
+            ),
+            ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => {
+                self.lower_expr(circuit, expr, locals)
+            }
+            ExprKind::Assert { cond, message } => {
+                let mut args = ArenaVec::with_capacity_in(2, self);
+                args.push(Argument::from(self.lower_expr(circuit, cond, locals)));
+                args.push(Argument::from(self.expr_str(span, message)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "assert"),
+                    args,
+                )
+            }
+            ExprKind::CircuitCall {
+                circuit: callee_id,
+                args,
+            } => {
+                let callee = self.input.program.circuit(*callee_id);
+                let mut call_args = ArenaVec::new_in(self);
+                if !callee.pure {
+                    call_args.push(Argument::from(self.expr_ident(span, "context")));
+                }
+                for a in args {
+                    call_args.push(Argument::from(self.lower_expr(circuit, a, locals)));
+                }
+                self.expr_call(
+                    span,
+                    self.expr_ident(span, &format!("_{}", callee.name)),
+                    call_args,
+                )
+            }
+            ExprKind::LedgerCall { field, op, args } => {
+                let ledger_field = self.input.program.ledger_field(*field);
+                match op {
+                    LedgerOp::CellRead => {
+                        let mut call_args = ArenaVec::with_capacity_in(2, self);
+                        call_args.push(Argument::from(self.expr_ident(span, "context")));
+                        call_args.push(Argument::from(
+                            self.expr_num(span, ledger_field.path[0] as f64),
+                        ));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "readCell",
+                            ),
+                            call_args,
+                        )
+                    }
+                    LedgerOp::CellWrite => {
+                        let mut call_args = ArenaVec::with_capacity_in(3, self);
+                        call_args.push(Argument::from(self.expr_ident(span, "context")));
+                        call_args.push(Argument::from(
+                            self.expr_num(span, ledger_field.path[0] as f64),
+                        ));
+                        call_args.push(Argument::from(self.lower_expr(circuit, &args[0], locals)));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "writeCell",
+                            ),
+                            call_args,
+                        )
+                    }
+                    LedgerOp::CounterIncrement | LedgerOp::CounterDecrement => {
+                        let amount = match args.first().map(|a| &a.kind) {
+                            Some(ExprKind::IntLit(v)) => *v as f64,
+                            _ => 0.0,
+                        };
+                        let op_key = if matches!(op, LedgerOp::CounterIncrement) {
+                            "addi"
+                        } else {
+                            "subi"
+                        };
+                        let mut ops = ArenaVec::with_capacity_in(3, self);
+                        ops.push(ArrayExpressionElement::from(self.make_vm_op(
+                            "idx",
+                            vec![
+                                ("cached", self.expr_bool(span, false)),
+                                ("pushPath", self.expr_bool(span, true)),
+                                ("path", self.expr_num(span, ledger_field.path[0] as f64)),
+                            ],
+                        )));
+                        ops.push(ArrayExpressionElement::from(self.make_vm_op(
+                            op_key,
+                            vec![("immediate", self.expr_num(span, amount))],
+                        )));
+                        ops.push(ArrayExpressionElement::from(self.make_vm_op(
+                            "ins",
+                            vec![
+                                ("cached", self.expr_bool(span, true)),
+                                ("n", self.expr_num(span, ledger_field.path.len() as f64)),
+                            ],
+                        )));
+                        let mut call_args = ArenaVec::with_capacity_in(2, self);
+                        call_args.push(Argument::from(self.expr_ident(span, "context")));
+                        call_args.push(Argument::from(Expression::new_array_expression(
+                            span, ops, self,
+                        )));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "queryLedger",
+                            ),
+                            call_args,
+                        )
+                    }
+                    LedgerOp::CounterRead => {
+                        let mut call_args = ArenaVec::with_capacity_in(2, self);
+                        call_args.push(Argument::from(self.expr_ident(span, "context")));
+                        call_args.push(Argument::from(
+                            self.expr_num(span, ledger_field.path[0] as f64),
+                        ));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "readCounter",
+                            ),
+                            call_args,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fn make_vm_op(&self, name: &str, fields: Vec<(&str, Expression<'a>)>) -> Expression<'a> {
@@ -1151,64 +1476,14 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             Expression::new_object_expression(SPAN, props, self),
         )
     }
-
-    fn lower_stmt(&self, circuit: &Circuit, stmt: &Stmt) -> Statement<'a> {
-        match stmt {
-            Stmt::Expr(expr) => {
-                Statement::new_expression_statement(self.oxc_span(expr.span), self.lower_expr(circuit, expr), self)
-            }
-            Stmt::Return { value, span } => Statement::new_return_statement(
-                self.oxc_span(*span),
-                value.as_ref().map(|e| self.lower_expr(circuit, e)),
-                self,
-            ),
-        }
-    }
-
-    fn lower_expr(&self, circuit: &Circuit, expr: &Expr) -> Expression<'a> {
-        let span = self.oxc_span(expr.span);
-        match &expr.kind {
-            ExprKind::IntLit(v) => Expression::new_big_int_literal(
-                span,
-                self.str_atom(&v.to_string()),
-                None,
-                oxc_syntax::number::BigintBase::Decimal,
-                self,
-            ),
-            ExprKind::ParamRef(pid) => {
-                self.expr_ident(span, &circuit.params[pid.0 as usize].name)
-            }
-            ExprKind::Tuple(elems) => {
-                let mut arr = ArenaVec::with_capacity_in(elems.len(), self);
-                for elem in elems {
-                    arr.push(ArrayExpressionElement::from(self.lower_expr(circuit, elem)));
-                }
-                Expression::new_array_expression(span, arr, self)
-            }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let bin_op = match op {
-                    BinaryOp::Add => BinaryOperator::Addition,
-                    BinaryOp::Sub => BinaryOperator::Subtraction,
-                };
-                Expression::new_binary_expression(
-                    span,
-                    self.lower_expr(circuit, lhs),
-                    bin_op,
-                    self.lower_expr(circuit, rhs),
-                    self,
-                )
-            }
-            ExprKind::LedgerCall { .. } => Expression::new_void_0(span, self),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use compact_hir::lower;
     use compact_parser::parse;
+    use compact_sema::check;
     use compact_span::SourceMap;
     use compact_test_utils::assert_compact_snapshot;
 
@@ -1216,16 +1491,20 @@ mod tests {
 
     fn compile_ts_bundle(src: &str) -> String {
         let mut sm = SourceMap::new();
-        let id = sm.add_file("counter.compact", src);
+        let id = sm.add_file("contract.compact", src);
         let file = sm.get(id);
         let parsed = parse(file);
         assert!(!parsed.diagnostics.has_errors());
-        let lowered = lower(file, &parsed.ast);
-        assert!(!lowered.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(
+            !checked.diagnostics.has_errors(),
+            "unexpected sema errors: {:?}",
+            checked.diagnostics
+        );
         let hashes = BTreeMap::new();
         let out = generate_ts(&TsCodegenInput {
-            program: &lowered.program,
-            source_name: "counter.compact",
+            program: &checked.program,
+            source_name: "contract.compact",
             source_text: src,
             verifier_key_hashes: &hashes,
         })
@@ -1246,6 +1525,35 @@ mod tests {
 
             export circuit increment(): [] {
               round.increment(1);
+            }
+            "#,
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_cell_enum_ts_js_dts() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            export enum STATE { unset, set }
+
+            export ledger value: Field;
+            ledger state: STATE;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            export circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "already set");
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            export circuit get(): Field {
+              return in_state(STATE.set) ? value : 0 as Field;
             }
             "#,
             compile_ts_bundle

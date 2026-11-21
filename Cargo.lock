@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "compact-hir",
  "compact-parser",
+ "compact-sema",
  "compact-span",
  "compact-test-utils",
  "hex",
@@ -500,6 +501,7 @@ version = "0.1.0"
 dependencies = [
  "compact-hir",
  "compact-parser",
+ "compact-sema",
  "compact-span",
  "compact-test-utils",
  "oxc_allocator",
@@ -521,6 +523,7 @@ dependencies = [
  "compact-circuit",
  "compact-hir",
  "compact-parser",
+ "compact-sema",
  "compact-span",
  "compact-test-utils",
  "hex",
@@ -556,6 +559,7 @@ dependencies = [
  "compact-fmt",
  "compact-hir",
  "compact-parser",
+ "compact-sema",
  "compact-span",
  "miette",
  "rayon",
@@ -578,11 +582,7 @@ dependencies = [
 name = "compact-hir"
 version = "0.1.0"
 dependencies = [
- "compact-ast",
- "compact-diagnostics",
- "compact-parser",
  "compact-span",
- "compact-test-utils",
 ]
 
 [[package]]
@@ -594,6 +594,18 @@ dependencies = [
  "compact-span",
  "compact-test-utils",
  "soa-rs",
+]
+
+[[package]]
+name = "compact-sema"
+version = "0.1.0"
+dependencies = [
+ "compact-ast",
+ "compact-diagnostics",
+ "compact-hir",
+ "compact-parser",
+ "compact-span",
+ "compact-test-utils",
 ]
 
 [[package]]

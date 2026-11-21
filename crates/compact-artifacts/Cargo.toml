@@ -12,5 +12,6 @@ sha2.workspace = true
 
 [dev-dependencies]
 compact-parser.workspace = true
+compact-sema.workspace = true
 compact-span.workspace = true
 compact-test-utils.workspace = true
