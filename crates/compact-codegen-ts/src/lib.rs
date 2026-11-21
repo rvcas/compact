@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use compact_hir::{
-    BinaryOp, Circuit, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
+    BinaryOp, Circuit, CircuitId, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId, Param,
     Program as HirProgram, Stmt, Type, UnaryOp,
 };
 use compact_span::Span as CompactSpan;
@@ -224,9 +224,22 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         match ty {
             Type::Field | Type::Uint(_) => TSType::new_ts_big_int_keyword(SPAN, self),
             Type::Boolean => TSType::new_ts_boolean_keyword(SPAN, self),
+            Type::Bytes(_) => self.ts_type_ref("Uint8Array", None),
+            Type::Vector(len, elem) => {
+                let mut ts_elems = ArenaVec::with_capacity_in(*len as usize, self);
+                for _ in 0..*len {
+                    ts_elems.push(TSTupleElement::from(self.hir_type_to_ts(elem)));
+                }
+                TSType::new_ts_tuple_type(SPAN, ts_elems, self)
+            }
             Type::Enum(id) => {
                 let decl = self.input.program.enum_decl(*id);
                 self.ts_type_ref(&decl.name, None)
+            }
+            Type::Maybe(inner) => {
+                let mut targs = ArenaVec::with_capacity_in(1, self);
+                targs.push(self.hir_type_to_ts(inner));
+                self.ts_type_ref("Maybe", Some(targs))
             }
             Type::Tuple(elems) => {
                 let mut ts_elems = ArenaVec::with_capacity_in(elems.len(), self);
@@ -238,20 +251,173 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         }
     }
 
+    fn collect_called_circuits(&self) -> HashSet<CircuitId> {
+        fn visit_expr(expr: &Expr, out: &mut HashSet<CircuitId>) {
+            match &expr.kind {
+                ExprKind::CircuitCall { circuit, args } => {
+                    out.insert(*circuit);
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+                ExprKind::Tuple(es) | ExprKind::Vector(es) => {
+                    for e in es {
+                        visit_expr(e, out);
+                    }
+                }
+                ExprKind::Unary { operand, .. }
+                | ExprKind::Cast { expr: operand, .. }
+                | ExprKind::Disclose(operand)
+                | ExprKind::PersistentHash { arg: operand, .. }
+                | ExprKind::MaybeSome(operand) => visit_expr(operand, out),
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    visit_expr(lhs, out);
+                    visit_expr(rhs, out);
+                }
+                ExprKind::Ternary {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    visit_expr(cond, out);
+                    visit_expr(then_branch, out);
+                    visit_expr(else_branch, out);
+                }
+                ExprKind::Assert { cond, .. } => visit_expr(cond, out),
+                ExprKind::WitnessCall { args, .. } | ExprKind::LedgerCall { args, .. } => {
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+                ExprKind::IntLit(_)
+                | ExprKind::BoolLit(_)
+                | ExprKind::BytesLit(_)
+                | ExprKind::Default(_)
+                | ExprKind::ParamRef(_)
+                | ExprKind::LocalRef(_)
+                | ExprKind::EnumVariant { .. }
+                | ExprKind::MaybeNone(_) => {}
+            }
+        }
+        fn visit_stmts(stmts: &[Stmt], out: &mut HashSet<CircuitId>) {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Const { init, .. } => visit_expr(init, out),
+                    Stmt::Expr(e) => visit_expr(e, out),
+                    Stmt::Return { value: Some(e), .. } => visit_expr(e, out),
+                    Stmt::Return { value: None, .. } => {}
+                }
+            }
+        }
+        let mut called = HashSet::new();
+        if let Some(ctor) = &self.input.program.constructor {
+            visit_stmts(&ctor.body, &mut called);
+        }
+        for c in &self.input.program.circuits {
+            visit_stmts(&c.body, &mut called);
+        }
+        called
+    }
+
+    fn uses_maybe(&self) -> bool {
+        fn ty_uses_maybe(ty: &Type) -> bool {
+            match ty {
+                Type::Maybe(_) => true,
+                Type::Vector(_, e) => ty_uses_maybe(e),
+                Type::Tuple(es) => es.iter().any(ty_uses_maybe),
+                _ => false,
+            }
+        }
+        self.input
+            .program
+            .exported_stdlib_types
+            .iter()
+            .any(|s| s == "Maybe")
+            || self
+                .input
+                .program
+                .circuits
+                .iter()
+                .any(|c| ty_uses_maybe(&c.ret_type) || c.params.iter().any(|p| ty_uses_maybe(&p.ty)))
+            || self
+                .input
+                .program
+                .ledger_fields
+                .iter()
+                .any(|f| ty_uses_maybe(&f.value_type))
+            || self
+                .input
+                .program
+                .witnesses
+                .iter()
+                .any(|w| ty_uses_maybe(&w.ret_type) || w.params.iter().any(|p| ty_uses_maybe(&p.ty)))
+    }
+
+    fn build_maybe_type(&self, exported: bool) -> Statement<'a> {
+        let mut tparams = ArenaVec::with_capacity_in(1, self);
+        tparams.push(self.ts_type_param("T"));
+        let mut members = ArenaVec::with_capacity_in(2, self);
+        members.push(TSSignature::new_ts_property_signature(
+            SPAN,
+            false,
+            false,
+            false,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident("is_some"), self)),
+            Some(self.ts_type_annotation(TSType::new_ts_boolean_keyword(SPAN, self))),
+            self,
+        ));
+        members.push(TSSignature::new_ts_property_signature(
+            SPAN,
+            false,
+            false,
+            false,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident("value"), self)),
+            Some(self.ts_type_annotation(self.ts_type_ref("T", None))),
+            self,
+        ));
+        let obj = TSType::new_ts_type_literal(SPAN, members, self);
+        let type_parameters = Some(TSTypeParameterDeclaration::boxed(SPAN, tparams, self));
+        let decl = Declaration::new_ts_type_alias_declaration(
+            SPAN,
+            BindingIdentifier::new(SPAN, self.ident("Maybe"), self),
+            type_parameters,
+            obj,
+            false,
+            self,
+        );
+        if exported {
+            Statement::new_export_declaration(SPAN, decl, self)
+        } else {
+            Statement::from(decl)
+        }
+    }
+
     fn build_program(&self) -> Program<'a> {
         let mut body = ArenaVec::new_in(self);
 
         // import * as __compactRuntime from '@midnight-ntwrk/compact-runtime';
         body.push(self.build_runtime_import());
 
+        // Emit standard library types such as `export type Maybe<T> = { is_some: boolean; value: T };`
+        if self.uses_maybe() {
+            let exported = self
+                .input
+                .program
+                .exported_stdlib_types
+                .iter()
+                .any(|s| s == "Maybe");
+            body.push(self.build_maybe_type(exported));
+        }
+
         // Emit enum declarations (exported if exported in Compact; still emitted locally if used).
         for enum_decl in &self.input.program.enums {
             body.push(self.build_enum_decl(enum_decl));
         }
 
-        // Emit internal helper circuits as module-level functions so exported circuits can call them.
+        // Emit helper functions for non-exported circuits and any circuit called by another circuit/constructor.
+        let called_circuits = self.collect_called_circuits();
         for circuit in &self.input.program.circuits {
-            if !circuit.exported {
+            if !circuit.exported || called_circuits.contains(&circuit.id) {
                 body.push(self.build_helper_circuit_fn(circuit));
             }
         }
@@ -450,8 +616,68 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
     fn build_witnesses_type(&self) -> Statement<'a> {
         let mut tparams = ArenaVec::with_capacity_in(1, self);
         tparams.push(self.ts_type_param("T"));
-        let empty_obj = TSType::new_ts_type_literal(SPAN, ArenaVec::new_in(self), self);
-        self.export_type_alias("Witnesses", Some(tparams), empty_obj)
+        let mut members = ArenaVec::with_capacity_in(self.input.program.witnesses.len(), self);
+        for w in &self.input.program.witnesses {
+            let mut params = ArenaVec::with_capacity_in(w.params.len() + 1, self);
+            let mut ctx_args = ArenaVec::with_capacity_in(2, self);
+            ctx_args.push(self.ts_type_ref("Ledger", None));
+            ctx_args.push(self.ts_type_ref("T", None));
+            params.push(FormalParameter::new(
+                SPAN,
+                ArenaVec::new_in(self),
+                self.binding_ident(SPAN, "context"),
+                Some(self.ts_type_annotation(self.ts_runtime_type("WitnessContext", Some(ctx_args)))),
+                None,
+                false,
+                None,
+                false,
+                false,
+                self,
+            ));
+            for p in &w.params {
+                params.push(FormalParameter::new(
+                    SPAN,
+                    ArenaVec::new_in(self),
+                    self.binding_ident(SPAN, &p.name),
+                    Some(self.ts_type_annotation(self.hir_type_to_ts(&p.ty))),
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    self,
+                ));
+            }
+            let formal_params = FormalParameters::boxed(
+                SPAN,
+                FormalParameterKind::Signature,
+                params,
+                None,
+                self,
+            );
+            let mut ret_tuple = ArenaVec::with_capacity_in(2, self);
+            ret_tuple.push(TSTupleElement::from(self.ts_type_ref("T", None)));
+            ret_tuple.push(TSTupleElement::from(self.hir_type_to_ts(&w.ret_type)));
+            let ret_ty = TSType::new_ts_tuple_type(SPAN, ret_tuple, self);
+            members.push(TSSignature::new_ts_method_signature(
+                SPAN,
+                PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                    SPAN,
+                    self.ident(&w.name),
+                    self,
+                )),
+                false,
+                false,
+                TSMethodSignatureKind::Method,
+                None,
+                None,
+                formal_params,
+                Some(self.ts_type_annotation(ret_ty)),
+                self,
+            ));
+        }
+        let obj = TSType::new_ts_type_literal(SPAN, members, self);
+        self.export_type_alias("Witnesses", Some(tparams), obj)
     }
 
     fn build_pure_circuits_type(&self) -> Statement<'a> {
@@ -995,7 +1221,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     span,
                 } => {
                     locals.insert(*local, name.clone());
-                    let init_expr = self.lower_expr(circuit, init, &locals);
+                    let init_expr = self.lower_expr(&circuit.params, init, &locals);
                     let declarator = VariableDeclarator::new(
                         self.oxc_span(*span),
                         self.binding_ident(self.oxc_span(*span), name),
@@ -1017,7 +1243,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 Stmt::Expr(expr) => {
                     stmts.push(Statement::new_expression_statement(
                         self.oxc_span(expr.span),
-                        self.lower_expr(circuit, expr, &locals),
+                        self.lower_expr(&circuit.params, expr, &locals),
                         self,
                     ));
                 }
@@ -1025,7 +1251,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     returned = true;
                     let result_expr = value
                         .as_ref()
-                        .map(|e| self.lower_expr(circuit, e, &locals))
+                        .map(|e| self.lower_expr(&circuit.params, e, &locals))
                         .unwrap_or_else(|| {
                             Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self)
                         });
@@ -1085,9 +1311,13 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
     }
 
     fn lower_stmts(&self, circuit: &Circuit) -> ArenaVec<'a, Statement<'a>> {
+        self.lower_stmts_for(&circuit.params, &circuit.body)
+    }
+
+    fn lower_stmts_for(&self, params: &[Param], body: &[Stmt]) -> ArenaVec<'a, Statement<'a>> {
         let mut locals = HashMap::new();
         let mut stmts = ArenaVec::new_in(self);
-        for stmt in &circuit.body {
+        for stmt in body {
             match stmt {
                 Stmt::Const {
                     local,
@@ -1097,7 +1327,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     span,
                 } => {
                     locals.insert(*local, name.clone());
-                    let init_expr = self.lower_expr(circuit, init, &locals);
+                    let init_expr = self.lower_expr(params, init, &locals);
                     let declarator = VariableDeclarator::new(
                         self.oxc_span(*span),
                         self.binding_ident(self.oxc_span(*span), name),
@@ -1119,14 +1349,14 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 Stmt::Expr(expr) => {
                     stmts.push(Statement::new_expression_statement(
                         self.oxc_span(expr.span),
-                        self.lower_expr(circuit, expr, &locals),
+                        self.lower_expr(params, expr, &locals),
                         self,
                     ));
                 }
                 Stmt::Return { value, span } => {
                     stmts.push(Statement::new_return_statement(
                         self.oxc_span(*span),
-                        value.as_ref().map(|e| self.lower_expr(circuit, e, &locals)),
+                        value.as_ref().map(|e| self.lower_expr(params, e, &locals)),
                         self,
                     ));
                 }
@@ -1135,9 +1365,87 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         stmts
     }
 
+    fn default_expr_for_type(&self, span: Span, ty: &Type) -> Expression<'a> {
+        match ty {
+            Type::Field | Type::Uint(_) => Expression::new_big_int_literal(
+                span,
+                self.str_atom("0"),
+                None,
+                oxc_syntax::number::BigintBase::Decimal,
+                self,
+            ),
+            Type::Boolean => self.expr_bool(span, false),
+            Type::Bytes(len) => {
+                let mut args = ArenaVec::with_capacity_in(1, self);
+                args.push(Argument::from(self.expr_num(span, *len as f64)));
+                Expression::new_new_expression(
+                    span,
+                    self.expr_ident(span, "Uint8Array"),
+                    None,
+                    args,
+                    self,
+                )
+            }
+            Type::Enum(id) => {
+                let decl = self.input.program.enum_decl(*id);
+                self.expr_member(span, self.expr_ident(span, &decl.name), &decl.variants[0])
+            }
+            Type::Tuple(elems) => {
+                let mut arr = ArenaVec::with_capacity_in(elems.len(), self);
+                for e in elems {
+                    arr.push(ArrayExpressionElement::from(
+                        self.default_expr_for_type(span, e),
+                    ));
+                }
+                Expression::new_array_expression(span, arr, self)
+            }
+            Type::Vector(len, elem) => {
+                let mut arr = ArenaVec::with_capacity_in(*len as usize, self);
+                for _ in 0..*len {
+                    arr.push(ArrayExpressionElement::from(
+                        self.default_expr_for_type(span, elem),
+                    ));
+                }
+                Expression::new_array_expression(span, arr, self)
+            }
+            Type::Maybe(inner) => {
+                let mut props = ArenaVec::with_capacity_in(2, self);
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("is_some"),
+                        self,
+                    )),
+                    self.expr_bool(span, false),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("value"),
+                        self,
+                    )),
+                    self.default_expr_for_type(span, inner),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                Expression::new_object_expression(span, props, self)
+            }
+        }
+    }
+
     fn lower_expr(
         &self,
-        circuit: &Circuit,
+        params: &[Param],
         expr: &Expr,
         locals: &HashMap<LocalId, String>,
     ) -> Expression<'a> {
@@ -1151,7 +1459,25 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 self,
             ),
             ExprKind::BoolLit(b) => self.expr_bool(span, *b),
-            ExprKind::ParamRef(pid) => self.expr_ident(span, &circuit.params[pid.0 as usize].name),
+            ExprKind::BytesLit(bytes) => {
+                let mut elems = ArenaVec::with_capacity_in(bytes.len(), self);
+                for &b in bytes {
+                    elems.push(ArrayExpressionElement::from(self.expr_num(span, b as f64)));
+                }
+                let mut args = ArenaVec::with_capacity_in(1, self);
+                args.push(Argument::from(Expression::new_array_expression(
+                    span, elems, self,
+                )));
+                Expression::new_new_expression(
+                    span,
+                    self.expr_ident(span, "Uint8Array"),
+                    None,
+                    args,
+                    self,
+                )
+            }
+            ExprKind::Default(ty) => self.default_expr_for_type(span, ty),
+            ExprKind::ParamRef(pid) => self.expr_ident(span, &params[pid.0 as usize].name),
             ExprKind::LocalRef(lid) => self.expr_ident(span, &locals[lid]),
             ExprKind::EnumVariant {
                 enum_id,
@@ -1164,11 +1490,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     &decl.variants[*variant_idx as usize],
                 )
             }
-            ExprKind::Tuple(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
                 let mut arr = ArenaVec::with_capacity_in(elems.len(), self);
                 for elem in elems {
                     arr.push(ArrayExpressionElement::from(
-                        self.lower_expr(circuit, elem, locals),
+                        self.lower_expr(params, elem, locals),
                     ));
                 }
                 Expression::new_array_expression(span, arr, self)
@@ -1181,11 +1507,36 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 Expression::new_unary_expression(
                     span,
                     uop,
-                    self.lower_expr(circuit, operand, locals),
+                    self.lower_expr(params, operand, locals),
                     self,
                 )
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
+                    && matches!(
+                        lhs.ty,
+                        Type::Bytes(_) | Type::Vector(_, _) | Type::Tuple(_) | Type::Maybe(_)
+                    )
+                {
+                    let mut eq_args = ArenaVec::with_capacity_in(2, self);
+                    eq_args.push(Argument::from(self.lower_expr(params, lhs, locals)));
+                    eq_args.push(Argument::from(self.lower_expr(params, rhs, locals)));
+                    let eq_call = self.expr_call(
+                        span,
+                        self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "equal"),
+                        eq_args,
+                    );
+                    return if matches!(op, BinaryOp::Neq) {
+                        Expression::new_unary_expression(
+                            span,
+                            UnaryOperator::LogicalNot,
+                            eq_call,
+                            self,
+                        )
+                    } else {
+                        eq_call
+                    };
+                }
                 let bin_op = match op {
                     BinaryOp::Add => BinaryOperator::Addition,
                     BinaryOp::Sub => BinaryOperator::Subtraction,
@@ -1194,9 +1545,9 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 };
                 Expression::new_binary_expression(
                     span,
-                    self.lower_expr(circuit, lhs, locals),
+                    self.lower_expr(params, lhs, locals),
                     bin_op,
-                    self.lower_expr(circuit, rhs, locals),
+                    self.lower_expr(params, rhs, locals),
                     self,
                 )
             }
@@ -1206,23 +1557,127 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 else_branch,
             } => Expression::new_conditional_expression(
                 span,
-                self.lower_expr(circuit, cond, locals),
-                self.lower_expr(circuit, then_branch, locals),
-                self.lower_expr(circuit, else_branch, locals),
+                self.lower_expr(params, cond, locals),
+                self.lower_expr(params, then_branch, locals),
+                self.lower_expr(params, else_branch, locals),
                 self,
             ),
             ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => {
-                self.lower_expr(circuit, expr, locals)
+                self.lower_expr(params, expr, locals)
             }
             ExprKind::Assert { cond, message } => {
                 let mut args = ArenaVec::with_capacity_in(2, self);
-                args.push(Argument::from(self.lower_expr(circuit, cond, locals)));
+                args.push(Argument::from(self.lower_expr(params, cond, locals)));
                 args.push(Argument::from(self.expr_str(span, message)));
                 self.expr_call(
                     span,
                     self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "assert"),
                     args,
                 )
+            }
+            ExprKind::WitnessCall { witness, args } => {
+                let w = self.input.program.witness(*witness);
+                let witness_fn = self.expr_member(
+                    span,
+                    self.expr_member(
+                        span,
+                        Expression::new_this_expression(span, self),
+                        "witnesses",
+                    ),
+                    &w.name,
+                );
+                let mut call_args = ArenaVec::with_capacity_in(args.len() + 2, self);
+                call_args.push(Argument::from(witness_fn));
+                call_args.push(Argument::from(self.expr_ident(span, "context")));
+                for a in args {
+                    call_args.push(Argument::from(self.lower_expr(params, a, locals)));
+                }
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "callWitness",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::PersistentHash { arg, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "persistentHash",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::MaybeSome(inner) => {
+                let mut props = ArenaVec::with_capacity_in(2, self);
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("is_some"),
+                        self,
+                    )),
+                    self.expr_bool(span, true),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("value"),
+                        self,
+                    )),
+                    self.lower_expr(params, inner, locals),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                Expression::new_object_expression(span, props, self)
+            }
+            ExprKind::MaybeNone(inner_ty) => {
+                let mut props = ArenaVec::with_capacity_in(2, self);
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("is_some"),
+                        self,
+                    )),
+                    self.expr_bool(span, false),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("value"),
+                        self,
+                    )),
+                    self.default_expr_for_type(span, inner_ty),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                Expression::new_object_expression(span, props, self)
             }
             ExprKind::CircuitCall {
                 circuit: callee_id,
@@ -1234,7 +1689,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     call_args.push(Argument::from(self.expr_ident(span, "context")));
                 }
                 for a in args {
-                    call_args.push(Argument::from(self.lower_expr(circuit, a, locals)));
+                    call_args.push(Argument::from(self.lower_expr(params, a, locals)));
                 }
                 self.expr_call(
                     span,
@@ -1267,7 +1722,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         call_args.push(Argument::from(
                             self.expr_num(span, ledger_field.path[0] as f64),
                         ));
-                        call_args.push(Argument::from(self.lower_expr(circuit, &args[0], locals)));
+                        call_args.push(Argument::from(self.lower_expr(params, &args[0], locals)));
                         self.expr_call(
                             span,
                             self.expr_member(
@@ -1373,7 +1828,9 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
     }
 
     fn build_initial_state_method(&self) -> ClassElement<'a> {
-        let mut params = ArenaVec::with_capacity_in(1, self);
+        let ctor = self.input.program.constructor.as_ref();
+        let extra_params = ctor.map_or(0, |c| c.params.len());
+        let mut params = ArenaVec::with_capacity_in(1 + extra_params, self);
         let mut ctx_targs = ArenaVec::with_capacity_in(1, self);
         ctx_targs.push(self.ts_type_ref("T", None));
         params.push(FormalParameter::new(
@@ -1390,6 +1847,22 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             false,
             self,
         ));
+        if let Some(ctor) = ctor {
+            for p in &ctor.params {
+                params.push(FormalParameter::new(
+                    self.oxc_span(p.span),
+                    ArenaVec::new_in(self),
+                    self.binding_ident(self.oxc_span(p.span), &p.name),
+                    Some(self.ts_type_annotation(self.hir_type_to_ts(&p.ty))),
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                    self,
+                ));
+            }
+        }
         let formal_params = FormalParameters::boxed(
             SPAN,
             FormalParameterKind::FormalParameter,
@@ -1402,6 +1875,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         ret_targs.push(self.ts_type_ref("T", None));
         let ret_ty = self.ts_runtime_type("ConstructorResult", Some(ret_targs));
 
+        let mut stmts = if let Some(ctor) = ctor {
+            self.lower_stmts_for(&ctor.params, &ctor.body)
+        } else {
+            ArenaVec::new_in(self)
+        };
         let mut call_args = ArenaVec::with_capacity_in(1, self);
         call_args.push(Argument::from(self.expr_ident(SPAN, "context")));
         let call = self.expr_call(
@@ -1413,7 +1891,6 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             ),
             call_args,
         );
-        let mut stmts = ArenaVec::with_capacity_in(1, self);
         stmts.push(Statement::new_return_statement(SPAN, Some(call), self));
         let body = FunctionBody::boxed(SPAN, ArenaVec::new_in(self), stmts, self);
 
@@ -1554,6 +2031,65 @@ mod tests {
 
             export circuit get(): Field {
               return in_state(STATE.set) ? value : 0 as Field;
+            }
+            "#,
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_tiny_contract() {
+        assert_compact_snapshot!(
+            r#"
+            export {Maybe}
+            export {set, get, clear, public_key}
+
+            import CompactStandardLibrary;
+
+            enum STATE { unset, set }
+
+            ledger authority: Bytes<32>;
+            export ledger value: Field;
+            ledger state: STATE;
+
+            constructor(v: Field) {
+              const sk = private$secret_key();
+              authority = public_key(sk);
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            witness private$secret_key(): Bytes<32>;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              authority = apk;
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            circuit get(): Maybe<Field> {
+              return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+            }
+
+            circuit clear(): [] {
+              assert(in_state(STATE.set), "clear: no value is currently recorded");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority, "clear: attempted clear without proper authorization");
+              authority = default<Bytes<32>>;
+              value = default<Field>;
+              state = STATE.unset;
+            }
+
+            circuit public_key(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
             }
             "#,
             compile_ts_bundle

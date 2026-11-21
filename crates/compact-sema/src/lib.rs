@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
 use compact_hir::{
-    BinaryOp, Circuit, CircuitId, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt, LedgerField,
-    LedgerFieldId, LedgerOp, LocalId, Param, ParamId, Program, Stmt, Type, UnaryOp,
+    BinaryOp, Circuit, CircuitId, Constructor, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt,
+    LedgerField, LedgerFieldId, LedgerOp, LocalId, Param, ParamId, Program, Stmt, Type, UnaryOp,
+    WitnessDecl, WitnessId,
 };
 use compact_span::{SourceFile, Span};
 
@@ -21,23 +22,32 @@ pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
         file,
         ast,
         diagnostics: DiagnosticBag::new(),
+        has_stdlib: false,
         enums: Vec::new(),
         enum_by_name: HashMap::new(),
         ledger_fields: Vec::new(),
         ledger_by_name: HashMap::new(),
+        witnesses: Vec::new(),
+        witness_by_name: HashMap::new(),
+        constructor_node: None,
+        constructor: None,
         circuit_sigs: Vec::new(),
         circuit_by_name: HashMap::new(),
         circuits: Vec::new(),
+        export_list_tokens: Vec::new(),
+        exported_stdlib_types: Vec::new(),
     };
     analyzer.run();
 
     let mut program = Program {
         enums: analyzer.enums,
         ledger_fields: analyzer.ledger_fields,
+        witnesses: analyzer.witnesses,
+        constructor: analyzer.constructor,
         circuits: analyzer.circuits,
+        exported_stdlib_types: analyzer.exported_stdlib_types,
     };
 
-    // Pass 3: Reject recursive circuits, propagate transitive purity, and run WPP witness checks.
     witness::reject_recursive_circuits(file, &program, &mut analyzer.diagnostics);
     propagate_purity(file, &mut program, &analyzer.circuit_sigs, &mut analyzer.diagnostics);
     if !analyzer.diagnostics.has_errors() {
@@ -72,13 +82,20 @@ struct Analyzer<'a> {
     file: &'a SourceFile,
     ast: &'a Ast,
     diagnostics: DiagnosticBag,
+    has_stdlib: bool,
     enums: Vec<EnumDecl>,
     enum_by_name: HashMap<String, EnumId>,
     ledger_fields: Vec<LedgerField>,
     ledger_by_name: HashMap<String, LedgerFieldId>,
+    witnesses: Vec<WitnessDecl>,
+    witness_by_name: HashMap<String, WitnessId>,
+    constructor_node: Option<NodeIndex>,
+    constructor: Option<Constructor>,
     circuit_sigs: Vec<CircuitSig>,
     circuit_by_name: HashMap<String, CircuitId>,
     circuits: Vec<Circuit>,
+    export_list_tokens: Vec<TokenIndex>,
+    exported_stdlib_types: Vec<String>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -89,13 +106,15 @@ impl<'a> Analyzer<'a> {
     fn run(&mut self) {
         let decls: Vec<_> = self.ast.root_decls().collect();
 
-        // Pass 1a: imports and enums (types must exist before ledger/circuit signatures).
+        // Pass 1a: imports, export lists, and enums.
         for &decl in &decls {
             match self.ast.node_tag(decl) {
                 NodeTag::ImportDecl => {
                     let import = self.ast.import_decl(decl);
                     let name = self.text(import.name_token);
-                    if name != "CompactStandardLibrary" {
+                    if name == "CompactStandardLibrary" {
+                        self.has_stdlib = true;
+                    } else {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
                             self.ast.token_span(import.name_token),
@@ -103,21 +122,66 @@ impl<'a> Analyzer<'a> {
                         ));
                     }
                 }
+                NodeTag::ExportListDecl => {
+                    let list = self.ast.export_list_decl(decl);
+                    self.export_list_tokens
+                        .extend(self.ast.extra_tokens(list.names_start, list.names_end));
+                }
                 NodeTag::EnumDecl => self.register_enum(decl),
                 _ => {}
             }
         }
 
-        // Pass 1b: ledger declarations and circuit signatures.
+        // Pass 1b: ledger declarations, witnesses, constructor, and circuit signatures.
         for &decl in &decls {
             match self.ast.node_tag(decl) {
                 NodeTag::LedgerDecl => self.register_ledger(decl),
+                NodeTag::WitnessDecl => self.register_witness(decl),
+                NodeTag::ConstructorDecl => {
+                    if self.constructor_node.is_some() {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            self.ast.node_span(decl),
+                            "duplicate `constructor` declaration",
+                        ));
+                    } else {
+                        self.constructor_node = Some(decl);
+                    }
+                }
                 NodeTag::CircuitDecl => self.register_circuit_sig(decl),
                 _ => {}
             }
         }
 
-        // Pass 2: type-check circuit bodies.
+        // Apply standalone `export { ... }` lists.
+        let export_tokens = std::mem::take(&mut self.export_list_tokens);
+        for tok in export_tokens {
+            let name = self.text(tok);
+            if let Some(&cid) = self.circuit_by_name.get(name) {
+                self.circuit_sigs[cid.0 as usize].exported = true;
+            } else if let Some(&eid) = self.enum_by_name.get(name) {
+                self.enums[eid.0 as usize].exported = true;
+            } else if let Some(&fid) = self.ledger_by_name.get(name) {
+                self.ledger_fields[fid.0 as usize].exported = true;
+            } else if let Some(&wid) = self.witness_by_name.get(name) {
+                self.witnesses[wid.0 as usize].exported = true;
+            } else if self.has_stdlib && name == "Maybe" {
+                if !self.exported_stdlib_types.iter().any(|s| s == name) {
+                    self.exported_stdlib_types.push(name.to_owned());
+                }
+            } else {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    self.ast.token_span(tok),
+                    format!("cannot export unknown item `{name}`"),
+                ));
+            }
+        }
+
+        // Pass 2: type-check constructor & circuit bodies.
+        if let Some(ctor_node) = self.constructor_node {
+            self.check_constructor(ctor_node);
+        }
         for sig_idx in 0..self.circuit_sigs.len() {
             self.check_circuit_body(sig_idx);
         }
@@ -210,6 +274,37 @@ impl<'a> Analyzer<'a> {
         self.ledger_by_name.insert(name, id);
     }
 
+    fn register_witness(&mut self, node: NodeIndex) {
+        let decl = self.ast.witness_decl(node);
+        let name = self.text(decl.name_token).to_owned();
+        let name_span = self.ast.token_span(decl.name_token);
+
+        if self.witness_by_name.contains_key(&name) {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                name_span,
+                format!("duplicate witness `{name}`"),
+            ));
+            return;
+        }
+
+        let params = self.resolve_params(decl.params_start, decl.params_end);
+        let Some(ret_type) = self.resolve_type(decl.ret_type) else {
+            return;
+        };
+
+        let id = WitnessId(self.witnesses.len() as u32);
+        self.witness_by_name.insert(name.clone(), id);
+        self.witnesses.push(WitnessDecl {
+            id,
+            name,
+            params,
+            ret_type,
+            exported: decl.exported,
+            span: self.ast.node_span(node),
+        });
+    }
+
     fn register_circuit_sig(&mut self, node: NodeIndex) {
         let decl = self.ast.circuit_decl(node);
         let name = self.text(decl.name_token).to_owned();
@@ -224,12 +319,30 @@ impl<'a> Analyzer<'a> {
             return;
         }
 
+        let params = self.resolve_params(decl.params_start, decl.params_end);
+        let Some(ret_type) = self.resolve_type(decl.ret_type) else {
+            return;
+        };
+
+        let id = CircuitId(self.circuit_sigs.len() as u32);
+        self.circuit_by_name.insert(name.clone(), id);
+        self.circuit_sigs.push(CircuitSig {
+            id,
+            name,
+            name_span,
+            params,
+            ret_type,
+            body_node: decl.body,
+            exported: decl.exported,
+            declared_pure: decl.pure,
+            span: self.ast.node_span(node),
+        });
+    }
+
+    fn resolve_params(&mut self, start: u32, end: u32) -> Vec<Param> {
         let mut params = Vec::new();
         let mut seen = HashMap::new();
-        let param_nodes: Vec<_> = self
-            .ast
-            .extra_nodes(decl.params_start, decl.params_end)
-            .collect();
+        let param_nodes: Vec<_> = self.ast.extra_nodes(start, end).collect();
         for pnode in param_nodes {
             let p = self.ast.param(pnode);
             let pname = self.text(p.name_token).to_owned();
@@ -253,24 +366,7 @@ impl<'a> Analyzer<'a> {
                 span: self.ast.node_span(pnode),
             });
         }
-
-        let Some(ret_type) = self.resolve_type(decl.ret_type) else {
-            return;
-        };
-
-        let id = CircuitId(self.circuit_sigs.len() as u32);
-        self.circuit_by_name.insert(name.clone(), id);
-        self.circuit_sigs.push(CircuitSig {
-            id,
-            name,
-            name_span,
-            params,
-            ret_type,
-            body_node: decl.body,
-            exported: decl.exported,
-            declared_pure: decl.pure,
-            span: self.ast.node_span(node),
-        });
+        params
     }
 
     fn resolve_type(&mut self, node: NodeIndex) -> Option<Type> {
@@ -295,6 +391,55 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            NodeTag::TypeGeneric => {
+                let tok = self.ast.node_main_token(node);
+                let name = self.text(tok);
+                let data = self.ast.node_data(node);
+                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                match name {
+                    "Bytes" => {
+                        let len = self.expect_type_nat(&arg_nodes, 0, "Bytes", self.ast.node_span(node))?;
+                        Some(Type::Bytes(len))
+                    }
+                    "Uint" => {
+                        let bits = self.expect_type_nat(&arg_nodes, 0, "Uint", self.ast.node_span(node))?;
+                        Some(Type::Uint(bits))
+                    }
+                    "Vector" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!("`Vector` expects 2 type arguments, found {}", arg_nodes.len()),
+                            ));
+                            return None;
+                        }
+                        let len = self.expect_type_nat(&arg_nodes, 0, "Vector", self.ast.node_span(node))?;
+                        let elem = self.resolve_type(arg_nodes[1])?;
+                        Some(Type::Vector(len, Box::new(elem)))
+                    }
+                    "Maybe" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!("`Maybe` expects 1 type argument, found {}", arg_nodes.len()),
+                            ));
+                            return None;
+                        }
+                        let inner = self.resolve_type(arg_nodes[0])?;
+                        Some(Type::Maybe(Box::new(inner)))
+                    }
+                    other => {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            self.ast.token_span(tok),
+                            format!("unknown generic type `{other}`"),
+                        ));
+                        None
+                    }
+                }
+            }
             NodeTag::TypeTuple => {
                 let data = self.ast.node_data(node);
                 let elem_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
@@ -308,17 +453,84 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn expect_type_nat(
+        &mut self,
+        args: &[NodeIndex],
+        index: usize,
+        type_name: &str,
+        span: Span,
+    ) -> Option<u32> {
+        let Some(&arg) = args.get(index) else {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                span,
+                format!("`{type_name}` is missing a numeric size argument"),
+            ));
+            return None;
+        };
+        if self.ast.node_tag(arg) != NodeTag::TypeNat {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                self.ast.node_span(arg),
+                format!("`{type_name}` size argument must be a numeric literal"),
+            ));
+            return None;
+        }
+        let raw = self.text(self.ast.node_main_token(arg));
+        match raw.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    self.ast.node_span(arg),
+                    format!("invalid numeric size `{raw}`"),
+                ));
+                None
+            }
+        }
+    }
+
     fn format_type(&self, ty: &Type) -> String {
         match ty {
             Type::Field => "Field".into(),
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
+            Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {
                 let inner: Vec<_> = elems.iter().map(|e| self.format_type(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
             Type::Enum(id) => self.enums[id.0 as usize].name.clone(),
+            Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
         }
+    }
+
+    fn check_constructor(&mut self, node: NodeIndex) {
+        let decl = self.ast.constructor_decl(node);
+        let params = self.resolve_params(decl.params_start, decl.params_end);
+        let mut scope: HashMap<String, ValueBinding> = HashMap::new();
+        for p in &params {
+            scope.insert(p.name.clone(), ValueBinding::Param(p.id, p.ty.clone()));
+        }
+        let mut next_local: u32 = 0;
+        let block_data = self.ast.node_data(decl.body);
+        let stmt_nodes: Vec<_> = self
+            .ast
+            .extra_nodes(block_data.lhs, block_data.rhs)
+            .collect();
+        let ret_unit = Type::unit();
+        let mut body = Vec::new();
+        for snode in stmt_nodes {
+            if let Some(stmt) = self.check_stmt(snode, &mut scope, &mut next_local, &ret_unit) {
+                body.push(stmt);
+            }
+        }
+        self.constructor = Some(Constructor {
+            params,
+            body,
+            span: self.ast.node_span(node),
+        });
     }
 
     fn check_circuit_body(&mut self, sig_idx: usize) {
@@ -356,8 +568,8 @@ impl<'a> Analyzer<'a> {
             ret_type,
             body,
             exported,
-            pure: true,  // computed in propagate_purity
-            proof: false, // computed in propagate_purity
+            pure: true,
+            proof: false,
             span,
         });
     }
@@ -506,7 +718,6 @@ impl<'a> Analyzer<'a> {
         if expr.ty == *expected {
             return true;
         }
-        // Allow unsuffixed integer literals to narrow/coerce to expected Uint<N>.
         if let (ExprKind::IntLit(v), Type::Uint(bits)) = (&expr.kind, expected)
             && *bits < 128
             && *v < (1u128 << bits)
@@ -560,6 +771,15 @@ impl<'a> Analyzer<'a> {
                     span,
                 })
             }
+            NodeTag::DefaultExpr => {
+                let data = self.ast.node_data(node);
+                let ty = self.resolve_type(NodeIndex(data.lhs))?;
+                Some(Expr {
+                    kind: ExprKind::Default(ty.clone()),
+                    ty,
+                    span,
+                })
+            }
             NodeTag::IdentExpr => {
                 let tok = self.ast.node_main_token(node);
                 let name = self.text(tok);
@@ -577,7 +797,6 @@ impl<'a> Analyzer<'a> {
                         },
                     });
                 }
-                // Implicit Cell read sugar: referencing a Cell ledger field reads it.
                 if let Some(&field_id) = self.ledger_by_name.get(name) {
                     let field = &self.ledger_fields[field_id.0 as usize];
                     if field.adt == LedgerAdt::Cell {
@@ -648,6 +867,42 @@ impl<'a> Analyzer<'a> {
             NodeTag::TupleExpr => {
                 let data = self.ast.node_data(node);
                 let elem_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                if let Some(Type::Vector(expected_len, elem_ty)) = expected {
+                    if elem_nodes.len() != *expected_len as usize {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            span,
+                            format!(
+                                "expected `Vector` of length {expected_len}, found {} element(s)",
+                                elem_nodes.len()
+                            ),
+                        ));
+                        return None;
+                    }
+                    let mut exprs = Vec::with_capacity(elem_nodes.len());
+                    for enode in elem_nodes {
+                        let mut e = self.check_expr(enode, scope, Some(elem_ty))?;
+                        if !self.coerce_or_check(&mut e, elem_ty) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                e.span,
+                                format!(
+                                    "vector element type mismatch: expected `{}`, found `{}`",
+                                    self.format_type(elem_ty),
+                                    self.format_type(&e.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        exprs.push(e);
+                    }
+                    return Some(Expr {
+                        kind: ExprKind::Vector(exprs),
+                        ty: Type::Vector(*expected_len, elem_ty.clone()),
+                        span,
+                    });
+                }
+
                 let mut exprs = Vec::with_capacity(elem_nodes.len());
                 let mut tys = Vec::with_capacity(elem_nodes.len());
                 for enode in elem_nodes {
@@ -871,6 +1126,35 @@ impl<'a> Analyzer<'a> {
                     span,
                 })
             }
+            NodeTag::GenericCallExpr => {
+                let call = self.ast.generic_call_expr(node);
+                let targ_nodes: Vec<_> = self
+                    .ast
+                    .extra_nodes(call.targs_start, call.targs_end)
+                    .collect();
+                let arg_nodes: Vec<_> = self
+                    .ast
+                    .extra_nodes(call.args_start, call.args_end)
+                    .collect();
+                if self.ast.node_tag(call.callee) == NodeTag::IdentExpr {
+                    let callee_tok = self.ast.node_main_token(call.callee);
+                    let callee_name = self.text(callee_tok);
+                    return self.check_generic_builtin(
+                        callee_name,
+                        self.ast.token_span(callee_tok),
+                        &targ_nodes,
+                        &arg_nodes,
+                        span,
+                        scope,
+                    );
+                }
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    span,
+                    "unsupported generic call target",
+                ));
+                None
+            }
             NodeTag::CallExpr => {
                 let call = self.ast.call_expr(node);
                 let arg_nodes: Vec<_> = self
@@ -878,22 +1162,28 @@ impl<'a> Analyzer<'a> {
                     .extra_nodes(call.args_start, call.args_end)
                     .collect();
 
-                // 1. Direct circuit call: `in_state(STATE.unset)`
+                // 1. Direct identifier call: `pad(...)`, circuit call, or witness call.
                 if self.ast.node_tag(call.callee) == NodeTag::IdentExpr {
                     let callee_tok = self.ast.node_main_token(call.callee);
                     let callee_name = self.text(callee_tok);
+                    if callee_name == "pad" {
+                        return self.check_pad_call(&arg_nodes, span);
+                    }
                     if let Some(&cid) = self.circuit_by_name.get(callee_name) {
                         return self.check_circuit_call(cid, &arg_nodes, span, scope);
+                    }
+                    if let Some(&wid) = self.witness_by_name.get(callee_name) {
+                        return self.check_witness_call(wid, &arg_nodes, span, scope);
                     }
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.file,
                         self.ast.token_span(callee_tok),
-                        format!("unknown circuit `{callee_name}`"),
+                        format!("unknown circuit or witness `{callee_name}`"),
                     ));
                     return None;
                 }
 
-                // 2. Ledger ADT method call: `round.increment(1)` or `value.read()` / `value.write(x)`
+                // 2. Ledger ADT method call.
                 if self.ast.node_tag(call.callee) == NodeTag::MemberExpr {
                     let mdata = self.ast.node_data(call.callee);
                     let recv = NodeIndex(mdata.lhs);
@@ -930,6 +1220,215 @@ impl<'a> Analyzer<'a> {
                 None
             }
         }
+    }
+
+    fn check_pad_call(&mut self, arg_nodes: &[NodeIndex], call_span: Span) -> Option<Expr> {
+        if arg_nodes.len() != 2 {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                call_span,
+                format!("`pad` expects 2 arguments (length, string), found {}", arg_nodes.len()),
+            ));
+            return None;
+        }
+        if self.ast.node_tag(arg_nodes[0]) != NodeTag::IntLitExpr {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                self.ast.node_span(arg_nodes[0]),
+                "`pad` length must be an integer literal",
+            ));
+            return None;
+        }
+        let len: u32 = match self.text(self.ast.node_main_token(arg_nodes[0])).parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    self.ast.node_span(arg_nodes[0]),
+                    "invalid `pad` length",
+                ));
+                return None;
+            }
+        };
+        if self.ast.node_tag(arg_nodes[1]) != NodeTag::StringLitExpr {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                self.ast.node_span(arg_nodes[1]),
+                "`pad` second argument must be a string literal",
+            ));
+            return None;
+        }
+        let text = unquote_string(self.text(self.ast.node_main_token(arg_nodes[1])));
+        let raw_bytes = text.as_bytes();
+        if raw_bytes.len() > len as usize {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                self.ast.node_span(arg_nodes[1]),
+                format!(
+                    "string of length {} exceeds `pad` target length {len}",
+                    raw_bytes.len()
+                ),
+            ));
+            return None;
+        }
+        let mut padded = vec![0u8; len as usize];
+        padded[..raw_bytes.len()].copy_from_slice(raw_bytes);
+        Some(Expr {
+            kind: ExprKind::BytesLit(padded),
+            ty: Type::Bytes(len),
+            span: call_span,
+        })
+    }
+
+    fn check_generic_builtin(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        targ_nodes: &[NodeIndex],
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        match name {
+            "some" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        call_span,
+                        "`some<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let ty = self.resolve_type(targ_nodes[0])?;
+                let mut val = self.check_expr(arg_nodes[0], scope, Some(&ty))?;
+                if !self.coerce_or_check(&mut val, &ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        val.span,
+                        format!(
+                            "`some` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&ty),
+                            self.format_type(&val.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::MaybeSome(Box::new(val)),
+                    ty: Type::Maybe(Box::new(ty)),
+                    span: call_span,
+                })
+            }
+            "none" => {
+                if targ_nodes.len() != 1 || !arg_nodes.is_empty() {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        call_span,
+                        "`none<T>()` expects 1 type argument and 0 value arguments",
+                    ));
+                    return None;
+                }
+                let ty = self.resolve_type(targ_nodes[0])?;
+                Some(Expr {
+                    kind: ExprKind::MaybeNone(ty.clone()),
+                    ty: Type::Maybe(Box::new(ty)),
+                    span: call_span,
+                })
+            }
+            "persistentHash" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        call_span,
+                        "`persistentHash<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut arg = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut arg, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        arg.span,
+                        format!(
+                            "`persistentHash` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&arg.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::PersistentHash {
+                        input_ty,
+                        arg: Box::new(arg),
+                    },
+                    ty: Type::Bytes(32),
+                    span: call_span,
+                })
+            }
+            other => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    name_span,
+                    format!("unknown generic circuit `{other}`"),
+                ));
+                None
+            }
+        }
+    }
+
+    fn check_witness_call(
+        &mut self,
+        wid: WitnessId,
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        let wname = self.witnesses[wid.0 as usize].name.clone();
+        let expected_params: Vec<Type> = self.witnesses[wid.0 as usize]
+            .params
+            .iter()
+            .map(|p| p.ty.clone())
+            .collect();
+        let ret_type = self.witnesses[wid.0 as usize].ret_type.clone();
+
+        if arg_nodes.len() != expected_params.len() {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                call_span,
+                format!(
+                    "witness `{wname}` expects {} argument(s), found {}",
+                    expected_params.len(),
+                    arg_nodes.len()
+                ),
+            ));
+            return None;
+        }
+
+        let mut args = Vec::with_capacity(arg_nodes.len());
+        for (&anode, expected_ty) in arg_nodes.iter().zip(&expected_params) {
+            let mut arg = self.check_expr(anode, scope, Some(expected_ty))?;
+            if !self.coerce_or_check(&mut arg, expected_ty) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    arg.span,
+                    format!(
+                        "argument type mismatch calling witness `{wname}`: expected `{}`, found `{}`",
+                        self.format_type(expected_ty),
+                        self.format_type(&arg.ty)
+                    ),
+                ));
+                return None;
+            }
+            args.push(arg);
+        }
+
+        Some(Expr {
+            kind: ExprKind::WitnessCall { witness: wid, args },
+            ty: ret_type,
+            span: call_span,
+        })
     }
 
     fn check_circuit_call(
@@ -1136,91 +1635,131 @@ fn propagate_purity(
     diagnostics: &mut DiagnosticBag,
 ) {
     let n = program.circuits.len();
-    let mut impure = vec![false; n];
+    let mut touches_ledger = vec![false; n];
+    let mut calls_witness = vec![false; n];
     let mut direct_calls: Vec<Vec<CircuitId>> = vec![Vec::new(); n];
 
     for c in &program.circuits {
         let idx = c.id.0 as usize;
-        impure[idx] = stmts_touch_ledger(&c.body, &mut direct_calls[idx]);
+        let (l, w) = stmts_effects(&c.body, &mut direct_calls[idx]);
+        touches_ledger[idx] = l;
+        calls_witness[idx] = w;
     }
 
-    // Fixed-point propagation: if A calls impure B, A is impure.
     let mut changed = true;
     while changed {
         changed = false;
         for idx in 0..n {
-            if !impure[idx] && direct_calls[idx].iter().any(|callee| impure[callee.0 as usize]) {
-                impure[idx] = true;
-                changed = true;
+            for &callee in &direct_calls[idx] {
+                let cidx = callee.0 as usize;
+                if touches_ledger[cidx] && !touches_ledger[idx] {
+                    touches_ledger[idx] = true;
+                    changed = true;
+                }
+                if calls_witness[cidx] && !calls_witness[idx] {
+                    calls_witness[idx] = true;
+                    changed = true;
+                }
             }
         }
     }
 
     for c in &mut program.circuits {
         let idx = c.id.0 as usize;
-        c.pure = !impure[idx];
-        c.proof = c.exported && !c.pure;
+        c.pure = !touches_ledger[idx] && !calls_witness[idx];
+        c.proof = c.exported && touches_ledger[idx];
         if sigs[idx].declared_pure && !c.pure {
             diagnostics.push(CompactDiagnostic::error(
                 file,
                 sigs[idx].name_span,
-                format!("circuit `{}` is declared `pure` but accesses ledger state", c.name),
+                format!(
+                    "circuit `{}` is declared `pure` but accesses ledger or witness state",
+                    c.name
+                ),
             ));
         }
     }
 }
 
-fn stmts_touch_ledger(stmts: &[Stmt], calls: &mut Vec<CircuitId>) -> bool {
-    let mut touches = false;
+fn stmts_effects(stmts: &[Stmt], calls: &mut Vec<CircuitId>) -> (bool, bool) {
+    let (mut l, mut w) = (false, false);
     for stmt in stmts {
-        match stmt {
-            Stmt::Const { init, .. } => touches |= expr_touches_ledger(init, calls),
-            Stmt::Expr(e) => touches |= expr_touches_ledger(e, calls),
-            Stmt::Return { value: Some(e), .. } => touches |= expr_touches_ledger(e, calls),
-            Stmt::Return { value: None, .. } => {}
-        }
+        let (sl, sw) = match stmt {
+            Stmt::Const { init, .. } => expr_effects(init, calls),
+            Stmt::Expr(e) => expr_effects(e, calls),
+            Stmt::Return { value: Some(e), .. } => expr_effects(e, calls),
+            Stmt::Return { value: None, .. } => (false, false),
+        };
+        l |= sl;
+        w |= sw;
     }
-    touches
+    (l, w)
 }
 
-fn expr_touches_ledger(expr: &Expr, calls: &mut Vec<CircuitId>) -> bool {
+fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
     match &expr.kind {
         ExprKind::LedgerCall { args, .. } => {
+            let mut w = false;
             for a in args {
-                let _ = expr_touches_ledger(a, calls);
+                w |= expr_effects(a, calls).1;
             }
-            true
+            (true, w)
+        }
+        ExprKind::WitnessCall { args, .. } => {
+            let mut l = false;
+            for a in args {
+                l |= expr_effects(a, calls).0;
+            }
+            (l, true)
         }
         ExprKind::CircuitCall { circuit, args } => {
             calls.push(*circuit);
-            let mut t = false;
+            let (mut l, mut w) = (false, false);
             for a in args {
-                t |= expr_touches_ledger(a, calls);
+                let (al, aw) = expr_effects(a, calls);
+                l |= al;
+                w |= aw;
             }
-            t
+            (l, w)
         }
-        ExprKind::Tuple(elems) => elems.iter().fold(false, |acc, e| acc | expr_touches_ledger(e, calls)),
+        ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
+            let (mut l, mut w) = (false, false);
+            for e in elems {
+                let (el, ew) = expr_effects(e, calls);
+                l |= el;
+                w |= ew;
+            }
+            (l, w)
+        }
         ExprKind::Unary { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Assert { cond: operand, .. }
-        | ExprKind::Disclose(operand) => expr_touches_ledger(operand, calls),
+        | ExprKind::Disclose(operand)
+        | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::MaybeSome(operand) => expr_effects(operand, calls),
         ExprKind::Binary { lhs, rhs, .. } => {
-            expr_touches_ledger(lhs, calls) | expr_touches_ledger(rhs, calls)
+            let (l1, w1) = expr_effects(lhs, calls);
+            let (l2, w2) = expr_effects(rhs, calls);
+            (l1 | l2, w1 | w2)
         }
         ExprKind::Ternary {
             cond,
             then_branch,
             else_branch,
         } => {
-            expr_touches_ledger(cond, calls)
-                | expr_touches_ledger(then_branch, calls)
-                | expr_touches_ledger(else_branch, calls)
+            let (l1, w1) = expr_effects(cond, calls);
+            let (l2, w2) = expr_effects(then_branch, calls);
+            let (l3, w3) = expr_effects(else_branch, calls);
+            (l1 | l2 | l3, w1 | w2 | w3)
         }
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
+        | ExprKind::BytesLit(_)
+        | ExprKind::Default(_)
         | ExprKind::ParamRef(_)
         | ExprKind::LocalRef(_)
-        | ExprKind::EnumVariant { .. } => false,
+        | ExprKind::EnumVariant { .. }
+        | ExprKind::MaybeNone(_) => (false, false),
     }
 }
 
@@ -1298,6 +1837,89 @@ mod tests {
     }
 
     #[test]
+    fn check_tiny_contract() {
+        assert_compact_snapshot!(
+            r#"
+            export {Maybe}
+            export {set, get, clear, public_key}
+
+            import CompactStandardLibrary;
+
+            enum STATE { unset, set }
+
+            ledger authority: Bytes<32>;
+            export ledger value: Field;
+            ledger state: STATE;
+
+            constructor(v: Field) {
+              const sk = private$secret_key();
+              authority = public_key(sk);
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            witness private$secret_key(): Bytes<32>;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              authority = apk;
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            circuit get(): Maybe<Field> {
+              return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+            }
+
+            circuit clear(): [] {
+              assert(in_state(STATE.set), "clear: no value is currently recorded");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority, "clear: attempted clear without proper authorization");
+              authority = default<Bytes<32>>;
+              value = default<Field>;
+              state = STATE.unset;
+            }
+
+            circuit public_key(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
+            }
+            "#,
+            check_and_dump
+        );
+    }
+
+    #[test]
+    fn rejects_undisclosed_constructor_param_write() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            export ledger value: Field;
+            constructor(v: Field) {
+              value = v;
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("disclose"),
+            "expected witness disclosure error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
     fn rejects_undisclosed_witness_param_write() {
         let mut sm = SourceMap::new();
         let src = r#"
@@ -1316,6 +1938,29 @@ mod tests {
             checked.diagnostics.diagnostics[0]
                 .message
                 .contains("disclose")
+        );
+    }
+
+    #[test]
+    fn rejects_undisclosed_witness_return_write() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            export ledger authority: Bytes<32>;
+            witness secret(): Bytes<32>;
+            export circuit leak(): [] {
+              authority = secret();
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("witness `secret`")
         );
     }
 

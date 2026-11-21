@@ -261,12 +261,12 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
 
 #[inline]
 fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
 }
 
 #[inline]
 fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 fn keyword_or_ident(text: &str) -> TokenTag {

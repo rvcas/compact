@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
-use compact_hir::{Circuit, CircuitId, Expr, ExprKind, LocalId, Program, Stmt};
+use compact_hir::{CircuitId, Expr, ExprKind, LocalId, Program, Stmt};
 use compact_span::{SourceFile, Span};
 
-/// Origin of a private/witness value entering a contract (e.g. an exported circuit parameter).
+/// Origin of a private/witness value entering a contract (exported circuit params,
+/// constructor params, or witness return values).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WitnessOrigin {
     description: String,
@@ -46,13 +47,29 @@ impl Taint {
 }
 
 /// Enforce Compact's Witness Protection Program (WPP): values originating from
-/// exported circuit parameters (and later witnesses/constructors) cannot flow into
-/// ledger writes or branch conditions guarding ledger operations unless wrapped in `disclose(...)`.
+/// exported circuit parameters, constructor parameters, or witness return values
+/// cannot flow into ledger writes or branch conditions guarding ledger operations
+/// unless explicitly wrapped in `disclose(...)`.
 pub fn check_witness_disclosure(
     file: &SourceFile,
     program: &Program,
     diagnostics: &mut DiagnosticBag,
 ) {
+    let mut checker = WitnessChecker {
+        file,
+        program,
+        diagnostics,
+    };
+
+    if let Some(ctor) = &program.constructor {
+        let param_taints: Vec<Taint> = ctor
+            .params
+            .iter()
+            .map(|p| Taint::single(format!("constructor parameter `{}`", p.name), p.span))
+            .collect();
+        let _ = checker.check_stmts(&ctor.body, &param_taints, &Taint::clean());
+    }
+
     for circuit in &program.circuits {
         if !circuit.exported {
             continue;
@@ -70,12 +87,7 @@ pub fn check_witness_disclosure(
                 )
             })
             .collect();
-        let mut checker = WitnessChecker {
-            file,
-            program,
-            diagnostics,
-        };
-        let _ = checker.check_circuit(circuit, &param_taints, &Taint::clean());
+        let _ = checker.check_stmts(&circuit.body, &param_taints, &Taint::clean());
     }
 }
 
@@ -102,16 +114,16 @@ impl<'a> WitnessChecker<'a> {
         }
     }
 
-    fn check_circuit(
+    fn check_stmts(
         &mut self,
-        circuit: &Circuit,
+        stmts: &[Stmt],
         param_taints: &[Taint],
         guard_taint: &Taint,
     ) -> Taint {
         let mut locals: HashMap<LocalId, Taint> = HashMap::new();
         let mut ret_taint = Taint::clean();
 
-        for stmt in &circuit.body {
+        for stmt in stmts {
             match stmt {
                 Stmt::Const { local, init, .. } => {
                     let t = self.check_expr(init, param_taints, &locals, guard_taint);
@@ -139,15 +151,23 @@ impl<'a> WitnessChecker<'a> {
         guard_taint: &Taint,
     ) -> Taint {
         match &expr.kind {
-            ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::EnumVariant { .. } => {
-                Taint::clean()
-            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::BytesLit(_)
+            | ExprKind::Default(_)
+            | ExprKind::EnumVariant { .. }
+            | ExprKind::MaybeNone(_) => Taint::clean(),
             ExprKind::ParamRef(pid) => param_taints[pid.0 as usize].clone(),
             ExprKind::LocalRef(lid) => locals.get(lid).cloned().unwrap_or_default(),
-            ExprKind::Tuple(elems) => elems.iter().fold(Taint::clean(), |acc, e| {
-                acc.merge(&self.check_expr(e, param_taints, locals, guard_taint))
-            }),
-            ExprKind::Unary { operand, .. } => {
+            ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
+                elems.iter().fold(Taint::clean(), |acc, e| {
+                    acc.merge(&self.check_expr(e, param_taints, locals, guard_taint))
+                })
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::MaybeSome(operand) => {
                 self.check_expr(operand, param_taints, locals, guard_taint)
             }
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -166,7 +186,6 @@ impl<'a> WitnessChecker<'a> {
                 let et = self.check_expr(else_branch, param_taints, locals, &branch_guard);
                 ct.merge(&tt).merge(&et)
             }
-            ExprKind::Cast { expr, .. } => self.check_expr(expr, param_taints, locals, guard_taint),
             ExprKind::Assert { cond, .. } => {
                 let _ = self.check_expr(cond, param_taints, locals, guard_taint);
                 Taint::clean()
@@ -175,13 +194,20 @@ impl<'a> WitnessChecker<'a> {
                 let _ = self.check_expr(inner, param_taints, locals, guard_taint);
                 Taint::clean()
             }
+            ExprKind::WitnessCall { witness, args } => {
+                for a in args {
+                    let _ = self.check_expr(a, param_taints, locals, guard_taint);
+                }
+                let w = self.program.witness(*witness);
+                Taint::single(format!("return value of witness `{}`", w.name), expr.span)
+            }
             ExprKind::CircuitCall { circuit, args } => {
                 let arg_taints: Vec<_> = args
                     .iter()
                     .map(|a| self.check_expr(a, param_taints, locals, guard_taint))
                     .collect();
                 let callee = self.program.circuit(*circuit);
-                self.check_circuit(callee, &arg_taints, guard_taint)
+                self.check_stmts(&callee.body, &arg_taints, guard_taint)
             }
             ExprKind::LedgerCall { field, op, args } => {
                 let field_name = &self.program.ledger_field(*field).name;
@@ -202,14 +228,13 @@ impl<'a> WitnessChecker<'a> {
                         );
                     }
                 }
-                // Reading from the public ledger produces a public (untainted) value.
                 Taint::clean()
             }
         }
     }
 }
 
-/// Helper to check whether a circuit call graph contains recursion.
+/// Reject any cyclic/recursive circuit call graph.
 pub fn reject_recursive_circuits(
     file: &SourceFile,
     program: &Program,
@@ -221,7 +246,6 @@ pub fn reject_recursive_circuits(
         collect_calls_stmts(&c.body, &mut adj[c.id.0 as usize]);
     }
 
-    // 0 = unvisited, 1 = visiting, 2 = done
     let mut state = vec![0u8; n];
     for id in 0..n {
         if state[id] == 0 {
@@ -277,7 +301,10 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
                 collect_calls_expr(a, out);
             }
         }
-        ExprKind::Tuple(elems) | ExprKind::LedgerCall { args: elems, .. } => {
+        ExprKind::Tuple(elems)
+        | ExprKind::Vector(elems)
+        | ExprKind::LedgerCall { args: elems, .. }
+        | ExprKind::WitnessCall { args: elems, .. } => {
             for e in elems {
                 collect_calls_expr(e, out);
             }
@@ -285,7 +312,9 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         ExprKind::Unary { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Assert { cond: operand, .. }
-        | ExprKind::Disclose(operand) => collect_calls_expr(operand, out),
+        | ExprKind::Disclose(operand)
+        | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::MaybeSome(operand) => collect_calls_expr(operand, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, out);
             collect_calls_expr(rhs, out);
@@ -301,8 +330,11 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         }
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
+        | ExprKind::BytesLit(_)
+        | ExprKind::Default(_)
         | ExprKind::ParamRef(_)
         | ExprKind::LocalRef(_)
-        | ExprKind::EnumVariant { .. } => {}
+        | ExprKind::EnumVariant { .. }
+        | ExprKind::MaybeNone(_) => {}
     }
 }

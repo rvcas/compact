@@ -77,6 +77,14 @@ impl<'a> Formatter<'a> {
                     main
                 }
             }
+            NodeTag::WitnessDecl => {
+                let d = self.ast.witness_decl(node);
+                if d.exported {
+                    TokenIndex(main.0.saturating_sub(1))
+                } else {
+                    main
+                }
+            }
             NodeTag::LedgerDecl => {
                 let d = self.ast.ledger_decl(node);
                 let mut offset = 0u32;
@@ -114,6 +122,15 @@ impl<'a> Formatter<'a> {
                 )
                 .unwrap();
             }
+            NodeTag::ExportListDecl => {
+                let decl = self.ast.export_list_decl(node);
+                let names: Vec<_> = self
+                    .ast
+                    .extra_tokens(decl.names_start, decl.names_end)
+                    .map(|t| self.ast.token_text(t, self.source))
+                    .collect();
+                write!(self.out, "export {{ {} }};", names.join(", ")).unwrap();
+            }
             NodeTag::EnumDecl => {
                 let decl = self.ast.enum_decl(node);
                 if decl.exported {
@@ -149,6 +166,29 @@ impl<'a> Formatter<'a> {
                 self.format_type(decl.type_node);
                 self.out.push(';');
             }
+            NodeTag::WitnessDecl => {
+                let decl = self.ast.witness_decl(node);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                write!(
+                    self.out,
+                    "witness {}(",
+                    self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+                self.format_params(decl.params_start, decl.params_end);
+                self.out.push_str("): ");
+                self.format_type(decl.ret_type);
+                self.out.push(';');
+            }
+            NodeTag::ConstructorDecl => {
+                let decl = self.ast.constructor_decl(node);
+                self.out.push_str("constructor(");
+                self.format_params(decl.params_start, decl.params_end);
+                self.out.push_str(") ");
+                self.format_block(decl.body, 0);
+            }
             NodeTag::CircuitDecl => {
                 let decl = self.ast.circuit_decl(node);
                 if decl.exported {
@@ -163,23 +203,7 @@ impl<'a> Formatter<'a> {
                     self.ast.token_text(decl.name_token, self.source)
                 )
                 .unwrap();
-                let params: Vec<_> = self
-                    .ast
-                    .extra_nodes(decl.params_start, decl.params_end)
-                    .collect();
-                for (i, param) in params.into_iter().enumerate() {
-                    if i > 0 {
-                        self.out.push_str(", ");
-                    }
-                    let p = self.ast.param(param);
-                    write!(
-                        self.out,
-                        "{}: ",
-                        self.ast.token_text(p.name_token, self.source)
-                    )
-                    .unwrap();
-                    self.format_type(p.type_node);
-                }
+                self.format_params(decl.params_start, decl.params_end);
                 self.out.push_str("): ");
                 self.format_type(decl.ret_type);
                 self.out.push(' ');
@@ -189,12 +213,42 @@ impl<'a> Formatter<'a> {
         }
     }
 
+    fn format_params(&mut self, start: u32, end: u32) {
+        let params: Vec<_> = self.ast.extra_nodes(start, end).collect();
+        for (i, param) in params.into_iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(", ");
+            }
+            let p = self.ast.param(param);
+            write!(
+                self.out,
+                "{}: ",
+                self.ast.token_text(p.name_token, self.source)
+            )
+            .unwrap();
+            self.format_type(p.type_node);
+        }
+    }
+
     fn format_type(&mut self, node: NodeIndex) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
-            NodeTag::TypeNamed => {
+            NodeTag::TypeNamed | NodeTag::TypeNat => {
                 self.out
                     .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+            }
+            NodeTag::TypeGeneric => {
+                self.out
+                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.out.push('<');
+                let args: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                for (i, arg) in args.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.format_type(arg);
+                }
+                self.out.push('>');
             }
             NodeTag::TypeTuple => {
                 self.out.push('[');
@@ -316,6 +370,33 @@ impl<'a> Formatter<'a> {
                 }
                 self.out.push(')');
             }
+            NodeTag::GenericCallExpr => {
+                let call = self.ast.generic_call_expr(node);
+                self.format_expr(call.callee);
+                self.out.push('<');
+                let targs: Vec<_> = self
+                    .ast
+                    .extra_nodes(call.targs_start, call.targs_end)
+                    .collect();
+                for (i, targ) in targs.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.format_type(targ);
+                }
+                self.out.push_str(">(");
+                let args: Vec<_> = self
+                    .ast
+                    .extra_nodes(call.args_start, call.args_end)
+                    .collect();
+                for (i, arg) in args.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.format_expr(arg);
+                }
+                self.out.push(')');
+            }
             NodeTag::UnaryExpr => {
                 self.out
                     .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
@@ -343,6 +424,11 @@ impl<'a> Formatter<'a> {
                 self.format_expr(NodeIndex(data.lhs));
                 self.out.push_str(" as ");
                 self.format_type(NodeIndex(data.rhs));
+            }
+            NodeTag::DefaultExpr => {
+                self.out.push_str("default<");
+                self.format_type(NodeIndex(data.lhs));
+                self.out.push('>');
             }
             NodeTag::AssertExpr => {
                 let a = self.ast.assert_expr(node);
@@ -400,6 +486,27 @@ mod tests {
             ledger state:STATE;
             circuit in_state(s:STATE):Boolean{return state==s;}
             export circuit set(v:Field):[]{assert(in_state(STATE.unset),"overwrite");const dv=disclose(v);value=dv;state=STATE.set;}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_tiny_contract() {
+        assert_compact_snapshot!(
+            r#"
+            export{Maybe}
+            export{set,get,clear,public_key}
+            import CompactStandardLibrary;
+            enum STATE{unset,set}
+            ledger authority:Bytes<32>;
+            export ledger value:Field;
+            ledger state:STATE;
+            constructor(v:Field){const sk=private$secret_key();authority=public_key(sk);value=disclose(v);state=STATE.set;}
+            witness private$secret_key():Bytes<32>;
+            circuit get():Maybe<Field>{return state==STATE.set?some<Field>(value):none<Field>();}
+            circuit clear():[]{authority=default<Bytes<32>>;value=default<Field>;state=STATE.unset;}
+            circuit public_key(sk:Bytes<32>):Bytes<32>{return disclose(persistentHash<Vector<2,Bytes<32>>>([pad(32,"lares:tiny:pk:"),sk]));}
             "#,
             fmt
         );

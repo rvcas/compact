@@ -1,0 +1,554 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+export {Maybe}
+export {set, get, clear, public_key}
+
+import CompactStandardLibrary;
+
+enum STATE { unset, set }
+
+ledger authority: Bytes<32>;
+export ledger value: Field;
+ledger state: STATE;
+
+constructor(v: Field) {
+  const sk = private$secret_key();
+  authority = public_key(sk);
+  value = disclose(v);
+  state = STATE.set;
+}
+
+witness private$secret_key(): Bytes<32>;
+
+circuit in_state(s: STATE): Boolean {
+  return state == s;
+}
+
+circuit set(v: Field): [] {
+  assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  authority = apk;
+  value = disclose(v);
+  state = STATE.set;
+}
+
+circuit get(): Maybe<Field> {
+  return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+}
+
+circuit clear(): [] {
+  assert(in_state(STATE.set), "clear: no value is currently recorded");
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  assert(apk == authority, "clear: attempted clear without proper authorization");
+  authority = default<Bytes<32>>;
+  value = default<Field>;
+  state = STATE.unset;
+}
+
+circuit public_key(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+enum STATE {
+	unset = 0,
+	set = 1
+}
+function _in_state(context: __compactRuntime.CircuitContext<unknown>, s: STATE): boolean {
+	return __compactRuntime.readCell(context, 2) === s;
+}
+function _public_key(sk: Uint8Array): Uint8Array {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		116,
+		105,
+		110,
+		121,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+export type Witnesses<T> = {
+	private$secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+};
+export type ImpureCircuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	clear(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {
+	public_key(sk: Uint8Array): Uint8Array;
+};
+export type Circuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	clear(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	public_key(context: __compactRuntime.CircuitContext<T>, sk: Uint8Array): __compactRuntime.CircuitResults<T, Uint8Array>;
+};
+export type Ledger = {
+	readonly value: bigint;
+};
+export const pureCircuits: PureCircuits = { public_key: (sk: Uint8Array): Uint8Array => {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		116,
+		105,
+		110,
+		121,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+} };
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return { value: __compactRuntime.decodeCell(state, 1) };
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			set: (context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "set: attempted to overwrite recorded value");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.writeCell(context, 0, apk);
+				__compactRuntime.writeCell(context, 1, v);
+				__compactRuntime.writeCell(context, 2, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>> => {
+				return {
+					result: _in_state(context, STATE.set) ? {
+						is_some: true,
+						value: __compactRuntime.readCell(context, 1)
+					} : {
+						is_some: false,
+						value: 0n
+					},
+					context
+				};
+			},
+			clear: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.set), "clear: no value is currently recorded");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "clear: attempted clear without proper authorization");
+				__compactRuntime.writeCell(context, 0, new Uint8Array(32));
+				__compactRuntime.writeCell(context, 1, 0n);
+				__compactRuntime.writeCell(context, 2, STATE.unset);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			set: (context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "set: attempted to overwrite recorded value");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.writeCell(context, 0, apk);
+				__compactRuntime.writeCell(context, 1, v);
+				__compactRuntime.writeCell(context, 2, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>> => {
+				return {
+					result: _in_state(context, STATE.set) ? {
+						is_some: true,
+						value: __compactRuntime.readCell(context, 1)
+					} : {
+						is_some: false,
+						value: 0n
+					},
+					context
+				};
+			},
+			clear: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(_in_state(context, STATE.set), "clear: no value is currently recorded");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "clear: attempted clear without proper authorization");
+				__compactRuntime.writeCell(context, 0, new Uint8Array(32));
+				__compactRuntime.writeCell(context, 1, 0n);
+				__compactRuntime.writeCell(context, 2, STATE.unset);
+				return {
+					result: [],
+					context
+				};
+			},
+			public_key: (context: __compactRuntime.CircuitContext<T>, sk: Uint8Array): __compactRuntime.CircuitResults<T, Uint8Array> => {
+				return {
+					result: __compactRuntime.persistentHash([new Uint8Array([
+						108,
+						97,
+						114,
+						101,
+						115,
+						58,
+						116,
+						105,
+						110,
+						121,
+						58,
+						112,
+						107,
+						58,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0
+					]), sk]),
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>, v: bigint): __compactRuntime.ConstructorResult<T> {
+		const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+		__compactRuntime.writeCell(context, 0, _public_key(sk));
+		__compactRuntime.writeCell(context, 1, v);
+		__compactRuntime.writeCell(context, 2, STATE.set);
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+var STATE = /* @__PURE__ */ function(STATE) {
+	STATE[STATE["unset"] = 0] = "unset";
+	STATE[STATE["set"] = 1] = "set";
+	return STATE;
+}(STATE || {});
+function _in_state(context, s) {
+	return __compactRuntime.readCell(context, 2) === s;
+}
+function _public_key(sk) {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		116,
+		105,
+		110,
+		121,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+export const pureCircuits = { public_key: (sk) => {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		116,
+		105,
+		110,
+		121,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+} };
+export const ledger = (state) => {
+	return { value: __compactRuntime.decodeCell(state, 1) };
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			set: (context, v) => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "set: attempted to overwrite recorded value");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.writeCell(context, 0, apk);
+				__compactRuntime.writeCell(context, 1, v);
+				__compactRuntime.writeCell(context, 2, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context) => {
+				return {
+					result: _in_state(context, STATE.set) ? {
+						is_some: true,
+						value: __compactRuntime.readCell(context, 1)
+					} : {
+						is_some: false,
+						value: 0n
+					},
+					context
+				};
+			},
+			clear: (context) => {
+				__compactRuntime.assert(_in_state(context, STATE.set), "clear: no value is currently recorded");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "clear: attempted clear without proper authorization");
+				__compactRuntime.writeCell(context, 0, new Uint8Array(32));
+				__compactRuntime.writeCell(context, 1, 0n);
+				__compactRuntime.writeCell(context, 2, STATE.unset);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			set: (context, v) => {
+				__compactRuntime.assert(_in_state(context, STATE.unset), "set: attempted to overwrite recorded value");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.writeCell(context, 0, apk);
+				__compactRuntime.writeCell(context, 1, v);
+				__compactRuntime.writeCell(context, 2, STATE.set);
+				return {
+					result: [],
+					context
+				};
+			},
+			get: (context) => {
+				return {
+					result: _in_state(context, STATE.set) ? {
+						is_some: true,
+						value: __compactRuntime.readCell(context, 1)
+					} : {
+						is_some: false,
+						value: 0n
+					},
+					context
+				};
+			},
+			clear: (context) => {
+				__compactRuntime.assert(_in_state(context, STATE.set), "clear: no value is currently recorded");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "clear: attempted clear without proper authorization");
+				__compactRuntime.writeCell(context, 0, new Uint8Array(32));
+				__compactRuntime.writeCell(context, 1, 0n);
+				__compactRuntime.writeCell(context, 2, STATE.unset);
+				return {
+					result: [],
+					context
+				};
+			},
+			public_key: (context, sk) => {
+				return {
+					result: __compactRuntime.persistentHash([new Uint8Array([
+						108,
+						97,
+						114,
+						101,
+						115,
+						58,
+						116,
+						105,
+						110,
+						121,
+						58,
+						112,
+						107,
+						58,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0,
+						0
+					]), sk]),
+					context
+				};
+			}
+		};
+	}
+	initialState(context, v) {
+		const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+		__compactRuntime.writeCell(context, 0, _public_key(sk));
+		__compactRuntime.writeCell(context, 1, v);
+		__compactRuntime.writeCell(context, 2, STATE.set);
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+export type Witnesses<T> = {
+	private$secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+};
+export type ImpureCircuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	clear(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {
+	public_key(sk: Uint8Array): Uint8Array;
+};
+export type Circuits<T> = {
+	set(context: __compactRuntime.CircuitContext<T>, v: bigint): __compactRuntime.CircuitResults<T, []>;
+	get(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	clear(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	public_key(context: __compactRuntime.CircuitContext<T>, sk: Uint8Array): __compactRuntime.CircuitResults<T, Uint8Array>;
+};
+export type Ledger = {
+	readonly value: bigint;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>, v: bigint): __compactRuntime.ConstructorResult<T>;
+}

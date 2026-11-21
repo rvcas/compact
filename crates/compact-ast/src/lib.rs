@@ -205,14 +205,24 @@ pub enum NodeTag {
     Root,
     /// `import <ident>;` — `main_token = import`, `data = (name_tok, 0)`.
     ImportDecl,
+    /// `export { <name>, ... }[;]` — `main_token = export`, `data = (names_start, names_end)`.
+    ExportListDecl,
     /// `[export] enum <name> { <variant>, ... }`
     /// `main_token = enum`, `data = (extra_start, flags)`,
-    /// `extra_data[extra_start..+3] = [name_tok, variants_start, variants_end]` (variant `TokenIndex`es).
+    /// `extra_data[extra_start..+3] = [name_tok, variants_start, variants_end]`.
     EnumDecl,
     /// `[export] [sealed] ledger <name>: <type>;`
     /// `main_token = ledger`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+2] = [name_tok, type_node]`.
     LedgerDecl,
+    /// `[export] witness <name>(<params>): <ret_type>;`
+    /// `main_token = witness`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+4] = [name_tok, params_start, params_end, ret_type_node]`.
+    WitnessDecl,
+    /// `constructor(<params>) <block>`
+    /// `main_token = constructor`, `data = (extra_start, 0)`,
+    /// `extra_data[extra_start..+3] = [params_start, params_end, body_node]`.
+    ConstructorDecl,
     /// `[export] [pure] circuit <name>(<params>): <ret_type> <block>`
     /// `main_token = circuit`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+5] = [name_tok, params_start, params_end, ret_type_node, body_node]`.
@@ -221,6 +231,11 @@ pub enum NodeTag {
     Param,
     /// Named type reference (e.g. `Counter`, `Field`) — `main_token = name_tok`.
     TypeNamed,
+    /// Parameterized type (e.g. `Bytes<32>`, `Vector<2, Bytes<32>>`, `Maybe<Field>`)
+    /// `main_token = name_tok`, `data = (args_start, args_end)`.
+    TypeGeneric,
+    /// Numeric type argument (e.g. `32` in `Bytes<32>`) — `main_token = nat_tok`.
+    TypeNat,
     /// Tuple type (e.g. `[]`, `[Field, Boolean]`) — `main_token = '['`, `data = (extra_start, extra_end)`.
     TypeTuple,
     /// Block `{ <stmt>* }` — `main_token = '{'`, `data = (extra_start, extra_end)`.
@@ -244,7 +259,7 @@ pub enum NodeTag {
     BoolLitExpr,
     /// String literal expression — `main_token = string_tok`.
     StringLitExpr,
-    /// Tuple literal expression `[<expr>, ...]` — `main_token = '['`, `data = (extra_start, extra_end)`.
+    /// Tuple / vector literal expression `[<expr>, ...]` — `main_token = '['`, `data = (extra_start, extra_end)`.
     TupleExpr,
     /// Member access `<lhs>.<field>` — `main_token = '.'`, `data = (lhs_node, field_tok)`.
     MemberExpr,
@@ -252,6 +267,10 @@ pub enum NodeTag {
     /// `main_token = '('`, `data = (extra_start, rparen_tok)`,
     /// `extra_data[extra_start..+3] = [callee_node, args_start, args_end]`.
     CallExpr,
+    /// Generic call expression `<callee><targs>(<args>)`
+    /// `main_token = '('`, `data = (extra_start, rparen_tok)`,
+    /// `extra_data[extra_start..+5] = [callee_node, targs_start, targs_end, args_start, args_end]`.
+    GenericCallExpr,
     /// Unary expression `<op><expr>` — `main_token = op_tok`, `data = (operand_node, 0)`.
     UnaryExpr,
     /// Binary expression `<lhs> <op> <rhs>` — `main_token = op_tok`, `data = (lhs_node, rhs_node)`.
@@ -262,6 +281,8 @@ pub enum NodeTag {
     TernaryExpr,
     /// Cast expression `<expr> as <type>` — `main_token = as`, `data = (expr_node, type_node)`.
     CastExpr,
+    /// `default<T>` — `main_token = default`, `data = (type_node, rangle_tok)`.
+    DefaultExpr,
     /// `assert(<cond>, <msg>)` — `main_token = assert`, `data = (extra_start, rparen_tok)`,
     /// `extra_data[extra_start..+2] = [cond_node, msg_node]`.
     AssertExpr,
@@ -300,6 +321,13 @@ pub struct ImportDecl {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct ExportListDecl {
+    pub export_token: TokenIndex,
+    pub names_start: u32,
+    pub names_end: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct EnumDecl {
     pub enum_token: TokenIndex,
     pub name_token: TokenIndex,
@@ -315,6 +343,24 @@ pub struct LedgerDecl {
     pub type_node: NodeIndex,
     pub exported: bool,
     pub sealed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WitnessDecl {
+    pub witness_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub params_start: u32,
+    pub params_end: u32,
+    pub ret_type: NodeIndex,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConstructorDecl {
+    pub constructor_token: TokenIndex,
+    pub params_start: u32,
+    pub params_end: u32,
+    pub body: NodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -357,6 +403,17 @@ pub struct CallExpr {
     pub lparen_token: TokenIndex,
     pub rparen_token: TokenIndex,
     pub callee: NodeIndex,
+    pub args_start: u32,
+    pub args_end: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GenericCallExpr {
+    pub lparen_token: TokenIndex,
+    pub rparen_token: TokenIndex,
+    pub callee: NodeIndex,
+    pub targs_start: u32,
+    pub targs_end: u32,
     pub args_start: u32,
     pub args_end: u32,
 }
@@ -478,6 +535,16 @@ impl Ast {
         }
     }
 
+    pub fn export_list_decl(&self, node: NodeIndex) -> ExportListDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ExportListDecl);
+        let data = self.node_data(node);
+        ExportListDecl {
+            export_token: self.node_main_token(node),
+            names_start: data.lhs,
+            names_end: data.rhs,
+        }
+    }
+
     pub fn enum_decl(&self, node: NodeIndex) -> EnumDecl {
         debug_assert_eq!(self.node_tag(node), NodeTag::EnumDecl);
         let data = self.node_data(node);
@@ -501,6 +568,32 @@ impl Ast {
             type_node: NodeIndex(self.extra_data[base + 1]),
             exported: (data.rhs & decl_flags::EXPORT) != 0,
             sealed: (data.rhs & decl_flags::SEALED) != 0,
+        }
+    }
+
+    pub fn witness_decl(&self, node: NodeIndex) -> WitnessDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::WitnessDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        WitnessDecl {
+            witness_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            params_start: self.extra_data[base + 1],
+            params_end: self.extra_data[base + 2],
+            ret_type: NodeIndex(self.extra_data[base + 3]),
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
+        }
+    }
+
+    pub fn constructor_decl(&self, node: NodeIndex) -> ConstructorDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ConstructorDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ConstructorDecl {
+            constructor_token: self.node_main_token(node),
+            params_start: self.extra_data[base],
+            params_end: self.extra_data[base + 1],
+            body: NodeIndex(self.extra_data[base + 2]),
         }
     }
 
@@ -567,6 +660,21 @@ impl Ast {
         }
     }
 
+    pub fn generic_call_expr(&self, node: NodeIndex) -> GenericCallExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::GenericCallExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        GenericCallExpr {
+            lparen_token: self.node_main_token(node),
+            rparen_token: TokenIndex(data.rhs),
+            callee: NodeIndex(self.extra_data[base]),
+            targs_start: self.extra_data[base + 1],
+            targs_end: self.extra_data[base + 2],
+            args_start: self.extra_data[base + 3],
+            args_end: self.extra_data[base + 4],
+        }
+    }
+
     pub fn ternary_expr(&self, node: NodeIndex) -> TernaryExpr {
         debug_assert_eq!(self.node_tag(node), NodeTag::TernaryExpr);
         let data = self.node_data(node);
@@ -606,6 +714,13 @@ impl Ast {
                 self.node_span(first).merge(self.node_span(last))
             }
             NodeTag::ImportDecl => main.merge(self.token_span(TokenIndex(data.lhs))),
+            NodeTag::ExportListDecl => {
+                let mut span = main;
+                if let Some(last) = self.extra_tokens(data.lhs, data.rhs).last() {
+                    span = span.merge(self.token_span(last));
+                }
+                span
+            }
             NodeTag::EnumDecl => {
                 let decl = self.enum_decl(node);
                 let mut span = main.merge(self.token_span(decl.name_token));
@@ -621,17 +736,26 @@ impl Ast {
                 let decl = self.ledger_decl(node);
                 main.merge(self.node_span(decl.type_node))
             }
+            NodeTag::WitnessDecl => {
+                let decl = self.witness_decl(node);
+                main.merge(self.node_span(decl.ret_type))
+            }
+            NodeTag::ConstructorDecl => {
+                let decl = self.constructor_decl(node);
+                main.merge(self.node_span(decl.body))
+            }
             NodeTag::CircuitDecl => {
                 let decl = self.circuit_decl(node);
                 main.merge(self.node_span(decl.body))
             }
             NodeTag::Param => main.merge(self.node_span(NodeIndex(data.lhs))),
             NodeTag::TypeNamed
+            | NodeTag::TypeNat
             | NodeTag::IdentExpr
             | NodeTag::IntLitExpr
             | NodeTag::BoolLitExpr
             | NodeTag::StringLitExpr => main,
-            NodeTag::TypeTuple | NodeTag::TupleExpr | NodeTag::Block => {
+            NodeTag::TypeGeneric | NodeTag::TypeTuple | NodeTag::TupleExpr | NodeTag::Block => {
                 let mut span = main;
                 if let Some(last) = self.extra_nodes(data.lhs, data.rhs).last() {
                     span = span.merge(self.node_span(last));
@@ -665,6 +789,11 @@ impl Ast {
                 self.node_span(call.callee)
                     .merge(self.token_span(call.rparen_token))
             }
+            NodeTag::GenericCallExpr => {
+                let call = self.generic_call_expr(node);
+                self.node_span(call.callee)
+                    .merge(self.token_span(call.rparen_token))
+            }
             NodeTag::UnaryExpr => main.merge(self.node_span(NodeIndex(data.lhs))),
             NodeTag::BinaryExpr => self
                 .node_span(NodeIndex(data.lhs))
@@ -676,6 +805,7 @@ impl Ast {
             NodeTag::CastExpr => self
                 .node_span(NodeIndex(data.lhs))
                 .merge(self.node_span(NodeIndex(data.rhs))),
+            NodeTag::DefaultExpr => main.merge(self.token_span(TokenIndex(data.rhs))),
             NodeTag::AssertExpr => {
                 let a = self.assert_expr(node);
                 main.merge(self.token_span(a.rparen_token))
@@ -710,6 +840,14 @@ impl Ast {
                     self.token_text(decl.name_token, source)
                 )
                 .unwrap();
+            }
+            NodeTag::ExportListDecl => {
+                let decl = self.export_list_decl(node);
+                let names: Vec<_> = self
+                    .extra_tokens(decl.names_start, decl.names_end)
+                    .map(|t| self.token_text(t, source))
+                    .collect();
+                writeln!(out, "{pad}ExportList {{ {} }}", names.join(", ")).unwrap();
             }
             NodeTag::EnumDecl => {
                 let decl = self.enum_decl(node);
@@ -747,6 +885,41 @@ impl Ast {
                 )
                 .unwrap();
                 self.dump_node(decl.type_node, source, indent + 1, out);
+            }
+            NodeTag::WitnessDecl => {
+                let decl = self.witness_decl(node);
+                let mods_str = if decl.exported { "[export] " } else { "" };
+                writeln!(
+                    out,
+                    "{pad}WitnessDecl {mods_str}{}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                let params: Vec<_> = self
+                    .extra_nodes(decl.params_start, decl.params_end)
+                    .collect();
+                if !params.is_empty() {
+                    writeln!(out, "{pad}  Params").unwrap();
+                    for param in params {
+                        self.dump_node(param, source, indent + 2, out);
+                    }
+                }
+                writeln!(out, "{pad}  ReturnType").unwrap();
+                self.dump_node(decl.ret_type, source, indent + 2, out);
+            }
+            NodeTag::ConstructorDecl => {
+                let decl = self.constructor_decl(node);
+                writeln!(out, "{pad}ConstructorDecl").unwrap();
+                let params: Vec<_> = self
+                    .extra_nodes(decl.params_start, decl.params_end)
+                    .collect();
+                if !params.is_empty() {
+                    writeln!(out, "{pad}  Params").unwrap();
+                    for param in params {
+                        self.dump_node(param, source, indent + 2, out);
+                    }
+                }
+                self.dump_node(decl.body, source, indent + 1, out);
             }
             NodeTag::CircuitDecl => {
                 let decl = self.circuit_decl(node);
@@ -795,6 +968,25 @@ impl Ast {
                 writeln!(
                     out,
                     "{pad}TypeNamed {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+            }
+            NodeTag::TypeGeneric => {
+                writeln!(
+                    out,
+                    "{pad}TypeGeneric {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+                for arg in self.extra_nodes(data.lhs, data.rhs) {
+                    self.dump_node(arg, source, indent + 1, out);
+                }
+            }
+            NodeTag::TypeNat => {
+                writeln!(
+                    out,
+                    "{pad}TypeNat {}",
                     self.token_text(self.node_main_token(node), source)
                 )
                 .unwrap();
@@ -895,6 +1087,18 @@ impl Ast {
                     self.dump_node(arg, source, indent + 1, out);
                 }
             }
+            NodeTag::GenericCallExpr => {
+                let call = self.generic_call_expr(node);
+                writeln!(out, "{pad}GenericCallExpr").unwrap();
+                self.dump_node(call.callee, source, indent + 1, out);
+                writeln!(out, "{pad}  TypeArgs").unwrap();
+                for targ in self.extra_nodes(call.targs_start, call.targs_end) {
+                    self.dump_node(targ, source, indent + 2, out);
+                }
+                for arg in self.extra_nodes(call.args_start, call.args_end) {
+                    self.dump_node(arg, source, indent + 1, out);
+                }
+            }
             NodeTag::UnaryExpr => {
                 writeln!(
                     out,
@@ -925,6 +1129,10 @@ impl Ast {
                 writeln!(out, "{pad}CastExpr").unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
                 self.dump_node(NodeIndex(data.rhs), source, indent + 1, out);
+            }
+            NodeTag::DefaultExpr => {
+                writeln!(out, "{pad}DefaultExpr").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
             }
             NodeTag::AssertExpr => {
                 let a = self.assert_expr(node);

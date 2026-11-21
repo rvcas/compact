@@ -24,9 +24,9 @@ struct ContractInfo<'a> {
     #[serde(rename = "runtime-version")]
     runtime_version: &'a str,
     circuits: Vec<CircuitInfo>,
-    witnesses: Vec<Value>,
+    witnesses: Vec<WitnessInfo>,
     contracts: Vec<Value>,
-    ledger: Vec<LedgerFieldInfo>,
+    ledger: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,17 +40,16 @@ struct CircuitInfo {
 }
 
 #[derive(Debug, Serialize)]
-struct ArgInfo {
+struct WitnessInfo {
     name: String,
-    #[serde(rename = "type")]
-    ty: Value,
+    arguments: Vec<ArgInfo>,
+    #[serde(rename = "result type")]
+    result_type: Value,
 }
 
 #[derive(Debug, Serialize)]
-struct LedgerFieldInfo {
+struct ArgInfo {
     name: String,
-    exported: bool,
-    sealed: bool,
     #[serde(rename = "type")]
     ty: Value,
 }
@@ -68,6 +67,15 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             map.insert("type-name".into(), Value::String("Uint".into()));
             map.insert("maxval".into(), Value::String(((1u128 << bits) - 1).to_string()));
         }
+        Type::Bytes(len) => {
+            map.insert("type-name".into(), Value::String("Bytes".into()));
+            map.insert("length".into(), Value::Number((*len as u64).into()));
+        }
+        Type::Vector(len, elem) => {
+            map.insert("type-name".into(), Value::String("Vector".into()));
+            map.insert("length".into(), Value::Number((*len as u64).into()));
+            map.insert("type".into(), type_to_json(program, elem));
+        }
         Type::Tuple(elems) => {
             map.insert("type-name".into(), Value::String("Tuple".into()));
             map.insert(
@@ -84,18 +92,48 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
                 Value::Array(decl.variants.iter().cloned().map(Value::String).collect()),
             );
         }
+        Type::Maybe(inner) => {
+            let mut is_some = Map::new();
+            is_some.insert("name".into(), Value::String("is_some".into()));
+            is_some.insert("type".into(), type_to_json(program, &Type::Boolean));
+
+            let mut value = Map::new();
+            value.insert("name".into(), Value::String("value".into()));
+            value.insert("type".into(), type_to_json(program, inner));
+
+            map.insert("type-name".into(), Value::String("Struct".into()));
+            map.insert("name".into(), Value::String("Maybe".into()));
+            map.insert(
+                "elements".into(),
+                Value::Array(vec![Value::Object(is_some), Value::Object(value)]),
+            );
+        }
     }
     Value::Object(map)
 }
 
-fn ledger_field_type_to_json(program: &Program, field: &LedgerField) -> Value {
+fn ledger_field_to_json(program: &Program, field: &LedgerField) -> Value {
     let mut map = Map::new();
+    map.insert("name".into(), Value::String(field.name.clone()));
+    let index = if field.path.len() == 1 {
+        Value::Number((field.path[0] as u64).into())
+    } else {
+        Value::Array(
+            field
+                .path
+                .iter()
+                .map(|&p| Value::Number((p as u64).into()))
+                .collect(),
+        )
+    };
+    map.insert("index".into(), index);
+    map.insert("exported".into(), Value::Bool(field.exported));
     match field.adt {
         LedgerAdt::Counter => {
-            map.insert("type-name".into(), Value::String("Counter".into()));
+            map.insert("storage".into(), Value::String("Counter".into()));
         }
         LedgerAdt::Cell => {
-            map.insert("type-name".into(), Value::String("Cell".into()));
+            map.insert("storage".into(), Value::String("Cell".into()));
             map.insert("type".into(), type_to_json(program, &field.value_type));
         }
     }
@@ -124,15 +162,27 @@ pub fn render_contract_info(program: &Program) -> String {
         })
         .collect();
 
+    let witnesses = program
+        .witnesses
+        .iter()
+        .map(|w| WitnessInfo {
+            name: w.name.clone(),
+            arguments: w
+                .params
+                .iter()
+                .map(|p| ArgInfo {
+                    name: p.name.clone(),
+                    ty: type_to_json(program, &p.ty),
+                })
+                .collect(),
+            result_type: type_to_json(program, &w.ret_type),
+        })
+        .collect();
+
     let ledger = program
         .ledger_fields
         .iter()
-        .map(|f| LedgerFieldInfo {
-            name: f.name.clone(),
-            exported: f.exported,
-            sealed: f.sealed,
-            ty: ledger_field_type_to_json(program, f),
-        })
+        .map(|f| ledger_field_to_json(program, f))
         .collect();
 
     let info = ContractInfo {
@@ -141,7 +191,7 @@ pub fn render_contract_info(program: &Program) -> String {
         language_version: LANGUAGE_VERSION,
         runtime_version: RUNTIME_VERSION,
         circuits,
-        witnesses: Vec::new(),
+        witnesses,
         contracts: Vec::new(),
         ledger,
     };
@@ -237,6 +287,65 @@ mod tests {
 
             export circuit increment(): [] {
               round.increment(1);
+            }
+            "#,
+            contract_info_for
+        );
+    }
+
+    #[test]
+    fn contract_info_tiny() {
+        assert_compact_snapshot!(
+            r#"
+            export {Maybe}
+            export {set, get, clear, public_key}
+
+            import CompactStandardLibrary;
+
+            enum STATE { unset, set }
+
+            ledger authority: Bytes<32>;
+            export ledger value: Field;
+            ledger state: STATE;
+
+            constructor(v: Field) {
+              const sk = private$secret_key();
+              authority = public_key(sk);
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            witness private$secret_key(): Bytes<32>;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              authority = apk;
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            circuit get(): Maybe<Field> {
+              return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+            }
+
+            circuit clear(): [] {
+              assert(in_state(STATE.set), "clear: no value is currently recorded");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority, "clear: attempted clear without proper authorization");
+              authority = default<Bytes<32>>;
+              value = default<Field>;
+              state = STATE.unset;
+            }
+
+            circuit public_key(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
             }
             "#,
             contract_info_for

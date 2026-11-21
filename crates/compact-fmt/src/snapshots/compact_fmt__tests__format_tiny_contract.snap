@@ -1,0 +1,52 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+export{Maybe}
+export{set,get,clear,public_key}
+import CompactStandardLibrary;
+enum STATE{unset,set}
+ledger authority:Bytes<32>;
+export ledger value:Field;
+ledger state:STATE;
+constructor(v:Field){const sk=private$secret_key();authority=public_key(sk);value=disclose(v);state=STATE.set;}
+witness private$secret_key():Bytes<32>;
+circuit get():Maybe<Field>{return state==STATE.set?some<Field>(value):none<Field>();}
+circuit clear():[]{authority=default<Bytes<32>>;value=default<Field>;state=STATE.unset;}
+circuit public_key(sk:Bytes<32>):Bytes<32>{return disclose(persistentHash<Vector<2,Bytes<32>>>([pad(32,"lares:tiny:pk:"),sk]));}
+===
+export { Maybe };
+
+export { set, get, clear, public_key };
+
+import CompactStandardLibrary;
+
+enum STATE { unset, set }
+
+ledger authority: Bytes<32>;
+
+export ledger value: Field;
+
+ledger state: STATE;
+
+constructor(v: Field) {
+  const sk = private$secret_key();
+  authority = public_key(sk);
+  value = disclose(v);
+  state = STATE.set;
+}
+
+witness private$secret_key(): Bytes<32>;
+
+circuit get(): Maybe<Field> {
+  return state == STATE.set ? some<Field>(value) : none<Field>();
+}
+
+circuit clear(): [] {
+  authority = default<Bytes<32>>;
+  value = default<Field>;
+  state = STATE.unset;
+}
+
+circuit public_key(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
+}

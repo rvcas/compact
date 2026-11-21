@@ -1,0 +1,153 @@
+---
+source: crates/compact-codegen-zkir/src/lib.rs
+---
+export {Maybe}
+export {set, get, clear, public_key}
+
+import CompactStandardLibrary;
+
+enum STATE { unset, set }
+
+ledger authority: Bytes<32>;
+export ledger value: Field;
+ledger state: STATE;
+constructor(v: Field) {
+  const sk = private$secret_key();
+  authority = public_key(sk);
+  value = disclose(v);
+  state = STATE.set;
+}
+
+witness private$secret_key(): Bytes<32>;
+
+circuit in_state(s: STATE): Boolean {
+  return state == s;
+}
+
+circuit set(v: Field): [] {
+  assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  authority = apk;
+  value = disclose(v);
+  state = STATE.set;
+}
+
+circuit get(): Maybe<Field> {
+  return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+}
+
+circuit clear(): [] {
+  assert(in_state(STATE.set), "clear: no value is currently recorded");
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  assert(apk == authority, "clear: attempted clear without proper authorization");
+  authority = default<Bytes<32>>;
+  value = default<Field>;
+  state = STATE.unset;
+}
+
+circuit public_key(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
+}
+===
+=== set.zkir ===
+{
+  "version": { "major": 3, "minor": 1 },
+  "do_communications_commitment": true,
+  "inputs": [
+    { "name": "%v.0", "type": "Scalar<BLS12-381>" }
+  ],
+  "outputs": [
+  ],
+  "instructions": [
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%state.1", "guard": null },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x01", "%state.1"] },
+    { "op": "test_eq", "output": "%t.2", "a": "%state.1", "b": "0x00" },
+    { "op": "assert", "cond": "%t.2" },
+    { "op": "private_input", "type": "Scalar<BLS12-381>", "output": "%sk.3", "guard": null },
+    { "op": "constrain_bits", "val": "%sk.3", "bits": 8 },
+    { "op": "private_input", "type": "Scalar<BLS12-381>", "output": "%sk.4", "guard": null },
+    { "op": "constrain_bits", "val": "%sk.4", "bits": 248 },
+    { "op": "persistent_hash", "output": "%bytes.5", "alignment": [{ "tag": "atom", "value": { "length": 32, "tag": "bytes" } }, { "tag": "atom", "value": { "length": 32, "tag": "bytes" } }], "inputs": ["0x00", "0x6c617265733a74696e793a706b3a", "%sk.3", "%sk.4"] },
+    { "op": "bytes_into_natives", "outputs": ["%hash.6", "%hash.7"], "bytes": "%bytes.5" },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x20", "%hash.7", "%hash.6"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "-0x02", "%v.0"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] }
+  ]
+}
+
+=== get.zkir ===
+{
+  "version": { "major": 3, "minor": 1 },
+  "do_communications_commitment": true,
+  "inputs": [
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%state.0", "guard": null },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x01", "%state.0"] },
+    { "op": "test_eq", "output": "%t.1", "a": "%state.0", "b": "0x01" },
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%value.2", "guard": "%t.1" },
+    { "op": "impact", "guard": "%t.1", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "%t.1", "inputs": ["0x50", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "%t.1", "inputs": ["0x0c", "0x01", "-0x02", "%value.2"] },
+    { "op": "cond_select", "output": "%t.3", "bit": "%t.1", "a": "%value.2", "b": "0x00" },
+    { "op": "output", "vals": ["%t.1", "%t.3"] }
+  ]
+}
+
+=== clear.zkir ===
+{
+  "version": { "major": 3, "minor": 1 },
+  "do_communications_commitment": true,
+  "inputs": [
+  ],
+  "outputs": [
+  ],
+  "instructions": [
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%state.0", "guard": null },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x01", "%state.0"] },
+    { "op": "test_eq", "output": "%t.1", "a": "%state.0", "b": "0x01" },
+    { "op": "assert", "cond": "%t.1" },
+    { "op": "private_input", "type": "Scalar<BLS12-381>", "output": "%sk.2", "guard": null },
+    { "op": "constrain_bits", "val": "%sk.2", "bits": 8 },
+    { "op": "private_input", "type": "Scalar<BLS12-381>", "output": "%sk.3", "guard": null },
+    { "op": "constrain_bits", "val": "%sk.3", "bits": 248 },
+    { "op": "persistent_hash", "output": "%bytes.4", "alignment": [{ "tag": "atom", "value": { "length": 32, "tag": "bytes" } }, { "tag": "atom", "value": { "length": 32, "tag": "bytes" } }], "inputs": ["0x00", "0x6c617265733a74696e793a706b3a", "%sk.2", "%sk.3"] },
+    { "op": "bytes_into_natives", "outputs": ["%hash.5", "%hash.6"], "bytes": "%bytes.4" },
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%authority.7", "guard": null },
+    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%authority.8", "guard": null },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x20", "%authority.7", "%authority.8"] },
+    { "op": "test_eq", "output": "%t.9", "a": "%hash.6", "b": "%authority.7" },
+    { "op": "test_eq", "output": "%t.10", "a": "%hash.5", "b": "%authority.8" },
+    { "op": "cond_select", "output": "%t.11", "bit": "%t.9", "a": "%t.10", "b": "0x00" },
+    { "op": "assert", "cond": "%t.11" },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x20", "0x00", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "-0x02", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] }
+  ]
+}

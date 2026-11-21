@@ -30,12 +30,10 @@ export circuit increment(): [] {
   "contracts": [],
   "ledger": [
     {
-      "name": "round",
       "exported": true,
-      "sealed": false,
-      "type": {
-        "type-name": "Counter"
-      }
+      "index": 0,
+      "name": "round",
+      "storage": "Counter"
     }
   ]
 }

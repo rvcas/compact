@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use compact_circuit::{CircuitInstr, CircuitVal, CircuitVar, ProofCircuit};
+use compact_circuit::{AlignmentAtom, CircuitInstr, CircuitVal, CircuitVar, ProofCircuit};
 use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use midnight_serialize::tagged_serialize;
 use midnight_transient_crypto::proofs::Zkir;
@@ -123,8 +123,7 @@ fn var_name(circuit: &ProofCircuit, var: CircuitVar) -> String {
     format!("%{hint}.{}", var.id)
 }
 
-/// Format a signed integer immediate into ZKIR v3 little-endian hex (`"0x00"`, `"-0x02"`, ...),
-/// matching `zkir-field-rep->string` in `print-zkir-v3.ss`.
+/// Format a signed integer immediate into ZKIR v3 little-endian hex (`"0x00"`, `"-0x02"`, ...).
 fn format_imm(val: i128) -> String {
     let mut s = String::new();
     let mut n = if val < 0 {
@@ -145,11 +144,27 @@ fn format_imm(val: i128) -> String {
     s
 }
 
-fn format_val(circuit: &ProofCircuit, val: CircuitVal) -> String {
+fn format_val(circuit: &ProofCircuit, val: &CircuitVal) -> String {
     match val {
-        CircuitVal::Var(v) => format!("\"{}\"", var_name(circuit, v)),
-        CircuitVal::Imm(n) => format!("\"{}\"", format_imm(n)),
+        CircuitVal::Var(v) => format!("\"{}\"", var_name(circuit, *v)),
+        CircuitVal::Imm(n) => format!("\"{}\"", format_imm(*n)),
+        CircuitVal::ImmBytes(bytes) => format!("\"0x{}\"", hex::encode(bytes)),
     }
+}
+
+fn format_alignment(alignment: &[AlignmentAtom]) -> String {
+    let items: Vec<String> = alignment
+        .iter()
+        .map(|atom| match atom {
+            AlignmentAtom::Bytes(len) => {
+                format!("{{ \"tag\": \"atom\", \"value\": {{ \"length\": {len}, \"tag\": \"bytes\" }} }}")
+            }
+            AlignmentAtom::Field => {
+                "{ \"tag\": \"atom\", \"value\": { \"tag\": \"field\" } }".to_owned()
+            }
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
 }
 
 /// Format a [`ProofCircuit`] into canonical upstream `.zkir` v3.1 JSON.
@@ -188,7 +203,7 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
         match instr {
             CircuitInstr::PublicInput { guard, output } => {
                 let guard_str = match guard {
-                    Some(g) => format_val(circuit, *g),
+                    Some(g) => format_val(circuit, g),
                     None => "null".to_owned(),
                 };
                 writeln!(
@@ -198,11 +213,31 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 )
                 .unwrap();
             }
+            CircuitInstr::PrivateInput { guard, output } => {
+                let guard_str = match guard {
+                    Some(g) => format_val(circuit, g),
+                    None => "null".to_owned(),
+                };
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"private_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"{}\", \"guard\": {guard_str} }}{comma}",
+                    var_name(circuit, *output)
+                )
+                .unwrap();
+            }
+            CircuitInstr::ConstrainBits { val, bits } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"constrain_bits\", \"val\": {}, \"bits\": {bits} }}{comma}",
+                    format_val(circuit, val)
+                )
+                .unwrap();
+            }
             CircuitInstr::Impact { guard, op } => {
-                let guard_str = format_val(circuit, *guard);
+                let guard_str = format_val(circuit, guard);
                 let inputs: Vec<_> = op
                     .assemble()
-                    .into_iter()
+                    .iter()
                     .map(|v| format_val(circuit, v))
                     .collect();
                 writeln!(
@@ -212,13 +247,42 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 )
                 .unwrap();
             }
+            CircuitInstr::PersistentHash {
+                alignment,
+                inputs,
+                output,
+            } => {
+                let rendered_inputs: Vec<_> =
+                    inputs.iter().map(|v| format_val(circuit, v)).collect();
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"persistent_hash\", \"output\": \"{}\", \"alignment\": {}, \"inputs\": [{}] }}{comma}",
+                    var_name(circuit, *output),
+                    format_alignment(alignment),
+                    rendered_inputs.join(", ")
+                )
+                .unwrap();
+            }
+            CircuitInstr::BytesIntoNatives { bytes, outputs } => {
+                let rendered_outputs: Vec<_> = outputs
+                    .iter()
+                    .map(|v| format!("\"{}\"", var_name(circuit, *v)))
+                    .collect();
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"bytes_into_natives\", \"outputs\": [{}], \"bytes\": \"{}\" }}{comma}",
+                    rendered_outputs.join(", "),
+                    var_name(circuit, *bytes)
+                )
+                .unwrap();
+            }
             CircuitInstr::TestEq { a, b, output } => {
                 writeln!(
                     out,
                     "    {{ \"op\": \"test_eq\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
                     var_name(circuit, *output),
-                    format_val(circuit, *a),
-                    format_val(circuit, *b)
+                    format_val(circuit, a),
+                    format_val(circuit, b)
                 )
                 .unwrap();
             }
@@ -227,7 +291,7 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                     out,
                     "    {{ \"op\": \"not\", \"output\": \"{}\", \"a\": {} }}{comma}",
                     var_name(circuit, *output),
-                    format_val(circuit, *a)
+                    format_val(circuit, a)
                 )
                 .unwrap();
             }
@@ -236,8 +300,8 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                     out,
                     "    {{ \"op\": \"add\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
                     var_name(circuit, *output),
-                    format_val(circuit, *a),
-                    format_val(circuit, *b)
+                    format_val(circuit, a),
+                    format_val(circuit, b)
                 )
                 .unwrap();
             }
@@ -246,7 +310,7 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                     out,
                     "    {{ \"op\": \"neg\", \"output\": \"{}\", \"a\": {} }}{comma}",
                     var_name(circuit, *output),
-                    format_val(circuit, *a)
+                    format_val(circuit, a)
                 )
                 .unwrap();
             }
@@ -255,9 +319,9 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                     out,
                     "    {{ \"op\": \"cond_select\", \"output\": \"{}\", \"bit\": {}, \"a\": {}, \"b\": {} }}{comma}",
                     var_name(circuit, *output),
-                    format_val(circuit, *bit),
-                    format_val(circuit, *a),
-                    format_val(circuit, *b)
+                    format_val(circuit, bit),
+                    format_val(circuit, a),
+                    format_val(circuit, b)
                 )
                 .unwrap();
             }
@@ -265,12 +329,12 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 writeln!(
                     out,
                     "    {{ \"op\": \"assert\", \"cond\": {} }}{comma}",
-                    format_val(circuit, *cond)
+                    format_val(circuit, cond)
                 )
                 .unwrap();
             }
             CircuitInstr::Output { vals } => {
-                let rendered: Vec<_> = vals.iter().map(|v| format_val(circuit, *v)).collect();
+                let rendered: Vec<_> = vals.iter().map(|v| format_val(circuit, v)).collect();
                 writeln!(
                     out,
                     "    {{ \"op\": \"output\", \"vals\": [{}] }}{comma}",
@@ -300,7 +364,11 @@ mod tests {
         let id = sm.add_file("test.compact", src);
         let file = sm.get(id);
         let parsed = parse(file);
-        assert!(!parsed.diagnostics.has_errors());
+        assert!(
+            !parsed.diagnostics.has_errors(),
+            "unexpected parse errors: {:?}",
+            parsed.diagnostics
+        );
         let checked = check(file, &parsed.ast);
         assert!(
             !checked.diagnostics.has_errors(),
@@ -365,6 +433,64 @@ mod tests {
 
             export circuit get(): Field {
               return in_state(STATE.set) ? value : 0 as Field;
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_tiny_contract() {
+        assert_compact_snapshot!(
+            r#"
+            export {Maybe}
+            export {set, get, clear, public_key}
+
+            import CompactStandardLibrary;
+
+            enum STATE { unset, set }
+
+            ledger authority: Bytes<32>;
+            export ledger value: Field;
+            ledger state: STATE;
+            constructor(v: Field) {
+              const sk = private$secret_key();
+              authority = public_key(sk);
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            witness private$secret_key(): Bytes<32>;
+
+            circuit in_state(s: STATE): Boolean {
+              return state == s;
+            }
+
+            circuit set(v: Field): [] {
+              assert(in_state(STATE.unset), "set: attempted to overwrite recorded value");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              authority = apk;
+              value = disclose(v);
+              state = STATE.set;
+            }
+
+            circuit get(): Maybe<Field> {
+              return in_state(STATE.set) ? some<Field>(value) : none<Field>();
+            }
+
+            circuit clear(): [] {
+              assert(in_state(STATE.set), "clear: no value is currently recorded");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority, "clear: attempted clear without proper authorization");
+              authority = default<Bytes<32>>;
+              value = default<Field>;
+              state = STATE.unset;
+            }
+
+            circuit public_key(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
             }
             "#,
             compile_all_zkir

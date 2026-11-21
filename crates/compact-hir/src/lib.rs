@@ -9,6 +9,9 @@ pub struct EnumId(pub u32);
 pub struct LedgerFieldId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WitnessId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CircuitId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,7 +23,7 @@ pub struct LocalId(pub u32);
 /// Built-in ledger Abstract Data Types from Midnight's ledger specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LedgerAdt {
-    /// Implicit single-value cell wrapping ordinary Compact types (e.g. `Field`, `Boolean`, enums).
+    /// Implicit single-value cell wrapping ordinary Compact types (e.g. `Field`, `Bytes<32>`, enums).
     Cell,
     Counter,
 }
@@ -68,8 +71,12 @@ pub enum Type {
     Field,
     Boolean,
     Uint(u32),
+    Bytes(u32),
+    Vector(u32, Box<Type>),
     Tuple(Vec<Type>),
     Enum(EnumId),
+    /// Standard-library `Maybe<T> { is_some: Boolean, value: T }`.
+    Maybe(Box<Type>),
 }
 
 impl Type {
@@ -96,11 +103,28 @@ pub struct LedgerField {
     pub id: LedgerFieldId,
     pub name: String,
     pub adt: LedgerAdt,
-    /// Underlying value type (`Field`/`Enum`/etc. for `Cell`; `Uint(64)` for `Counter`).
+    /// Underlying value type (`Field`/`Bytes<32>`/`Enum` for `Cell`; `Uint(64)` for `Counter`).
     pub value_type: Type,
     pub path: Vec<u32>,
     pub exported: bool,
     pub sealed: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct WitnessDecl {
+    pub id: WitnessId,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret_type: Type,
+    pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Constructor {
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
     pub span: Span,
 }
 
@@ -130,6 +154,10 @@ pub enum BinaryOp {
 pub enum ExprKind {
     IntLit(u128),
     BoolLit(bool),
+    /// Fixed-length byte string literal (e.g. from `pad(32, "lares:tiny:pk:")`).
+    BytesLit(Vec<u8>),
+    /// Zero/default value of a Compact type (`default<T>`).
+    Default(Type),
     ParamRef(ParamId),
     LocalRef(LocalId),
     EnumVariant {
@@ -137,6 +165,7 @@ pub enum ExprKind {
         variant_idx: u32,
     },
     Tuple(Vec<Expr>),
+    Vector(Vec<Expr>),
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,
@@ -160,6 +189,10 @@ pub enum ExprKind {
         message: String,
     },
     Disclose(Box<Expr>),
+    WitnessCall {
+        witness: WitnessId,
+        args: Vec<Expr>,
+    },
     CircuitCall {
         circuit: CircuitId,
         args: Vec<Expr>,
@@ -169,6 +202,12 @@ pub enum ExprKind {
         op: LedgerOp,
         args: Vec<Expr>,
     },
+    PersistentHash {
+        input_ty: Type,
+        arg: Box<Expr>,
+    },
+    MaybeSome(Box<Expr>),
+    MaybeNone(Type),
 }
 
 #[derive(Debug, Clone)]
@@ -202,9 +241,9 @@ pub struct Circuit {
     pub ret_type: Type,
     pub body: Vec<Stmt>,
     pub exported: bool,
-    /// True when the circuit performs no ledger/emit/witness/cross-contract operations (transitively).
+    /// True when the circuit performs no ledger or witness operations (transitively).
     pub pure: bool,
-    /// True when the circuit is exported and requires a ZK proof (i.e. impure).
+    /// True when the circuit is exported and requires a ZK proof (touches ledger).
     pub proof: bool,
     pub span: Span,
 }
@@ -213,7 +252,11 @@ pub struct Circuit {
 pub struct Program {
     pub enums: Vec<EnumDecl>,
     pub ledger_fields: Vec<LedgerField>,
+    pub witnesses: Vec<WitnessDecl>,
+    pub constructor: Option<Constructor>,
     pub circuits: Vec<Circuit>,
+    /// Exported stdlib type names (e.g. `Maybe`).
+    pub exported_stdlib_types: Vec<String>,
 }
 
 impl Program {
@@ -223,6 +266,10 @@ impl Program {
 
     pub fn ledger_field(&self, id: LedgerFieldId) -> &LedgerField {
         &self.ledger_fields[id.0 as usize]
+    }
+
+    pub fn witness(&self, id: WitnessId) -> &WitnessDecl {
+        &self.witnesses[id.0 as usize]
     }
 
     pub fn circuit(&self, id: CircuitId) -> &Circuit {
@@ -238,17 +285,23 @@ impl Program {
             Type::Field => "Field".into(),
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
+            Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {
                 let inner: Vec<_> = elems.iter().map(|e| self.format_type(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
             Type::Enum(id) => self.enum_decl(*id).name.clone(),
+            Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
         }
     }
 
     pub fn dump(&self) -> String {
         let mut out = String::new();
         writeln!(out, "HirProgram").unwrap();
+        for name in &self.exported_stdlib_types {
+            writeln!(out, "  ExportStdlibType {name}").unwrap();
+        }
         for e in &self.enums {
             writeln!(
                 out,
@@ -273,6 +326,20 @@ impl Program {
                 field.path
             )
             .unwrap();
+        }
+        for w in &self.witnesses {
+            writeln!(
+                out,
+                "  Witness #{} {}{} -> {}",
+                w.id.0,
+                if w.exported { "export " } else { "" },
+                w.name,
+                self.format_type(&w.ret_type)
+            )
+            .unwrap();
+        }
+        if let Some(ctor) = &self.constructor {
+            writeln!(out, "  Constructor ({} params)", ctor.params.len()).unwrap();
         }
         for circuit in &self.circuits {
             writeln!(
