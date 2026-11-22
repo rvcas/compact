@@ -680,4 +680,12 @@ mod tests {
             compile_all_zkir
         );
     }
+
+    #[test]
+    fn zkir_zerocash_contract() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/zerocash.compact"),
+            compile_all_zkir
+        );
+    }
 }

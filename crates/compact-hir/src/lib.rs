@@ -32,6 +32,8 @@ pub enum LedgerAdt {
     Set,
     /// Bounded Merkle tree of depth `nat` (`2 <= nat <= 32`).
     MerkleTree(u32),
+    /// Bounded Merkle tree of depth `nat` (`2 <= nat <= 32`) with historic root set.
+    HistoricMerkleTree(u32),
 }
 
 impl LedgerAdt {
@@ -41,6 +43,7 @@ impl LedgerAdt {
             Self::Counter => "Counter",
             Self::Set => "Set",
             Self::MerkleTree(_) => "MerkleTree",
+            Self::HistoricMerkleTree(_) => "HistoricMerkleTree",
         }
     }
 }
@@ -58,6 +61,8 @@ pub enum LedgerOp {
     SetRemove,
     MerkleTreeInsert,
     MerkleTreeCheckRoot,
+    HistoricMerkleTreeInsert,
+    HistoricMerkleTreeCheckRoot,
 }
 
 impl LedgerOp {
@@ -71,8 +76,8 @@ impl LedgerOp {
             Self::SetMember => "member",
             Self::SetInsert => "insert",
             Self::SetRemove => "remove",
-            Self::MerkleTreeInsert => "insert",
-            Self::MerkleTreeCheckRoot => "checkRoot",
+            Self::MerkleTreeInsert | Self::HistoricMerkleTreeInsert => "insert",
+            Self::MerkleTreeCheckRoot | Self::HistoricMerkleTreeCheckRoot => "checkRoot",
         }
     }
 
@@ -85,6 +90,7 @@ impl LedgerOp {
                 | Self::SetInsert
                 | Self::SetRemove
                 | Self::MerkleTreeInsert
+                | Self::HistoricMerkleTreeInsert
         )
     }
 }

@@ -349,8 +349,12 @@ impl<'a> Analyzer<'a> {
                 (LedgerAdt::Set, elem_ty)
             }
             NodeTag::TypeGeneric
-                if self.text(self.ast.node_main_token(decl.type_node)) == "MerkleTree" =>
+                if matches!(
+                    self.text(self.ast.node_main_token(decl.type_node)),
+                    "MerkleTree" | "HistoricMerkleTree"
+                ) =>
             {
+                let adt_name = self.text(self.ast.node_main_token(decl.type_node));
                 let data = self.ast.node_data(decl.type_node);
                 let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
                 if arg_nodes.len() != 2 {
@@ -358,7 +362,7 @@ impl<'a> Analyzer<'a> {
                         self.file,
                         self.ast.node_span(decl.type_node),
                         format!(
-                            "`MerkleTree` expects 2 type arguments (depth, element type), found {}",
+                            "`{adt_name}` expects 2 type arguments (depth, element type), found {}",
                             arg_nodes.len()
                         ),
                     ));
@@ -367,7 +371,7 @@ impl<'a> Analyzer<'a> {
                 let Some(depth) = self.expect_type_nat(
                     &arg_nodes,
                     0,
-                    "MerkleTree",
+                    adt_name,
                     self.ast.node_span(decl.type_node),
                 ) else {
                     return;
@@ -375,7 +379,12 @@ impl<'a> Analyzer<'a> {
                 let Some(elem_ty) = self.resolve_type(arg_nodes[1]) else {
                     return;
                 };
-                (LedgerAdt::MerkleTree(depth), elem_ty)
+                let adt = if adt_name == "HistoricMerkleTree" {
+                    LedgerAdt::HistoricMerkleTree(depth)
+                } else {
+                    LedgerAdt::MerkleTree(depth)
+                };
+                (adt, elem_ty)
             }
             _ => {
                 let Some(ty) = self.resolve_type(decl.type_node) else {
@@ -2079,80 +2088,92 @@ impl<'a> Analyzer<'a> {
                     None
                 }
             },
-            LedgerAdt::MerkleTree(_) => match method_name {
-                "insert" => {
-                    if arg_nodes.len() != 1 {
+            LedgerAdt::MerkleTree(_) | LedgerAdt::HistoricMerkleTree(_) => {
+                let historic = matches!(adt, LedgerAdt::HistoricMerkleTree(_));
+                let adt_name = adt.name();
+                match method_name {
+                    "insert" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                call_span,
+                                format!("`{adt_name}.insert` takes 1 argument"),
+                            ));
+                            return None;
+                        }
+                        let mut item = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
+                        if !self.coerce_or_check(&mut item, &value_type) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                item.span,
+                                format!(
+                                    "`{adt_name}.insert` expects `{}`, found `{}`",
+                                    self.format_type(&value_type),
+                                    self.format_type(&item.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        Some(Expr {
+                            kind: ExprKind::LedgerCall {
+                                field: field_id,
+                                op: if historic {
+                                    LedgerOp::HistoricMerkleTreeInsert
+                                } else {
+                                    LedgerOp::MerkleTreeInsert
+                                },
+                                args: vec![item],
+                            },
+                            ty: Type::unit(),
+                            span: call_span,
+                        })
+                    }
+                    "checkRoot" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                call_span,
+                                format!("`{adt_name}.checkRoot` takes 1 argument"),
+                            ));
+                            return None;
+                        }
+                        let mut rt =
+                            self.check_expr(arg_nodes[0], scope, Some(&Type::MerkleTreeDigest))?;
+                        if !self.coerce_or_check(&mut rt, &Type::MerkleTreeDigest) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                rt.span,
+                                format!(
+                                    "`{adt_name}.checkRoot` expects `MerkleTreeDigest`, found `{}`",
+                                    self.format_type(&rt.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        Some(Expr {
+                            kind: ExprKind::LedgerCall {
+                                field: field_id,
+                                op: if historic {
+                                    LedgerOp::HistoricMerkleTreeCheckRoot
+                                } else {
+                                    LedgerOp::MerkleTreeCheckRoot
+                                },
+                                args: vec![rt],
+                            },
+                            ty: Type::Boolean,
+                            span: call_span,
+                        })
+                    }
+                    other => {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
-                            call_span,
-                            "`MerkleTree.insert` takes 1 argument",
+                            method_span,
+                            format!("`{adt_name}` has no method `{other}`"),
                         ));
-                        return None;
+                        None
                     }
-                    let mut item = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
-                    if !self.coerce_or_check(&mut item, &value_type) {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.file,
-                            item.span,
-                            format!(
-                                "`MerkleTree.insert` expects `{}`, found `{}`",
-                                self.format_type(&value_type),
-                                self.format_type(&item.ty)
-                            ),
-                        ));
-                        return None;
-                    }
-                    Some(Expr {
-                        kind: ExprKind::LedgerCall {
-                            field: field_id,
-                            op: LedgerOp::MerkleTreeInsert,
-                            args: vec![item],
-                        },
-                        ty: Type::unit(),
-                        span: call_span,
-                    })
                 }
-                "checkRoot" => {
-                    if arg_nodes.len() != 1 {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.file,
-                            call_span,
-                            "`MerkleTree.checkRoot` takes 1 argument",
-                        ));
-                        return None;
-                    }
-                    let mut rt =
-                        self.check_expr(arg_nodes[0], scope, Some(&Type::MerkleTreeDigest))?;
-                    if !self.coerce_or_check(&mut rt, &Type::MerkleTreeDigest) {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.file,
-                            rt.span,
-                            format!(
-                                "`MerkleTree.checkRoot` expects `MerkleTreeDigest`, found `{}`",
-                                self.format_type(&rt.ty)
-                            ),
-                        ));
-                        return None;
-                    }
-                    Some(Expr {
-                        kind: ExprKind::LedgerCall {
-                            field: field_id,
-                            op: LedgerOp::MerkleTreeCheckRoot,
-                            args: vec![rt],
-                        },
-                        ty: Type::Boolean,
-                        span: call_span,
-                    })
-                }
-                other => {
-                    self.diagnostics.push(CompactDiagnostic::error(
-                        self.file,
-                        method_span,
-                        format!("`MerkleTree` has no method `{other}`"),
-                    ));
-                    None
-                }
-            },
+            }
         }
     }
 }

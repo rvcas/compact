@@ -524,4 +524,57 @@ mod tests {
         assert_eq!(info["witnesses"].as_array().unwrap().len(), 7);
         assert_eq!(info["ledger"].as_array().unwrap().len(), 9);
     }
+
+    #[test]
+    fn end_to_end_build_and_check_zerocash() {
+        let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/zerocash.compact");
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+
+        let check_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let hir = check_with_reporter(
+            &CheckOptions {
+                source: src_path.clone(),
+            },
+            &check_reporter,
+        )
+        .unwrap();
+        assert_eq!(hir.structs.len(), 8);
+        assert_eq!(hir.ledger_fields.len(), 3);
+        assert_eq!(hir.witnesses.len(), 7);
+        assert_eq!(hir.circuits.len(), 5);
+
+        let build_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let report = build_with_reporter(
+            &BuildOptions {
+                source: src_path.clone(),
+                target: out_dir.clone(),
+                skip_zk: true,
+            },
+            &build_reporter,
+        )
+        .unwrap();
+
+        assert_eq!(report.proof_circuits, vec!["spend", "zerocash_mint"]);
+        for name in ["spend", "zerocash_mint"] {
+            assert!(out_dir.join(format!("zkir/{name}.zkir")).is_file());
+            assert!(out_dir.join(format!("zkir/{name}.bzkir")).is_file());
+        }
+        assert!(!out_dir.join("zkir/derive_nullifier.zkir").exists());
+        assert!(!out_dir.join("zkir/derive_zk_public_key.zkir").exists());
+        assert!(!out_dir.join("zkir/commitment_from_coin_info.zkir").exists());
+        assert!(out_dir.join("contract/index.js").is_file());
+        assert!(out_dir.join("contract/index.d.ts").is_file());
+        assert!(out_dir.join("contract/index.js.map").is_file());
+        assert!(out_dir.join("compiler/contract-info.json").is_file());
+        assert!(out_dir.join("compiler/contract-manifest.json").is_file());
+
+        let info: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("compiler/contract-info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["circuits"].as_array().unwrap().len(), 2);
+        assert_eq!(info["witnesses"].as_array().unwrap().len(), 7);
+        assert_eq!(info["ledger"].as_array().unwrap().len(), 3);
+    }
 }

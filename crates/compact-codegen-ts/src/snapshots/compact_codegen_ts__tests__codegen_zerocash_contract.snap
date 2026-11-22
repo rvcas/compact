@@ -1,0 +1,527 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+export {zerocash_mint, spend}
+
+import CompactStandardLibrary;
+
+struct Nonce { bytes: Bytes<32>; }
+struct opening { bytes: Bytes<32>; }
+struct nullifier { bytes: Bytes<32>; }
+struct zk_secret_key { bytes: Bytes<32>; }
+struct zk_public_key { bytes: Bytes<32>; }
+struct commitment { bytes: Bytes<32>; }
+
+struct coin_info {
+  nonce: Nonce;
+  opening: opening;
+}
+struct public_key {
+  zk: zk_public_key;
+  encryption: Opaque<"Uint8Array">;
+}
+
+witness private$zk_secret_key(): zk_secret_key;
+witness private$remove_coin(coin: coin_info): [];
+witness private$zk_public_key(): zk_public_key;
+witness private$add_coin(coin: coin_info): [];
+witness context$path_of(cm: commitment): MerkleTreePath<32, commitment>;
+witness context$new_coin_info(): coin_info;
+witness context$encrypt(pk: Opaque<"Uint8Array">, coin: coin_info): Opaque<"Uint8Array">;
+
+ledger nullifiers: Set<nullifier>;
+ledger commitments: HistoricMerkleTree<32, commitment>;
+ledger ciphertexts: Opaque<"Uint8Array">;
+
+circuit spend(dest_public_key: public_key, input_coin: coin_info): [] {
+  const source_secret_key = private$zk_secret_key();
+  const old_nullifier = derive_nullifier(input_coin, source_secret_key);
+  assert(!nullifiers.member(old_nullifier), "spend: Coin already spent");
+  nullifiers.insert(old_nullifier);
+  const source_public_key = derive_zk_public_key(source_secret_key);
+  const old_commitment = commitment_from_coin_info(input_coin, source_public_key);
+  const commitment_path = context$path_of(old_commitment);
+  assert(commitments.checkRoot(disclose(merkleTreePathRoot<32, commitment>(commitment_path))) &&
+         old_commitment == commitment_path.leaf,
+         "spend: Illegal state: merkle path not recognized by public state");
+  const fresh_coin_info = context$new_coin_info();
+  const fresh_commitment = commitment_from_coin_info(fresh_coin_info, dest_public_key.zk);
+  commitments.insert(fresh_commitment);
+  const ciphertext = disclose(context$encrypt(dest_public_key.encryption, fresh_coin_info));
+  ciphertexts.write(ciphertext);
+  private$remove_coin(input_coin);
+}
+
+circuit zerocash_mint(): [] {
+  const coin = context$new_coin_info();
+  const pk = private$zk_public_key();
+  private$add_coin(coin);
+  const cm = commitment_from_coin_info(coin, pk);
+  commitments.insert(cm);
+}
+
+circuit derive_nullifier(coin: coin_info, sk: zk_secret_key): nullifier {
+  return nullifier{ bytes: disclose(persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "lares:zerocash:commit"),
+    coin.nonce.bytes,
+    coin.opening.bytes,
+    sk.bytes
+  ]))};
+}
+
+circuit derive_zk_public_key(sk: zk_secret_key): zk_public_key {
+  return zk_public_key{ bytes: persistentHash<Bytes<32>>(sk.bytes)};
+}
+
+circuit commitment_from_coin_info(coin: coin_info, pk: zk_public_key): commitment {
+  return commitment{ bytes: disclose(persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "lares:zerocash:commit"),
+    coin.nonce.bytes,
+    coin.opening.bytes,
+    pk.bytes
+  ]))};
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Nonce = {
+	bytes: Uint8Array;
+};
+type opening = {
+	bytes: Uint8Array;
+};
+type nullifier = {
+	bytes: Uint8Array;
+};
+type zk_secret_key = {
+	bytes: Uint8Array;
+};
+type zk_public_key = {
+	bytes: Uint8Array;
+};
+type commitment = {
+	bytes: Uint8Array;
+};
+type coin_info = {
+	nonce: Nonce;
+	opening: opening;
+};
+type public_key = {
+	zk: zk_public_key;
+	encryption: Uint8Array;
+};
+function _derive_nullifier(coin: coin_info, sk: zk_secret_key): nullifier {
+	return { bytes: __compactRuntime.persistentHash([
+		new Uint8Array([
+			108,
+			97,
+			114,
+			101,
+			115,
+			58,
+			122,
+			101,
+			114,
+			111,
+			99,
+			97,
+			115,
+			104,
+			58,
+			99,
+			111,
+			109,
+			109,
+			105,
+			116,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0
+		]),
+		coin.nonce.bytes,
+		coin.opening.bytes,
+		sk.bytes
+	]) };
+}
+function _derive_zk_public_key(sk: zk_secret_key): zk_public_key {
+	return { bytes: __compactRuntime.persistentHash(sk.bytes) };
+}
+function _commitment_from_coin_info(coin: coin_info, pk: zk_public_key): commitment {
+	return { bytes: __compactRuntime.persistentHash([
+		new Uint8Array([
+			108,
+			97,
+			114,
+			101,
+			115,
+			58,
+			122,
+			101,
+			114,
+			111,
+			99,
+			97,
+			115,
+			104,
+			58,
+			99,
+			111,
+			109,
+			109,
+			105,
+			116,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0
+		]),
+		coin.nonce.bytes,
+		coin.opening.bytes,
+		pk.bytes
+	]) };
+}
+export type Witnesses<T> = {
+	private$zk_secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, zk_secret_key];
+	private$remove_coin(context: __compactRuntime.WitnessContext<Ledger, T>, coin: coin_info): [T, []];
+	private$zk_public_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, zk_public_key];
+	private$add_coin(context: __compactRuntime.WitnessContext<Ledger, T>, coin: coin_info): [T, []];
+	context$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, cm: commitment): [T, __compactRuntime.MerkleTreePath<commitment>];
+	context$new_coin_info(context: __compactRuntime.WitnessContext<Ledger, T>): [T, coin_info];
+	context$encrypt(context: __compactRuntime.WitnessContext<Ledger, T>, pk: Uint8Array, coin: coin_info): [T, Uint8Array];
+};
+export type ImpureCircuits<T> = {
+	spend(context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []>;
+	zerocash_mint(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	spend(context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []>;
+	zerocash_mint(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			spend: (context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []> => {
+				const source_secret_key: zk_secret_key = __compactRuntime.callWitness(this.witnesses.private$zk_secret_key, context);
+				const old_nullifier: nullifier = _derive_nullifier(input_coin, source_secret_key);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 0, old_nullifier), "spend: Coin already spent");
+				__compactRuntime.setInsert(context, 0, old_nullifier);
+				const source_public_key: zk_public_key = _derive_zk_public_key(source_secret_key);
+				const old_commitment: commitment = _commitment_from_coin_info(input_coin, source_public_key);
+				const commitment_path: __compactRuntime.MerkleTreePath<commitment> = __compactRuntime.callWitness(this.witnesses.context$path_of, context, old_commitment);
+				__compactRuntime.assert(__compactRuntime.historicMerkleTreeCheckRoot(context, 1, __compactRuntime.merkleTreePathRoot(commitment_path)) && __compactRuntime.equal(old_commitment, commitment_path.leaf), "spend: Illegal state: merkle path not recognized by public state");
+				const fresh_coin_info: coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const fresh_commitment: commitment = _commitment_from_coin_info(fresh_coin_info, dest_public_key.zk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, fresh_commitment);
+				const ciphertext: Uint8Array = __compactRuntime.callWitness(this.witnesses.context$encrypt, context, dest_public_key.encryption, fresh_coin_info);
+				__compactRuntime.writeCell(context, 2, ciphertext);
+				__compactRuntime.callWitness(this.witnesses.private$remove_coin, context, input_coin);
+				return {
+					result: [],
+					context
+				};
+			},
+			zerocash_mint: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				const coin: coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const pk: zk_public_key = __compactRuntime.callWitness(this.witnesses.private$zk_public_key, context);
+				__compactRuntime.callWitness(this.witnesses.private$add_coin, context, coin);
+				const cm: commitment = _commitment_from_coin_info(coin, pk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, cm);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			spend: (context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []> => {
+				const source_secret_key: zk_secret_key = __compactRuntime.callWitness(this.witnesses.private$zk_secret_key, context);
+				const old_nullifier: nullifier = _derive_nullifier(input_coin, source_secret_key);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 0, old_nullifier), "spend: Coin already spent");
+				__compactRuntime.setInsert(context, 0, old_nullifier);
+				const source_public_key: zk_public_key = _derive_zk_public_key(source_secret_key);
+				const old_commitment: commitment = _commitment_from_coin_info(input_coin, source_public_key);
+				const commitment_path: __compactRuntime.MerkleTreePath<commitment> = __compactRuntime.callWitness(this.witnesses.context$path_of, context, old_commitment);
+				__compactRuntime.assert(__compactRuntime.historicMerkleTreeCheckRoot(context, 1, __compactRuntime.merkleTreePathRoot(commitment_path)) && __compactRuntime.equal(old_commitment, commitment_path.leaf), "spend: Illegal state: merkle path not recognized by public state");
+				const fresh_coin_info: coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const fresh_commitment: commitment = _commitment_from_coin_info(fresh_coin_info, dest_public_key.zk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, fresh_commitment);
+				const ciphertext: Uint8Array = __compactRuntime.callWitness(this.witnesses.context$encrypt, context, dest_public_key.encryption, fresh_coin_info);
+				__compactRuntime.writeCell(context, 2, ciphertext);
+				__compactRuntime.callWitness(this.witnesses.private$remove_coin, context, input_coin);
+				return {
+					result: [],
+					context
+				};
+			},
+			zerocash_mint: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				const coin: coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const pk: zk_public_key = __compactRuntime.callWitness(this.witnesses.private$zk_public_key, context);
+				__compactRuntime.callWitness(this.witnesses.private$add_coin, context, coin);
+				const cm: commitment = _commitment_from_coin_info(coin, pk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, cm);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+function _derive_nullifier(coin, sk) {
+	return { bytes: __compactRuntime.persistentHash([
+		new Uint8Array([
+			108,
+			97,
+			114,
+			101,
+			115,
+			58,
+			122,
+			101,
+			114,
+			111,
+			99,
+			97,
+			115,
+			104,
+			58,
+			99,
+			111,
+			109,
+			109,
+			105,
+			116,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0
+		]),
+		coin.nonce.bytes,
+		coin.opening.bytes,
+		sk.bytes
+	]) };
+}
+function _derive_zk_public_key(sk) {
+	return { bytes: __compactRuntime.persistentHash(sk.bytes) };
+}
+function _commitment_from_coin_info(coin, pk) {
+	return { bytes: __compactRuntime.persistentHash([
+		new Uint8Array([
+			108,
+			97,
+			114,
+			101,
+			115,
+			58,
+			122,
+			101,
+			114,
+			111,
+			99,
+			97,
+			115,
+			104,
+			58,
+			99,
+			111,
+			109,
+			109,
+			105,
+			116,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0
+		]),
+		coin.nonce.bytes,
+		coin.opening.bytes,
+		pk.bytes
+	]) };
+}
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return {};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			spend: (context, dest_public_key, input_coin) => {
+				const source_secret_key = __compactRuntime.callWitness(this.witnesses.private$zk_secret_key, context);
+				const old_nullifier = _derive_nullifier(input_coin, source_secret_key);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 0, old_nullifier), "spend: Coin already spent");
+				__compactRuntime.setInsert(context, 0, old_nullifier);
+				const source_public_key = _derive_zk_public_key(source_secret_key);
+				const old_commitment = _commitment_from_coin_info(input_coin, source_public_key);
+				const commitment_path = __compactRuntime.callWitness(this.witnesses.context$path_of, context, old_commitment);
+				__compactRuntime.assert(__compactRuntime.historicMerkleTreeCheckRoot(context, 1, __compactRuntime.merkleTreePathRoot(commitment_path)) && __compactRuntime.equal(old_commitment, commitment_path.leaf), "spend: Illegal state: merkle path not recognized by public state");
+				const fresh_coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const fresh_commitment = _commitment_from_coin_info(fresh_coin_info, dest_public_key.zk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, fresh_commitment);
+				const ciphertext = __compactRuntime.callWitness(this.witnesses.context$encrypt, context, dest_public_key.encryption, fresh_coin_info);
+				__compactRuntime.writeCell(context, 2, ciphertext);
+				__compactRuntime.callWitness(this.witnesses.private$remove_coin, context, input_coin);
+				return {
+					result: [],
+					context
+				};
+			},
+			zerocash_mint: (context) => {
+				const coin = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const pk = __compactRuntime.callWitness(this.witnesses.private$zk_public_key, context);
+				__compactRuntime.callWitness(this.witnesses.private$add_coin, context, coin);
+				const cm = _commitment_from_coin_info(coin, pk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, cm);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			spend: (context, dest_public_key, input_coin) => {
+				const source_secret_key = __compactRuntime.callWitness(this.witnesses.private$zk_secret_key, context);
+				const old_nullifier = _derive_nullifier(input_coin, source_secret_key);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 0, old_nullifier), "spend: Coin already spent");
+				__compactRuntime.setInsert(context, 0, old_nullifier);
+				const source_public_key = _derive_zk_public_key(source_secret_key);
+				const old_commitment = _commitment_from_coin_info(input_coin, source_public_key);
+				const commitment_path = __compactRuntime.callWitness(this.witnesses.context$path_of, context, old_commitment);
+				__compactRuntime.assert(__compactRuntime.historicMerkleTreeCheckRoot(context, 1, __compactRuntime.merkleTreePathRoot(commitment_path)) && __compactRuntime.equal(old_commitment, commitment_path.leaf), "spend: Illegal state: merkle path not recognized by public state");
+				const fresh_coin_info = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const fresh_commitment = _commitment_from_coin_info(fresh_coin_info, dest_public_key.zk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, fresh_commitment);
+				const ciphertext = __compactRuntime.callWitness(this.witnesses.context$encrypt, context, dest_public_key.encryption, fresh_coin_info);
+				__compactRuntime.writeCell(context, 2, ciphertext);
+				__compactRuntime.callWitness(this.witnesses.private$remove_coin, context, input_coin);
+				return {
+					result: [],
+					context
+				};
+			},
+			zerocash_mint: (context) => {
+				const coin = __compactRuntime.callWitness(this.witnesses.context$new_coin_info, context);
+				const pk = __compactRuntime.callWitness(this.witnesses.private$zk_public_key, context);
+				__compactRuntime.callWitness(this.witnesses.private$add_coin, context, coin);
+				const cm = _commitment_from_coin_info(coin, pk);
+				__compactRuntime.historicMerkleTreeInsert(context, 1, cm);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Nonce = {
+	bytes: Uint8Array;
+};
+type opening = {
+	bytes: Uint8Array;
+};
+type zk_secret_key = {
+	bytes: Uint8Array;
+};
+type zk_public_key = {
+	bytes: Uint8Array;
+};
+type commitment = {
+	bytes: Uint8Array;
+};
+type coin_info = {
+	nonce: Nonce;
+	opening: opening;
+};
+type public_key = {
+	zk: zk_public_key;
+	encryption: Uint8Array;
+};
+export type Witnesses<T> = {
+	private$zk_secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, zk_secret_key];
+	private$remove_coin(context: __compactRuntime.WitnessContext<Ledger, T>, coin: coin_info): [T, []];
+	private$zk_public_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, zk_public_key];
+	private$add_coin(context: __compactRuntime.WitnessContext<Ledger, T>, coin: coin_info): [T, []];
+	context$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, cm: commitment): [T, __compactRuntime.MerkleTreePath<commitment>];
+	context$new_coin_info(context: __compactRuntime.WitnessContext<Ledger, T>): [T, coin_info];
+	context$encrypt(context: __compactRuntime.WitnessContext<Ledger, T>, pk: Uint8Array, coin: coin_info): [T, Uint8Array];
+};
+export type ImpureCircuits<T> = {
+	spend(context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []>;
+	zerocash_mint(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	spend(context: __compactRuntime.CircuitContext<T>, dest_public_key: public_key, input_coin: coin_info): __compactRuntime.CircuitResults<T, []>;
+	zerocash_mint(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}
+export {};

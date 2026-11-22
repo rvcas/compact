@@ -175,6 +175,11 @@ fn ledger_field_to_json(program: &Program, field: &LedgerField) -> Value {
             map.insert("depth".into(), Value::Number((depth as u64).into()));
             map.insert("type".into(), type_to_json(program, &field.value_type));
         }
+        LedgerAdt::HistoricMerkleTree(depth) => {
+            map.insert("storage".into(), Value::String("HistoricMerkleTree".into()));
+            map.insert("depth".into(), Value::Number((depth as u64).into()));
+            map.insert("type".into(), type_to_json(program, &field.value_type));
+        }
     }
     Value::Object(map)
 }
@@ -395,6 +400,14 @@ mod tests {
     fn contract_info_election() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/election.compact"),
+            contract_info_for
+        );
+    }
+
+    #[test]
+    fn contract_info_zerocash() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/zerocash.compact"),
             contract_info_for
         );
     }

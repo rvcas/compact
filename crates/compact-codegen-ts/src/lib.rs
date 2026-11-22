@@ -969,6 +969,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 LedgerAdt::Cell => "decodeCell",
                 LedgerAdt::Set => "decodeSet",
                 LedgerAdt::MerkleTree(_) => "decodeMerkleTree",
+                LedgerAdt::HistoricMerkleTree(_) => "decodeHistoricMerkleTree",
             };
             let mut args = ArenaVec::with_capacity_in(2, self);
             args.push(Argument::from(self.expr_ident(SPAN, "state")));
@@ -1951,13 +1952,17 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     | LedgerOp::SetInsert
                     | LedgerOp::SetRemove
                     | LedgerOp::MerkleTreeInsert
-                    | LedgerOp::MerkleTreeCheckRoot => {
+                    | LedgerOp::MerkleTreeCheckRoot
+                    | LedgerOp::HistoricMerkleTreeInsert
+                    | LedgerOp::HistoricMerkleTreeCheckRoot => {
                         let rt_fn = match op {
                             LedgerOp::SetMember => "setMember",
                             LedgerOp::SetInsert => "setInsert",
                             LedgerOp::SetRemove => "setRemove",
                             LedgerOp::MerkleTreeInsert => "merkleTreeInsert",
                             LedgerOp::MerkleTreeCheckRoot => "merkleTreeCheckRoot",
+                            LedgerOp::HistoricMerkleTreeInsert => "historicMerkleTreeInsert",
+                            LedgerOp::HistoricMerkleTreeCheckRoot => "historicMerkleTreeCheckRoot",
                             _ => unreachable!(),
                         };
                         let mut call_args = ArenaVec::with_capacity_in(3, self);
@@ -2278,6 +2283,14 @@ mod tests {
     fn codegen_election_contract() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/election.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_zerocash_contract() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/zerocash.compact"),
             compile_ts_bundle
         );
     }
