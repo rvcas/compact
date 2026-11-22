@@ -1,0 +1,1057 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+export {vote$commit, vote$reveal, advance, set_topic, add_voter}
+
+import CompactStandardLibrary;
+
+enum PublicState { setup, commit, reveal, final, }
+enum PrivateState { initial, committed, revealed, }
+enum PermissibleVotes { yes, no, }
+
+ledger authority: Bytes<32>;
+ledger state: PublicState;
+ledger topic: Maybe<Opaque<"string">>;
+ledger tally_yes: Counter;
+ledger tally_no: Counter;
+ledger committed_votes: MerkleTree<10, Bytes<32>>;
+ledger eligible_voters: MerkleTree<10, Bytes<32>>;
+ledger committed: Set<Bytes<32>>;
+ledger revealed: Set<Bytes<32>>;
+
+witness private$secret_key(): Bytes<32>;
+witness private$state(): PrivateState;
+witness private$state$advance(): [];
+witness private$vote$record(ballot: PermissibleVotes): [];
+witness private$vote(): PermissibleVotes;
+witness context$eligible_voters$path_of(pk: Bytes<32>): Maybe<MerkleTreePath<10, Bytes<32>>>;
+witness context$committed_votes$path_of(cm: Bytes<32>): Maybe<MerkleTreePath<10, Bytes<32>>>;
+
+circuit ballot_repr(ballot: PermissibleVotes): Bytes<32> {
+  return ballot == PermissibleVotes.yes ? pad(32, "yes") : pad(32, "no");
+}
+
+circuit vote$commit(ballot: PermissibleVotes): [] {
+  assert(state.read() == PublicState.commit && private$state() == PrivateState.initial, "In illegal state for committing");
+  private$vote$record(ballot);
+  const sk = private$secret_key();
+  const com_nul = commitment_nullifier(sk);
+  assert(!committed.member(com_nul), "Unexpected attempt to double use of nullifier");
+  const pk = public_key(sk);
+  const path = disclose(context$eligible_voters$path_of(pk));
+  assert(path.is_some &&
+         eligible_voters.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path.value))) &&
+         pk == path.value.leaf, "Attempted to vote without authorization - need to add-voter");
+  const cm = commit_with_sk(ballot_repr(ballot), sk);
+  committed_votes.insert(cm);
+  committed.insert(com_nul);
+  private$state$advance();
+}
+
+circuit vote$reveal(): [] {
+  assert(state.read() == PublicState.reveal && private$state() == PrivateState.committed, "In illegal state for revealing");
+  const sk = private$secret_key();
+  const rev_nul = reveal_nullifier(sk);
+  assert(!revealed.member(rev_nul), "Attempted to double vote");
+  const vote = private$vote();
+  const cm = commit_with_sk(ballot_repr(vote), sk);
+  const path = disclose(context$committed_votes$path_of(cm));
+  assert(path.is_some &&
+         committed_votes.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path.value))) &&
+         cm == path.value.leaf, "Attempted to reveal incorrectly");
+  if(disclose(vote) == PermissibleVotes.yes) {
+    tally_yes.increment(1);
+  } else {
+    tally_no.increment(1);
+  }
+  revealed.insert(rev_nul);
+  private$state$advance();
+}
+
+circuit advance(): [] {
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  assert(apk == authority.read(), "Attempted to advance state without authorization");
+  assert(topic.read().is_some, "Attempted to start election without a topic");
+  state.write(successor(state.read()));
+}
+
+circuit successor(state: PublicState): PublicState {
+  if(state == PublicState.setup) {
+    return PublicState.commit;
+  } else if(state == PublicState.commit) {
+    return PublicState.reveal;
+  } else {
+    return PublicState.final;
+  }
+}
+
+circuit set_topic(t: Opaque<"string">): [] {
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  assert(apk == authority.read(), "Attempted to set topic without authorization");
+  assert(state.read() == PublicState.setup, "Attempted to set topic after setup phase");
+  topic.write(Maybe<Opaque<"string">>{ is_some: true, value: disclose(t) });
+}
+
+circuit add_voter(pk: Bytes<32>): [] {
+  assert(!context$eligible_voters$path_of(pk).is_some, "Attempted to add a voter twice");
+  const sk = private$secret_key();
+  const apk = public_key(sk);
+  assert(apk == authority.read(), "Attempted to add a voter without authorization");
+  assert(state.read() == PublicState.setup, "Attempted to add a voter after setup phase");
+  eligible_voters.insert(disclose(pk));
+}
+
+circuit commitment_nullifier(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:cm-nul:"), sk]));
+}
+
+circuit reveal_nullifier(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:rv-nul:"), sk]));
+}
+
+circuit public_key(sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:pk:"), sk]));
+}
+
+circuit commit_with_sk(ballot: Bytes<32>, sk: Bytes<32>): Bytes<32> {
+  return disclose(persistentHash<Vector<2, Bytes<32>>>([ballot, sk]));
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+enum PublicState {
+	setup = 0,
+	commit = 1,
+	reveal = 2,
+	final = 3
+}
+enum PrivateState {
+	initial = 0,
+	committed = 1,
+	revealed = 2
+}
+enum PermissibleVotes {
+	yes = 0,
+	no = 1
+}
+function _ballot_repr(ballot: PermissibleVotes): Uint8Array {
+	return ballot === PermissibleVotes.yes ? new Uint8Array([
+		121,
+		101,
+		115,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]) : new Uint8Array([
+		110,
+		111,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]);
+}
+function _successor(state: PublicState): PublicState {
+	if (state === PublicState.setup) {
+		return PublicState.commit;
+	} else {
+		if (state === PublicState.commit) {
+			return PublicState.reveal;
+		} else {
+			return PublicState.final;
+		}
+	}
+}
+function _commitment_nullifier(sk: Uint8Array): Uint8Array {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		99,
+		109,
+		45,
+		110,
+		117,
+		108,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _reveal_nullifier(sk: Uint8Array): Uint8Array {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		114,
+		118,
+		45,
+		110,
+		117,
+		108,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _public_key(sk: Uint8Array): Uint8Array {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _commit_with_sk(ballot: Uint8Array, sk: Uint8Array): Uint8Array {
+	return __compactRuntime.persistentHash([ballot, sk]);
+}
+export type Witnesses<T> = {
+	private$secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+	private$state(context: __compactRuntime.WitnessContext<Ledger, T>): [T, PrivateState];
+	private$state$advance(context: __compactRuntime.WitnessContext<Ledger, T>): [T, []];
+	private$vote$record(context: __compactRuntime.WitnessContext<Ledger, T>, ballot: PermissibleVotes): [T, []];
+	private$vote(context: __compactRuntime.WitnessContext<Ledger, T>): [T, PermissibleVotes];
+	context$eligible_voters$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, pk: Uint8Array): [T, Maybe<__compactRuntime.MerkleTreePath<Uint8Array>>];
+	context$committed_votes$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, cm: Uint8Array): [T, Maybe<__compactRuntime.MerkleTreePath<Uint8Array>>];
+};
+export type ImpureCircuits<T> = {
+	vote$commit(context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []>;
+	vote$reveal(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	advance(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	set_topic(context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []>;
+	add_voter(context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	vote$commit(context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []>;
+	vote$reveal(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	advance(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	set_topic(context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []>;
+	add_voter(context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			vote$commit: (context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.commit && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.initial, "In illegal state for committing");
+				__compactRuntime.callWitness(this.witnesses.private$vote$record, context, ballot);
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const com_nul: Uint8Array = _commitment_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 7, com_nul), "Unexpected attempt to double use of nullifier");
+				const pk: Uint8Array = _public_key(sk);
+				const path: Maybe<__compactRuntime.MerkleTreePath<Uint8Array>> = __compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 6, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(pk, path.value.leaf), "Attempted to vote without authorization - need to add-voter");
+				const cm: Uint8Array = _commit_with_sk(_ballot_repr(ballot), sk);
+				__compactRuntime.merkleTreeInsert(context, 5, cm);
+				__compactRuntime.setInsert(context, 7, com_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			vote$reveal: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.reveal && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.committed, "In illegal state for revealing");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const rev_nul: Uint8Array = _reveal_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 8, rev_nul), "Attempted to double vote");
+				const vote: PermissibleVotes = __compactRuntime.callWitness(this.witnesses.private$vote, context);
+				const cm: Uint8Array = _commit_with_sk(_ballot_repr(vote), sk);
+				const path: Maybe<__compactRuntime.MerkleTreePath<Uint8Array>> = __compactRuntime.callWitness(this.witnesses.context$committed_votes$path_of, context, cm);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 5, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(cm, path.value.leaf), "Attempted to reveal incorrectly");
+				if (vote === PermissibleVotes.yes) {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 3
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				} else {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 4
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				}
+				__compactRuntime.setInsert(context, 8, rev_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			advance: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to advance state without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 2).is_some, "Attempted to start election without a topic");
+				__compactRuntime.writeCell(context, 1, _successor(__compactRuntime.readCell(context, 1)));
+				return {
+					result: [],
+					context
+				};
+			},
+			set_topic: (context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []> => {
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to set topic without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to set topic after setup phase");
+				__compactRuntime.writeCell(context, 2, {
+					is_some: true,
+					value: t
+				});
+				return {
+					result: [],
+					context
+				};
+			},
+			add_voter: (context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(!__compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk).is_some, "Attempted to add a voter twice");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to add a voter without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to add a voter after setup phase");
+				__compactRuntime.merkleTreeInsert(context, 6, pk);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			vote$commit: (context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.commit && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.initial, "In illegal state for committing");
+				__compactRuntime.callWitness(this.witnesses.private$vote$record, context, ballot);
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const com_nul: Uint8Array = _commitment_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 7, com_nul), "Unexpected attempt to double use of nullifier");
+				const pk: Uint8Array = _public_key(sk);
+				const path: Maybe<__compactRuntime.MerkleTreePath<Uint8Array>> = __compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 6, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(pk, path.value.leaf), "Attempted to vote without authorization - need to add-voter");
+				const cm: Uint8Array = _commit_with_sk(_ballot_repr(ballot), sk);
+				__compactRuntime.merkleTreeInsert(context, 5, cm);
+				__compactRuntime.setInsert(context, 7, com_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			vote$reveal: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.reveal && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.committed, "In illegal state for revealing");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const rev_nul: Uint8Array = _reveal_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 8, rev_nul), "Attempted to double vote");
+				const vote: PermissibleVotes = __compactRuntime.callWitness(this.witnesses.private$vote, context);
+				const cm: Uint8Array = _commit_with_sk(_ballot_repr(vote), sk);
+				const path: Maybe<__compactRuntime.MerkleTreePath<Uint8Array>> = __compactRuntime.callWitness(this.witnesses.context$committed_votes$path_of, context, cm);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 5, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(cm, path.value.leaf), "Attempted to reveal incorrectly");
+				if (vote === PermissibleVotes.yes) {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 3
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				} else {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 4
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				}
+				__compactRuntime.setInsert(context, 8, rev_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			advance: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to advance state without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 2).is_some, "Attempted to start election without a topic");
+				__compactRuntime.writeCell(context, 1, _successor(__compactRuntime.readCell(context, 1)));
+				return {
+					result: [],
+					context
+				};
+			},
+			set_topic: (context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []> => {
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to set topic without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to set topic after setup phase");
+				__compactRuntime.writeCell(context, 2, {
+					is_some: true,
+					value: t
+				});
+				return {
+					result: [],
+					context
+				};
+			},
+			add_voter: (context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.assert(!__compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk).is_some, "Attempted to add a voter twice");
+				const sk: Uint8Array = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk: Uint8Array = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to add a voter without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to add a voter after setup phase");
+				__compactRuntime.merkleTreeInsert(context, 6, pk);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+var PublicState = /* @__PURE__ */ function(PublicState) {
+	PublicState[PublicState["setup"] = 0] = "setup";
+	PublicState[PublicState["commit"] = 1] = "commit";
+	PublicState[PublicState["reveal"] = 2] = "reveal";
+	PublicState[PublicState["final"] = 3] = "final";
+	return PublicState;
+}(PublicState || {});
+var PrivateState = /* @__PURE__ */ function(PrivateState) {
+	PrivateState[PrivateState["initial"] = 0] = "initial";
+	PrivateState[PrivateState["committed"] = 1] = "committed";
+	PrivateState[PrivateState["revealed"] = 2] = "revealed";
+	return PrivateState;
+}(PrivateState || {});
+var PermissibleVotes = /* @__PURE__ */ function(PermissibleVotes) {
+	PermissibleVotes[PermissibleVotes["yes"] = 0] = "yes";
+	PermissibleVotes[PermissibleVotes["no"] = 1] = "no";
+	return PermissibleVotes;
+}(PermissibleVotes || {});
+function _ballot_repr(ballot) {
+	return ballot === PermissibleVotes.yes ? new Uint8Array([
+		121,
+		101,
+		115,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]) : new Uint8Array([
+		110,
+		111,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]);
+}
+function _successor(state) {
+	if (state === PublicState.setup) {
+		return PublicState.commit;
+	} else {
+		if (state === PublicState.commit) {
+			return PublicState.reveal;
+		} else {
+			return PublicState.final;
+		}
+	}
+}
+function _commitment_nullifier(sk) {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		99,
+		109,
+		45,
+		110,
+		117,
+		108,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _reveal_nullifier(sk) {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		114,
+		118,
+		45,
+		110,
+		117,
+		108,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _public_key(sk) {
+	return __compactRuntime.persistentHash([new Uint8Array([
+		108,
+		97,
+		114,
+		101,
+		115,
+		58,
+		101,
+		108,
+		101,
+		99,
+		116,
+		105,
+		111,
+		110,
+		58,
+		112,
+		107,
+		58,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]), sk]);
+}
+function _commit_with_sk(ballot, sk) {
+	return __compactRuntime.persistentHash([ballot, sk]);
+}
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return {};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			vote$commit: (context, ballot) => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.commit && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.initial, "In illegal state for committing");
+				__compactRuntime.callWitness(this.witnesses.private$vote$record, context, ballot);
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const com_nul = _commitment_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 7, com_nul), "Unexpected attempt to double use of nullifier");
+				const pk = _public_key(sk);
+				const path = __compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 6, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(pk, path.value.leaf), "Attempted to vote without authorization - need to add-voter");
+				const cm = _commit_with_sk(_ballot_repr(ballot), sk);
+				__compactRuntime.merkleTreeInsert(context, 5, cm);
+				__compactRuntime.setInsert(context, 7, com_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			vote$reveal: (context) => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.reveal && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.committed, "In illegal state for revealing");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const rev_nul = _reveal_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 8, rev_nul), "Attempted to double vote");
+				const vote = __compactRuntime.callWitness(this.witnesses.private$vote, context);
+				const cm = _commit_with_sk(_ballot_repr(vote), sk);
+				const path = __compactRuntime.callWitness(this.witnesses.context$committed_votes$path_of, context, cm);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 5, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(cm, path.value.leaf), "Attempted to reveal incorrectly");
+				if (vote === PermissibleVotes.yes) {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 3
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				} else {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 4
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				}
+				__compactRuntime.setInsert(context, 8, rev_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			advance: (context) => {
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to advance state without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 2).is_some, "Attempted to start election without a topic");
+				__compactRuntime.writeCell(context, 1, _successor(__compactRuntime.readCell(context, 1)));
+				return {
+					result: [],
+					context
+				};
+			},
+			set_topic: (context, t) => {
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to set topic without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to set topic after setup phase");
+				__compactRuntime.writeCell(context, 2, {
+					is_some: true,
+					value: t
+				});
+				return {
+					result: [],
+					context
+				};
+			},
+			add_voter: (context, pk) => {
+				__compactRuntime.assert(!__compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk).is_some, "Attempted to add a voter twice");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to add a voter without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to add a voter after setup phase");
+				__compactRuntime.merkleTreeInsert(context, 6, pk);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			vote$commit: (context, ballot) => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.commit && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.initial, "In illegal state for committing");
+				__compactRuntime.callWitness(this.witnesses.private$vote$record, context, ballot);
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const com_nul = _commitment_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 7, com_nul), "Unexpected attempt to double use of nullifier");
+				const pk = _public_key(sk);
+				const path = __compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 6, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(pk, path.value.leaf), "Attempted to vote without authorization - need to add-voter");
+				const cm = _commit_with_sk(_ballot_repr(ballot), sk);
+				__compactRuntime.merkleTreeInsert(context, 5, cm);
+				__compactRuntime.setInsert(context, 7, com_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			vote$reveal: (context) => {
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.reveal && __compactRuntime.callWitness(this.witnesses.private$state, context) === PrivateState.committed, "In illegal state for revealing");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const rev_nul = _reveal_nullifier(sk);
+				__compactRuntime.assert(!__compactRuntime.setMember(context, 8, rev_nul), "Attempted to double vote");
+				const vote = __compactRuntime.callWitness(this.witnesses.private$vote, context);
+				const cm = _commit_with_sk(_ballot_repr(vote), sk);
+				const path = __compactRuntime.callWitness(this.witnesses.context$committed_votes$path_of, context, cm);
+				__compactRuntime.assert(path.is_some && __compactRuntime.merkleTreeCheckRoot(context, 5, __compactRuntime.merkleTreePathRoot(path.value)) && __compactRuntime.equal(cm, path.value.leaf), "Attempted to reveal incorrectly");
+				if (vote === PermissibleVotes.yes) {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 3
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				} else {
+					__compactRuntime.queryLedger(context, [
+						{ idx: {
+							cached: false,
+							pushPath: true,
+							path: 4
+						} },
+						{ addi: { immediate: 1 } },
+						{ ins: {
+							cached: true,
+							n: 1
+						} }
+					]);
+				}
+				__compactRuntime.setInsert(context, 8, rev_nul);
+				__compactRuntime.callWitness(this.witnesses.private$state$advance, context);
+				return {
+					result: [],
+					context
+				};
+			},
+			advance: (context) => {
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to advance state without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 2).is_some, "Attempted to start election without a topic");
+				__compactRuntime.writeCell(context, 1, _successor(__compactRuntime.readCell(context, 1)));
+				return {
+					result: [],
+					context
+				};
+			},
+			set_topic: (context, t) => {
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to set topic without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to set topic after setup phase");
+				__compactRuntime.writeCell(context, 2, {
+					is_some: true,
+					value: t
+				});
+				return {
+					result: [],
+					context
+				};
+			},
+			add_voter: (context, pk) => {
+				__compactRuntime.assert(!__compactRuntime.callWitness(this.witnesses.context$eligible_voters$path_of, context, pk).is_some, "Attempted to add a voter twice");
+				const sk = __compactRuntime.callWitness(this.witnesses.private$secret_key, context);
+				const apk = _public_key(sk);
+				__compactRuntime.assert(__compactRuntime.equal(apk, __compactRuntime.readCell(context, 0)), "Attempted to add a voter without authorization");
+				__compactRuntime.assert(__compactRuntime.readCell(context, 1) === PublicState.setup, "Attempted to add a voter after setup phase");
+				__compactRuntime.merkleTreeInsert(context, 6, pk);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+declare enum PrivateState {
+	initial = 0,
+	committed = 1,
+	revealed = 2
+}
+declare enum PermissibleVotes {
+	yes = 0,
+	no = 1
+}
+export type Witnesses<T> = {
+	private$secret_key(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+	private$state(context: __compactRuntime.WitnessContext<Ledger, T>): [T, PrivateState];
+	private$state$advance(context: __compactRuntime.WitnessContext<Ledger, T>): [T, []];
+	private$vote$record(context: __compactRuntime.WitnessContext<Ledger, T>, ballot: PermissibleVotes): [T, []];
+	private$vote(context: __compactRuntime.WitnessContext<Ledger, T>): [T, PermissibleVotes];
+	context$eligible_voters$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, pk: Uint8Array): [T, Maybe<__compactRuntime.MerkleTreePath<Uint8Array>>];
+	context$committed_votes$path_of(context: __compactRuntime.WitnessContext<Ledger, T>, cm: Uint8Array): [T, Maybe<__compactRuntime.MerkleTreePath<Uint8Array>>];
+};
+export type ImpureCircuits<T> = {
+	vote$commit(context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []>;
+	vote$reveal(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	advance(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	set_topic(context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []>;
+	add_voter(context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	vote$commit(context: __compactRuntime.CircuitContext<T>, ballot: PermissibleVotes): __compactRuntime.CircuitResults<T, []>;
+	vote$reveal(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	advance(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	set_topic(context: __compactRuntime.CircuitContext<T>, t: string): __compactRuntime.CircuitResults<T, []>;
+	add_voter(context: __compactRuntime.CircuitContext<T>, pk: Uint8Array): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}
+export {};

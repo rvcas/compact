@@ -85,7 +85,15 @@ pub fn analyze_model(ir: &IrSource) -> CircuitModelSummary {
 
 /// Compile proving and verifier keys in-process using `midnight-zkir` (no external `zkir-v3` binary).
 pub fn compile_keys(ir: &IrSource) -> Result<CompiledKeys, ZkirError> {
-    let model = analyze_model(ir);
+    compile_keys_with_model(ir, analyze_model(ir))
+}
+
+/// Compile proving and verifier keys using a precomputed [`CircuitModelSummary`] to avoid
+/// running Halo2 model synthesis twice.
+pub fn compile_keys_with_model(
+    ir: &IrSource,
+    model: CircuitModelSummary,
+) -> Result<CompiledKeys, ZkirError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -162,6 +170,9 @@ fn format_alignment(alignment: &[AlignmentAtom]) -> String {
             AlignmentAtom::Field => {
                 "{ \"tag\": \"atom\", \"value\": { \"tag\": \"field\" } }".to_owned()
             }
+            AlignmentAtom::Compress => {
+                "{ \"tag\": \"atom\", \"value\": { \"tag\": \"compress\" } }".to_owned()
+            }
         })
         .collect();
     format!("[{}]", items.join(", "))
@@ -225,10 +236,46 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 )
                 .unwrap();
             }
+            CircuitInstr::ConstrainToBoolean { val } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"constrain_to_boolean\", \"val\": {} }}{comma}",
+                    format_val(circuit, val)
+                )
+                .unwrap();
+            }
             CircuitInstr::ConstrainBits { val, bits } => {
                 writeln!(
                     out,
                     "    {{ \"op\": \"constrain_bits\", \"val\": {}, \"bits\": {bits} }}{comma}",
+                    format_val(circuit, val)
+                )
+                .unwrap();
+            }
+            CircuitInstr::ConstrainEq { a, b } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"constrain_eq\", \"a\": {}, \"b\": {} }}{comma}",
+                    format_val(circuit, a),
+                    format_val(circuit, b)
+                )
+                .unwrap();
+            }
+            CircuitInstr::LessThan { a, b, bits, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"less_than\", \"output\": \"{}\", \"a\": {}, \"b\": {}, \"bits\": {bits} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, a),
+                    format_val(circuit, b)
+                )
+                .unwrap();
+            }
+            CircuitInstr::Copy { val, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"copy\", \"output\": \"{}\", \"val\": {} }}{comma}",
+                    var_name(circuit, *output),
                     format_val(circuit, val)
                 )
                 .unwrap();
@@ -259,6 +306,17 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                     "    {{ \"op\": \"persistent_hash\", \"output\": \"{}\", \"alignment\": {}, \"inputs\": [{}] }}{comma}",
                     var_name(circuit, *output),
                     format_alignment(alignment),
+                    rendered_inputs.join(", ")
+                )
+                .unwrap();
+            }
+            CircuitInstr::TransientHash { inputs, output } => {
+                let rendered_inputs: Vec<_> =
+                    inputs.iter().map(|v| format_val(circuit, v)).collect();
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"transient_hash\", \"output\": \"{}\", \"inputs\": [{}] }}{comma}",
+                    var_name(circuit, *output),
                     rendered_inputs.join(", ")
                 )
                 .unwrap();
@@ -491,6 +549,132 @@ mod tests {
 
             circuit public_key(sk: Bytes<32>): Bytes<32> {
               return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_election_contract() {
+        assert_compact_snapshot!(
+            r#"
+            export {vote$commit, vote$reveal, advance, set_topic, add_voter}
+
+            import CompactStandardLibrary;
+
+            enum PublicState { setup, commit, reveal, final, }
+            enum PrivateState { initial, committed, revealed, }
+            enum PermissibleVotes { yes, no, }
+
+            ledger authority: Bytes<32>;
+            ledger state: PublicState;
+            ledger topic: Maybe<Opaque<"string">>;
+            ledger tally_yes: Counter;
+            ledger tally_no: Counter;
+            ledger committed_votes: MerkleTree<10, Bytes<32>>;
+            ledger eligible_voters: MerkleTree<10, Bytes<32>>;
+            ledger committed: Set<Bytes<32>>;
+            ledger revealed: Set<Bytes<32>>;
+
+            witness private$secret_key(): Bytes<32>;
+            witness private$state(): PrivateState;
+            witness private$state$advance(): [];
+            witness private$vote$record(ballot: PermissibleVotes): [];
+            witness private$vote(): PermissibleVotes;
+            witness context$eligible_voters$path_of(pk: Bytes<32>): Maybe<MerkleTreePath<10, Bytes<32>>>;
+            witness context$committed_votes$path_of(cm: Bytes<32>): Maybe<MerkleTreePath<10, Bytes<32>>>;
+
+            circuit ballot_repr(ballot: PermissibleVotes): Bytes<32> {
+              return ballot == PermissibleVotes.yes ? pad(32, "yes") : pad(32, "no");
+            }
+
+            circuit vote$commit(ballot: PermissibleVotes): [] {
+              assert(state.read() == PublicState.commit && private$state() == PrivateState.initial, "In illegal state for committing");
+              private$vote$record(ballot);
+              const sk = private$secret_key();
+              const com_nul = commitment_nullifier(sk);
+              assert(!committed.member(com_nul), "Unexpected attempt to double use of nullifier");
+              const pk = public_key(sk);
+              const path = disclose(context$eligible_voters$path_of(pk));
+              assert(path.is_some &&
+                     eligible_voters.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path.value))) &&
+                     pk == path.value.leaf, "Attempted to vote without authorization - need to add-voter");
+              const cm = commit_with_sk(ballot_repr(ballot), sk);
+              committed_votes.insert(cm);
+              committed.insert(com_nul);
+              private$state$advance();
+            }
+
+            circuit vote$reveal(): [] {
+              assert(state.read() == PublicState.reveal && private$state() == PrivateState.committed, "In illegal state for revealing");
+              const sk = private$secret_key();
+              const rev_nul = reveal_nullifier(sk);
+              assert(!revealed.member(rev_nul), "Attempted to double vote");
+              const vote = private$vote();
+              const cm = commit_with_sk(ballot_repr(vote), sk);
+              const path = disclose(context$committed_votes$path_of(cm));
+              assert(path.is_some &&
+                     committed_votes.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path.value))) &&
+                     cm == path.value.leaf, "Attempted to reveal incorrectly");
+              if(disclose(vote) == PermissibleVotes.yes) {
+                tally_yes.increment(1);
+              } else {
+                tally_no.increment(1);
+              }
+              revealed.insert(rev_nul);
+              private$state$advance();
+            }
+
+            circuit advance(): [] {
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority.read(), "Attempted to advance state without authorization");
+              assert(topic.read().is_some, "Attempted to start election without a topic");
+              state.write(successor(state.read()));
+            }
+
+            circuit successor(state: PublicState): PublicState {
+              if(state == PublicState.setup) {
+                return PublicState.commit;
+              } else if(state == PublicState.commit) {
+                return PublicState.reveal;
+              } else {
+                return PublicState.final;
+              }
+            }
+
+            circuit set_topic(t: Opaque<"string">): [] {
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority.read(), "Attempted to set topic without authorization");
+              assert(state.read() == PublicState.setup, "Attempted to set topic after setup phase");
+              topic.write(Maybe<Opaque<"string">>{ is_some: true, value: disclose(t) });
+            }
+
+            circuit add_voter(pk: Bytes<32>): [] {
+              assert(!context$eligible_voters$path_of(pk).is_some, "Attempted to add a voter twice");
+              const sk = private$secret_key();
+              const apk = public_key(sk);
+              assert(apk == authority.read(), "Attempted to add a voter without authorization");
+              assert(state.read() == PublicState.setup, "Attempted to add a voter after setup phase");
+              eligible_voters.insert(disclose(pk));
+            }
+
+            circuit commitment_nullifier(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:cm-nul:"), sk]));
+            }
+
+            circuit reveal_nullifier(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:rv-nul:"), sk]));
+            }
+
+            circuit public_key(sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:election:pk:"), sk]));
+            }
+
+            circuit commit_with_sk(ballot: Bytes<32>, sk: Bytes<32>): Bytes<32> {
+              return disclose(persistentHash<Vector<2, Bytes<32>>>([ballot, sk]));
             }
             "#,
             compile_all_zkir

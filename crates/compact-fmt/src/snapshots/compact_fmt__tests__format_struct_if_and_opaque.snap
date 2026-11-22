@@ -1,0 +1,34 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+struct Pair{a:Field;b:Opaque<"string">;}
+enum State{a,b,c,}
+ledger s:State;
+ledger t:Maybe<Opaque<"string">>;
+circuit next(x:State):State{if(x==State.a&&true){return State.b;}else if(x==State.b||false){return State.c;}else{return State.a;}}
+circuit set_t(v:Opaque<"string">):[]{t.write(Maybe<Opaque<"string">>{is_some:true,value:disclose(v)});}
+===
+struct Pair {
+  a: Field;
+  b: Opaque<"string">;
+}
+
+enum State { a, b, c }
+
+ledger s: State;
+
+ledger t: Maybe<Opaque<"string">>;
+
+circuit next(x: State): State {
+  if (x == State.a && true) {
+    return State.b;
+  } else if (x == State.b || false) {
+    return State.c;
+  } else {
+    return State.a;
+  }
+}
+
+circuit set_t(v: Opaque<"string">): [] {
+  t.write(Maybe<Opaque<"string">>{ is_some: true, value: disclose(v) });
+}

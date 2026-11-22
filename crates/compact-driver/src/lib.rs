@@ -8,7 +8,9 @@ use std::time::Instant;
 use compact_artifacts::{render_contract_info, render_contract_manifest};
 use compact_circuit::lower_to_circuits;
 use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
-use compact_codegen_zkir::{ZkirError, compile_keys, generate_zkir};
+use compact_codegen_zkir::{
+    ZkirError, analyze_model, compile_keys_with_model, generate_zkir,
+};
 use compact_diagnostics::DiagnosticBag;
 use compact_fmt::{FormatOptions, format_ast};
 use compact_hir::Program as HirProgram;
@@ -149,13 +151,16 @@ pub fn build_with_reporter(
         }
 
         if !options.skip_zk {
-            reporter.status(
-                "Proving",
-                &format!("{} circuit(s) via midnight-zkir", zkir_outputs.len()),
-            );
             let compiled_keys = zkir_outputs
                 .par_iter()
-                .map(|z| compile_keys(&z.ir).map(|keys| (z.name.clone(), keys)))
+                .map(|z| {
+                    let model = analyze_model(&z.ir);
+                    reporter.status(
+                        "Keygen",
+                        &format!("{} (k={}, {} rows)", z.name, model.k, model.rows),
+                    );
+                    compile_keys_with_model(&z.ir, model).map(|keys| (z.name.clone(), keys))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
 
             let keys_dir = options.target.join("keys");
@@ -450,5 +455,73 @@ mod tests {
         assert_eq!(info["circuits"].as_array().unwrap().len(), 4);
         assert_eq!(info["witnesses"].as_array().unwrap().len(), 1);
         assert_eq!(info["ledger"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn end_to_end_build_and_check_election() {
+        let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/election.compact");
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+
+        let check_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let hir = check_with_reporter(
+            &CheckOptions {
+                source: src_path.clone(),
+            },
+            &check_reporter,
+        )
+        .unwrap();
+        assert_eq!(hir.enums.len(), 3);
+        assert_eq!(hir.ledger_fields.len(), 9);
+        assert_eq!(hir.witnesses.len(), 7);
+        assert_eq!(hir.circuits.len(), 11);
+
+        let build_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let report = build_with_reporter(
+            &BuildOptions {
+                source: src_path.clone(),
+                target: out_dir.clone(),
+                skip_zk: true,
+            },
+            &build_reporter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.proof_circuits,
+            vec![
+                "vote$commit",
+                "vote$reveal",
+                "advance",
+                "set_topic",
+                "add_voter",
+            ]
+        );
+        for name in [
+            "vote$commit",
+            "vote$reveal",
+            "advance",
+            "set_topic",
+            "add_voter",
+        ] {
+            assert!(out_dir.join(format!("zkir/{name}.zkir")).is_file());
+            assert!(out_dir.join(format!("zkir/{name}.bzkir")).is_file());
+        }
+        assert!(!out_dir.join("zkir/ballot_repr.zkir").exists());
+        assert!(!out_dir.join("zkir/successor.zkir").exists());
+        assert!(!out_dir.join("zkir/public_key.zkir").exists());
+        assert!(out_dir.join("contract/index.js").is_file());
+        assert!(out_dir.join("contract/index.d.ts").is_file());
+        assert!(out_dir.join("contract/index.js.map").is_file());
+        assert!(out_dir.join("compiler/contract-info.json").is_file());
+        assert!(out_dir.join("compiler/contract-manifest.json").is_file());
+
+        let info: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("compiler/contract-info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["circuits"].as_array().unwrap().len(), 5);
+        assert_eq!(info["witnesses"].as_array().unwrap().len(), 7);
+        assert_eq!(info["ledger"].as_array().unwrap().len(), 9);
     }
 }

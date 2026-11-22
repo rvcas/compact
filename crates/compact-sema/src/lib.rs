@@ -6,8 +6,8 @@ use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
 use compact_hir::{
     BinaryOp, Circuit, CircuitId, Constructor, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt,
-    LedgerField, LedgerFieldId, LedgerOp, LocalId, Param, ParamId, Program, Stmt, Type, UnaryOp,
-    WitnessDecl, WitnessId,
+    LedgerField, LedgerFieldId, LedgerOp, LocalId, Param, ParamId, Program, Stmt, StructDecl,
+    StructField, StructId, Type, UnaryOp, WitnessDecl, WitnessId,
 };
 use compact_span::{SourceFile, Span};
 
@@ -25,6 +25,8 @@ pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
         has_stdlib: false,
         enums: Vec::new(),
         enum_by_name: HashMap::new(),
+        structs: Vec::new(),
+        struct_by_name: HashMap::new(),
         ledger_fields: Vec::new(),
         ledger_by_name: HashMap::new(),
         witnesses: Vec::new(),
@@ -41,6 +43,7 @@ pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
 
     let mut program = Program {
         enums: analyzer.enums,
+        structs: analyzer.structs,
         ledger_fields: analyzer.ledger_fields,
         witnesses: analyzer.witnesses,
         constructor: analyzer.constructor,
@@ -85,6 +88,8 @@ struct Analyzer<'a> {
     has_stdlib: bool,
     enums: Vec<EnumDecl>,
     enum_by_name: HashMap<String, EnumId>,
+    structs: Vec<StructDecl>,
+    struct_by_name: HashMap<String, StructId>,
     ledger_fields: Vec<LedgerField>,
     ledger_by_name: HashMap<String, LedgerFieldId>,
     witnesses: Vec<WitnessDecl>,
@@ -128,7 +133,15 @@ impl<'a> Analyzer<'a> {
                         .extend(self.ast.extra_tokens(list.names_start, list.names_end));
                 }
                 NodeTag::EnumDecl => self.register_enum(decl),
+                NodeTag::StructDecl => self.register_struct_name(decl),
                 _ => {}
+            }
+        }
+
+        // Pass 1a.5: resolve struct field types (allowing structs to reference earlier or later structs).
+        for &decl in &decls {
+            if self.ast.node_tag(decl) == NodeTag::StructDecl {
+                self.populate_struct_fields(decl);
             }
         }
 
@@ -161,11 +174,18 @@ impl<'a> Analyzer<'a> {
                 self.circuit_sigs[cid.0 as usize].exported = true;
             } else if let Some(&eid) = self.enum_by_name.get(name) {
                 self.enums[eid.0 as usize].exported = true;
+            } else if let Some(&sid) = self.struct_by_name.get(name) {
+                self.structs[sid.0 as usize].exported = true;
             } else if let Some(&fid) = self.ledger_by_name.get(name) {
                 self.ledger_fields[fid.0 as usize].exported = true;
             } else if let Some(&wid) = self.witness_by_name.get(name) {
                 self.witnesses[wid.0 as usize].exported = true;
-            } else if self.has_stdlib && name == "Maybe" {
+            } else if self.has_stdlib
+                && matches!(
+                    name,
+                    "Maybe" | "MerkleTreeDigest" | "MerkleTreePathEntry" | "MerkleTreePath"
+                )
+            {
                 if !self.exported_stdlib_types.iter().any(|s| s == name) {
                     self.exported_stdlib_types.push(name.to_owned());
                 }
@@ -231,6 +251,65 @@ impl<'a> Analyzer<'a> {
         self.enum_by_name.insert(name, id);
     }
 
+    fn register_struct_name(&mut self, node: NodeIndex) {
+        let decl = self.ast.struct_decl(node);
+        let name = self.text(decl.name_token).to_owned();
+        let name_span = self.ast.token_span(decl.name_token);
+        if self.struct_by_name.contains_key(&name) || self.enum_by_name.contains_key(&name) {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                name_span,
+                format!("duplicate type `{name}`"),
+            ));
+            return;
+        }
+        let id = StructId(self.structs.len() as u32);
+        self.structs.push(StructDecl {
+            id,
+            name: name.clone(),
+            fields: Vec::new(),
+            exported: decl.exported,
+            span: self.ast.node_span(node),
+        });
+        self.struct_by_name.insert(name, id);
+    }
+
+    fn populate_struct_fields(&mut self, node: NodeIndex) {
+        let decl = self.ast.struct_decl(node);
+        let name = self.text(decl.name_token);
+        let Some(&sid) = self.struct_by_name.get(name) else {
+            return;
+        };
+        let field_nodes: Vec<_> = self
+            .ast
+            .extra_nodes(decl.fields_start, decl.fields_end)
+            .collect();
+        let mut fields = Vec::with_capacity(field_nodes.len());
+        let mut seen = HashMap::new();
+        for fnode in field_nodes {
+            let sf = self.ast.struct_field(fnode);
+            let fname = self.text(sf.name_token).to_owned();
+            if seen.contains_key(&fname) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    self.ast.token_span(sf.name_token),
+                    format!("duplicate field `{fname}` in struct `{name}`"),
+                ));
+                continue;
+            }
+            let Some(fty) = self.resolve_type(sf.type_node) else {
+                continue;
+            };
+            seen.insert(fname.clone(), ());
+            fields.push(StructField {
+                name: fname,
+                ty: fty,
+                span: self.ast.node_span(fnode),
+            });
+        }
+        self.structs[sid.0 as usize].fields = fields;
+    }
+
     fn register_ledger(&mut self, node: NodeIndex) {
         let decl = self.ast.ledger_decl(node);
         let name = self.text(decl.name_token).to_owned();
@@ -250,6 +329,53 @@ impl<'a> Analyzer<'a> {
                 if self.text(self.ast.node_main_token(decl.type_node)) == "Counter" =>
             {
                 (LedgerAdt::Counter, Type::Uint(64))
+            }
+            NodeTag::TypeGeneric
+                if self.text(self.ast.node_main_token(decl.type_node)) == "Set" =>
+            {
+                let data = self.ast.node_data(decl.type_node);
+                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                if arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.node_span(decl.type_node),
+                        format!("`Set` expects 1 type argument, found {}", arg_nodes.len()),
+                    ));
+                    return;
+                }
+                let Some(elem_ty) = self.resolve_type(arg_nodes[0]) else {
+                    return;
+                };
+                (LedgerAdt::Set, elem_ty)
+            }
+            NodeTag::TypeGeneric
+                if self.text(self.ast.node_main_token(decl.type_node)) == "MerkleTree" =>
+            {
+                let data = self.ast.node_data(decl.type_node);
+                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                if arg_nodes.len() != 2 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.node_span(decl.type_node),
+                        format!(
+                            "`MerkleTree` expects 2 type arguments (depth, element type), found {}",
+                            arg_nodes.len()
+                        ),
+                    ));
+                    return;
+                }
+                let Some(depth) = self.expect_type_nat(
+                    &arg_nodes,
+                    0,
+                    "MerkleTree",
+                    self.ast.node_span(decl.type_node),
+                ) else {
+                    return;
+                };
+                let Some(elem_ty) = self.resolve_type(arg_nodes[1]) else {
+                    return;
+                };
+                (LedgerAdt::MerkleTree(depth), elem_ty)
             }
             _ => {
                 let Some(ty) = self.resolve_type(decl.type_node) else {
@@ -377,9 +503,13 @@ impl<'a> Analyzer<'a> {
                 match name {
                     "Field" => Some(Type::Field),
                     "Boolean" => Some(Type::Boolean),
+                    "MerkleTreeDigest" => Some(Type::MerkleTreeDigest),
+                    "MerkleTreePathEntry" => Some(Type::MerkleTreePathEntry),
                     _ => {
                         if let Some(&eid) = self.enum_by_name.get(name) {
                             Some(Type::Enum(eid))
+                        } else if let Some(&sid) = self.struct_by_name.get(name) {
+                            Some(Type::Struct(sid))
                         } else {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.file,
@@ -405,6 +535,21 @@ impl<'a> Analyzer<'a> {
                         let bits = self.expect_type_nat(&arg_nodes, 0, "Uint", self.ast.node_span(node))?;
                         Some(Type::Uint(bits))
                     }
+                    "Opaque" => {
+                        if arg_nodes.len() != 1
+                            || self.ast.node_tag(arg_nodes[0]) != NodeTag::TypeString
+                        {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                "`Opaque` expects 1 string literal type argument (e.g. `Opaque<\"string\">`)",
+                            ));
+                            return None;
+                        }
+                        let ts_ty =
+                            unquote_string(self.text(self.ast.node_main_token(arg_nodes[0])));
+                        Some(Type::Opaque(ts_ty))
+                    }
                     "Vector" => {
                         if arg_nodes.len() != 2 {
                             self.diagnostics.push(CompactDiagnostic::error(
@@ -429,6 +574,27 @@ impl<'a> Analyzer<'a> {
                         }
                         let inner = self.resolve_type(arg_nodes[0])?;
                         Some(Type::Maybe(Box::new(inner)))
+                    }
+                    "MerkleTreePath" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!(
+                                    "`MerkleTreePath` expects 2 type arguments, found {}",
+                                    arg_nodes.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        let depth = self.expect_type_nat(
+                            &arg_nodes,
+                            0,
+                            "MerkleTreePath",
+                            self.ast.node_span(node),
+                        )?;
+                        let leaf = self.resolve_type(arg_nodes[1])?;
+                        Some(Type::MerkleTreePath(depth, Box::new(leaf)))
                     }
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -490,19 +656,55 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn struct_fields_of(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
+        match ty {
+            Type::Struct(id) => Some(
+                self.structs[id.0 as usize]
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect(),
+            ),
+            Type::Maybe(inner) => Some(vec![
+                ("is_some".to_owned(), Type::Boolean),
+                ("value".to_owned(), (**inner).clone()),
+            ]),
+            Type::MerkleTreeDigest => Some(vec![("field".to_owned(), Type::Field)]),
+            Type::MerkleTreePathEntry => Some(vec![
+                ("sibling".to_owned(), Type::MerkleTreeDigest),
+                ("goes_left".to_owned(), Type::Boolean),
+            ]),
+            Type::MerkleTreePath(depth, leaf) => Some(vec![
+                ("leaf".to_owned(), (**leaf).clone()),
+                (
+                    "path".to_owned(),
+                    Type::Vector(*depth, Box::new(Type::MerkleTreePathEntry)),
+                ),
+            ]),
+            _ => None,
+        }
+    }
+
     fn format_type(&self, ty: &Type) -> String {
         match ty {
             Type::Field => "Field".into(),
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
             Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::Opaque(ts_ty) => format!("Opaque<\"{ts_ty}\">"),
             Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {
                 let inner: Vec<_> = elems.iter().map(|e| self.format_type(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
             Type::Enum(id) => self.enums[id.0 as usize].name.clone(),
+            Type::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
+            Type::MerkleTreeDigest => "MerkleTreeDigest".into(),
+            Type::MerkleTreePathEntry => "MerkleTreePathEntry".into(),
+            Type::MerkleTreePath(depth, leaf) => {
+                format!("MerkleTreePath<{depth}, {}>", self.format_type(leaf))
+            }
         }
     }
 
@@ -574,6 +776,37 @@ impl<'a> Analyzer<'a> {
         });
     }
 
+    fn check_stmt_list(
+        &mut self,
+        node: NodeIndex,
+        scope: &HashMap<String, ValueBinding>,
+        next_local: &mut u32,
+        expected_ret: &Type,
+    ) -> Vec<Stmt> {
+        let mut inner_scope = scope.clone();
+        if self.ast.node_tag(node) == NodeTag::Block {
+            let block_data = self.ast.node_data(node);
+            let stmt_nodes: Vec<_> = self
+                .ast
+                .extra_nodes(block_data.lhs, block_data.rhs)
+                .collect();
+            let mut stmts = Vec::new();
+            for snode in stmt_nodes {
+                if let Some(stmt) =
+                    self.check_stmt(snode, &mut inner_scope, next_local, expected_ret)
+                {
+                    stmts.push(stmt);
+                }
+            }
+            stmts
+        } else if let Some(stmt) = self.check_stmt(node, &mut inner_scope, next_local, expected_ret)
+        {
+            vec![stmt]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn check_stmt(
         &mut self,
         node: NodeIndex,
@@ -583,6 +816,33 @@ impl<'a> Analyzer<'a> {
     ) -> Option<Stmt> {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
+            NodeTag::IfStmt => {
+                let stmt = self.ast.if_stmt(node);
+                let cond = self.check_expr(stmt.cond, scope, Some(&Type::Boolean))?;
+                if cond.ty != Type::Boolean {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        cond.span,
+                        format!(
+                            "`if` condition must be `Boolean`, found `{}`",
+                            self.format_type(&cond.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                let then_branch =
+                    self.check_stmt_list(stmt.then_branch, scope, next_local, expected_ret);
+                let else_branch = match stmt.else_branch {
+                    Some(eb) => self.check_stmt_list(eb, scope, next_local, expected_ret),
+                    None => Vec::new(),
+                };
+                Some(Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    span: self.ast.node_span(node),
+                })
+            }
             NodeTag::ConstStmt => {
                 let stmt = self.ast.const_stmt(node);
                 let name = self.text(stmt.name_token).to_owned();
@@ -831,14 +1091,14 @@ impl<'a> Analyzer<'a> {
                 let data = self.ast.node_data(node);
                 let lhs = NodeIndex(data.lhs);
                 let field_tok = TokenIndex(data.rhs);
+                let field_name = self.text(field_tok);
                 if self.ast.node_tag(lhs) == NodeTag::IdentExpr {
                     let type_name = self.text(self.ast.node_main_token(lhs));
                     if let Some(&enum_id) = self.enum_by_name.get(type_name) {
-                        let variant_name = self.text(field_tok);
                         if let Some(idx) = self.enums[enum_id.0 as usize]
                             .variants
                             .iter()
-                            .position(|v| v == variant_name)
+                            .position(|v| v == field_name)
                         {
                             return Some(Expr {
                                 kind: ExprKind::EnumVariant {
@@ -852,17 +1112,109 @@ impl<'a> Analyzer<'a> {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
                             self.ast.token_span(field_tok),
-                            format!("enum `{type_name}` has no variant `{variant_name}`"),
+                            format!("enum `{type_name}` has no variant `{field_name}`"),
                         ));
                         return None;
                     }
                 }
+                let base = self.check_expr(lhs, scope, None)?;
+                if let Some(fields) = self.struct_fields_of(&base.ty) {
+                    if let Some((_, field_ty)) = fields.into_iter().find(|(n, _)| n == field_name) {
+                        return Some(Expr {
+                            kind: ExprKind::FieldAccess {
+                                base: Box::new(base),
+                                field: field_name.to_owned(),
+                            },
+                            ty: field_ty,
+                            span,
+                        });
+                    }
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.token_span(field_tok),
+                        format!(
+                            "type `{}` has no field `{field_name}`",
+                            self.format_type(&base.ty)
+                        ),
+                    ));
+                    return None;
+                }
                 self.diagnostics.push(CompactDiagnostic::error(
                     self.file,
                     span,
-                    "unsupported member access",
+                    format!(
+                        "cannot access field `{field_name}` on type `{}`",
+                        self.format_type(&base.ty)
+                    ),
                 ));
                 None
+            }
+            NodeTag::StructLitExpr => {
+                let lit = self.ast.struct_lit_expr(node);
+                let ty = self.resolve_type(lit.type_node)?;
+                let Some(expected_fields) = self.struct_fields_of(&ty) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.node_span(lit.type_node),
+                        format!("`{}` is not a struct type", self.format_type(&ty)),
+                    ));
+                    return None;
+                };
+                let lit_nodes: Vec<_> = self
+                    .ast
+                    .extra_nodes(lit.fields_start, lit.fields_end)
+                    .collect();
+                let mut provided: HashMap<String, Expr> = HashMap::new();
+                for fnode in lit_nodes {
+                    let sf = self.ast.struct_lit_field(fnode);
+                    let fname = self.text(sf.name_token).to_owned();
+                    let Some((_, expected_ty)) = expected_fields.iter().find(|(n, _)| *n == fname)
+                    else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            self.ast.token_span(sf.name_token),
+                            format!(
+                                "struct `{}` has no field `{fname}`",
+                                self.format_type(&ty)
+                            ),
+                        ));
+                        return None;
+                    };
+                    let mut val = self.check_expr(sf.value, scope, Some(expected_ty))?;
+                    if !self.coerce_or_check(&mut val, expected_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            val.span,
+                            format!(
+                                "type mismatch for field `{fname}`: expected `{}`, found `{}`",
+                                self.format_type(expected_ty),
+                                self.format_type(&val.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    provided.insert(fname, val);
+                }
+                let mut ordered = Vec::with_capacity(expected_fields.len());
+                for (fname, _) in expected_fields {
+                    let Some(val) = provided.remove(&fname) else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            span,
+                            format!(
+                                "missing field `{fname}` in struct `{}` literal",
+                                self.format_type(&ty)
+                            ),
+                        ));
+                        return None;
+                    };
+                    ordered.push((fname, val));
+                }
+                Some(Expr {
+                    kind: ExprKind::StructLit { fields: ordered },
+                    ty,
+                    span,
+                })
             }
             NodeTag::TupleExpr => {
                 let data = self.ast.node_data(node);
@@ -973,6 +1325,8 @@ impl<'a> Analyzer<'a> {
                     TokenTag::Minus => BinaryOp::Sub,
                     TokenTag::EqEq => BinaryOp::Eq,
                     TokenTag::BangEq => BinaryOp::Neq,
+                    TokenTag::AmpAmp => BinaryOp::And,
+                    TokenTag::PipePipe => BinaryOp::Or,
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
@@ -983,6 +1337,32 @@ impl<'a> Analyzer<'a> {
                     }
                 };
                 let data = self.ast.node_data(node);
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let lhs = self.check_expr(NodeIndex(data.lhs), scope, Some(&Type::Boolean))?;
+                    let rhs = self.check_expr(NodeIndex(data.rhs), scope, Some(&Type::Boolean))?;
+                    if lhs.ty != Type::Boolean || rhs.ty != Type::Boolean {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            span,
+                            format!(
+                                "logical `{}` expects `Boolean` operands, found `{}` and `{}`",
+                                self.ast.token_tag(op_tok).as_str(),
+                                self.format_type(&lhs.ty),
+                                self.format_type(&rhs.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    return Some(Expr {
+                        kind: ExprKind::Binary {
+                            op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        ty: Type::Boolean,
+                        span,
+                    });
+                }
                 let lhs = self.check_expr(NodeIndex(data.lhs), scope, None)?;
                 let mut rhs = self.check_expr(NodeIndex(data.rhs), scope, Some(&lhs.ty))?;
                 if !self.coerce_or_check(&mut rhs, &lhs.ty) {
@@ -998,7 +1378,7 @@ impl<'a> Analyzer<'a> {
                     return None;
                 }
                 let ty = match op {
-                    BinaryOp::Eq | BinaryOp::Neq => Type::Boolean,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::And | BinaryOp::Or => Type::Boolean,
                     BinaryOp::Add | BinaryOp::Sub => lhs.ty.clone(),
                 };
                 Some(Expr {
@@ -1367,6 +1747,42 @@ impl<'a> Analyzer<'a> {
                     span: call_span,
                 })
             }
+            "merkleTreePathRoot" => {
+                if targ_nodes.len() != 2 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        call_span,
+                        "`merkleTreePathRoot<N, T>(path)` expects 2 type arguments and 1 value argument",
+                    ));
+                    return None;
+                }
+                let depth =
+                    self.expect_type_nat(targ_nodes, 0, "merkleTreePathRoot", call_span)?;
+                let leaf_ty = self.resolve_type(targ_nodes[1])?;
+                let expected_path_ty = Type::MerkleTreePath(depth, Box::new(leaf_ty.clone()));
+                let mut path = self.check_expr(arg_nodes[0], scope, Some(&expected_path_ty))?;
+                if !self.coerce_or_check(&mut path, &expected_path_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        path.span,
+                        format!(
+                            "`merkleTreePathRoot` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&expected_path_ty),
+                            self.format_type(&path.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::MerkleTreePathRoot {
+                        depth,
+                        leaf_ty,
+                        path: Box::new(path),
+                    },
+                    ty: Type::MerkleTreeDigest,
+                    span: call_span,
+                })
+            }
             other => {
                 self.diagnostics.push(CompactDiagnostic::error(
                     self.file,
@@ -1616,6 +2032,127 @@ impl<'a> Analyzer<'a> {
                     None
                 }
             },
+            LedgerAdt::Set => match method_name {
+                "member" | "insert" | "remove" => {
+                    let (op, ret_ty) = match method_name {
+                        "member" => (LedgerOp::SetMember, Type::Boolean),
+                        "insert" => (LedgerOp::SetInsert, Type::unit()),
+                        _ => (LedgerOp::SetRemove, Type::unit()),
+                    };
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!("`Set.{method_name}` takes 1 argument"),
+                        ));
+                        return None;
+                    }
+                    let mut elem = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
+                    if !self.coerce_or_check(&mut elem, &value_type) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            elem.span,
+                            format!(
+                                "`Set.{method_name}` expects `{}`, found `{}`",
+                                self.format_type(&value_type),
+                                self.format_type(&elem.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    Some(Expr {
+                        kind: ExprKind::LedgerCall {
+                            field: field_id,
+                            op,
+                            args: vec![elem],
+                        },
+                        ty: ret_ty,
+                        span: call_span,
+                    })
+                }
+                other => {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        method_span,
+                        format!("`Set` has no method `{other}`"),
+                    ));
+                    None
+                }
+            },
+            LedgerAdt::MerkleTree(_) => match method_name {
+                "insert" => {
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`MerkleTree.insert` takes 1 argument",
+                        ));
+                        return None;
+                    }
+                    let mut item = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
+                    if !self.coerce_or_check(&mut item, &value_type) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            item.span,
+                            format!(
+                                "`MerkleTree.insert` expects `{}`, found `{}`",
+                                self.format_type(&value_type),
+                                self.format_type(&item.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    Some(Expr {
+                        kind: ExprKind::LedgerCall {
+                            field: field_id,
+                            op: LedgerOp::MerkleTreeInsert,
+                            args: vec![item],
+                        },
+                        ty: Type::unit(),
+                        span: call_span,
+                    })
+                }
+                "checkRoot" => {
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`MerkleTree.checkRoot` takes 1 argument",
+                        ));
+                        return None;
+                    }
+                    let mut rt =
+                        self.check_expr(arg_nodes[0], scope, Some(&Type::MerkleTreeDigest))?;
+                    if !self.coerce_or_check(&mut rt, &Type::MerkleTreeDigest) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            rt.span,
+                            format!(
+                                "`MerkleTree.checkRoot` expects `MerkleTreeDigest`, found `{}`",
+                                self.format_type(&rt.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    Some(Expr {
+                        kind: ExprKind::LedgerCall {
+                            field: field_id,
+                            op: LedgerOp::MerkleTreeCheckRoot,
+                            args: vec![rt],
+                        },
+                        ty: Type::Boolean,
+                        span: call_span,
+                    })
+                }
+                other => {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        method_span,
+                        format!("`MerkleTree` has no method `{other}`"),
+                    ));
+                    None
+                }
+            },
         }
     }
 }
@@ -1686,6 +2223,17 @@ fn stmts_effects(stmts: &[Stmt], calls: &mut Vec<CircuitId>) -> (bool, bool) {
     for stmt in stmts {
         let (sl, sw) = match stmt {
             Stmt::Const { init, .. } => expr_effects(init, calls),
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let (cl, cw) = expr_effects(cond, calls);
+                let (tl, tw) = stmts_effects(then_branch, calls);
+                let (el, ew) = stmts_effects(else_branch, calls);
+                (cl | tl | el, cw | tw | ew)
+            }
             Stmt::Expr(e) => expr_effects(e, calls),
             Stmt::Return { value: Some(e), .. } => expr_effects(e, calls),
             Stmt::Return { value: None, .. } => (false, false),
@@ -1736,7 +2284,18 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::MerkleTreePathRoot { path: operand, .. }
+        | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_effects(operand, calls),
+        ExprKind::StructLit { fields } => {
+            let (mut l, mut w) = (false, false);
+            for (_, e) in fields {
+                let (el, ew) = expr_effects(e, calls);
+                l |= el;
+                w |= ew;
+            }
+            (l, w)
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
             let (l1, w1) = expr_effects(lhs, calls);
             let (l2, w2) = expr_effects(rhs, calls);
@@ -1974,5 +2533,37 @@ mod tests {
         let checked = check(file, &parsed.ast);
         assert!(checked.diagnostics.has_errors());
         assert!(checked.diagnostics.diagnostics[0].message.contains("Uint<16>"));
+    }
+
+    #[test]
+    fn rejects_undisclosed_witness_in_if_guarding_ledger() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            enum Vote { yes, no }
+            ledger tally_yes: Counter;
+            ledger tally_no: Counter;
+            witness secret_vote(): Vote;
+            export circuit reveal(): [] {
+              const v = secret_vote();
+              if (v == Vote.yes) {
+                tally_yes.increment(1);
+              } else {
+                tally_no.increment(1);
+              }
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("disclose"),
+            "expected witness disclosure error, got: {:?}",
+            checked.diagnostics
+        );
     }
 }

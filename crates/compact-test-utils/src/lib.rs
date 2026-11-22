@@ -16,6 +16,16 @@ macro_rules! assert_compact_snapshot {
             $crate::insta::assert_snapshot!(__rendered);
         });
     }};
+    (file: $source:expr, $transform:expr $(,)?) => {{
+        let __src: &str = $source;
+        let __output = ($transform)(__src);
+        let __rendered = format!("{}\n===\n{}", __src.trim_end(), __output.trim_end());
+        $crate::insta::with_settings!({
+            omit_expression => true,
+        }, {
+            $crate::insta::assert_snapshot!(__rendered);
+        });
+    }};
     ($name:expr, $source:literal, $transform:expr $(,)?) => {{
         let __src: &str = $crate::indoc::indoc!($source);
         let __output = ($transform)(__src);

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
-use compact_hir::{CircuitId, Expr, ExprKind, LocalId, Program, Stmt};
+use compact_hir::{BinaryOp, CircuitId, Expr, ExprKind, LocalId, Program, Stmt};
 use compact_span::{SourceFile, Span};
 
 /// Origin of a private/witness value entering a contract (exported circuit params,
@@ -121,19 +121,53 @@ impl<'a> WitnessChecker<'a> {
         guard_taint: &Taint,
     ) -> Taint {
         let mut locals: HashMap<LocalId, Taint> = HashMap::new();
+        self.check_stmts_in_scope(stmts, param_taints, &mut locals, guard_taint)
+    }
+
+    fn check_stmts_in_scope(
+        &mut self,
+        stmts: &[Stmt],
+        param_taints: &[Taint],
+        locals: &mut HashMap<LocalId, Taint>,
+        guard_taint: &Taint,
+    ) -> Taint {
         let mut ret_taint = Taint::clean();
 
         for stmt in stmts {
             match stmt {
                 Stmt::Const { local, init, .. } => {
-                    let t = self.check_expr(init, param_taints, &locals, guard_taint);
+                    let t = self.check_expr(init, param_taints, locals, guard_taint);
                     locals.insert(*local, t);
                 }
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    let ct = self.check_expr(cond, param_taints, locals, guard_taint);
+                    let branch_guard = guard_taint.merge(&ct);
+                    let mut then_locals = locals.clone();
+                    let tt = self.check_stmts_in_scope(
+                        then_branch,
+                        param_taints,
+                        &mut then_locals,
+                        &branch_guard,
+                    );
+                    let mut else_locals = locals.clone();
+                    let et = self.check_stmts_in_scope(
+                        else_branch,
+                        param_taints,
+                        &mut else_locals,
+                        &branch_guard,
+                    );
+                    ret_taint = ret_taint.merge(&tt).merge(&et);
+                }
                 Stmt::Expr(expr) => {
-                    let _ = self.check_expr(expr, param_taints, &locals, guard_taint);
+                    let _ = self.check_expr(expr, param_taints, locals, guard_taint);
                 }
                 Stmt::Return { value: Some(expr), .. } => {
-                    let t = self.check_expr(expr, param_taints, &locals, guard_taint);
+                    let t = self.check_expr(expr, param_taints, locals, guard_taint);
                     ret_taint = ret_taint.merge(&t);
                 }
                 Stmt::Return { value: None, .. } => {}
@@ -167,12 +201,22 @@ impl<'a> WitnessChecker<'a> {
             ExprKind::Unary { operand, .. }
             | ExprKind::Cast { expr: operand, .. }
             | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::MerkleTreePathRoot { path: operand, .. }
+            | ExprKind::FieldAccess { base: operand, .. }
             | ExprKind::MaybeSome(operand) => {
                 self.check_expr(operand, param_taints, locals, guard_taint)
             }
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::StructLit { fields } => fields.iter().fold(Taint::clean(), |acc, (_, e)| {
+                acc.merge(&self.check_expr(e, param_taints, locals, guard_taint))
+            }),
+            ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.check_expr(lhs, param_taints, locals, guard_taint);
-                let rt = self.check_expr(rhs, param_taints, locals, guard_taint);
+                let rhs_guard = if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    guard_taint.merge(&lt)
+                } else {
+                    guard_taint.clone()
+                };
+                let rt = self.check_expr(rhs, param_taints, locals, &rhs_guard);
                 lt.merge(&rt)
             }
             ExprKind::Ternary {
@@ -286,6 +330,16 @@ fn collect_calls_stmts(stmts: &[Stmt], out: &mut Vec<(CircuitId, Span)>) {
     for stmt in stmts {
         match stmt {
             Stmt::Const { init, .. } => collect_calls_expr(init, out),
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_calls_expr(cond, out);
+                collect_calls_stmts(then_branch, out);
+                collect_calls_stmts(else_branch, out);
+            }
             Stmt::Expr(e) => collect_calls_expr(e, out),
             Stmt::Return { value: Some(e), .. } => collect_calls_expr(e, out),
             Stmt::Return { value: None, .. } => {}
@@ -309,11 +363,18 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
                 collect_calls_expr(e, out);
             }
         }
+        ExprKind::StructLit { fields } => {
+            for (_, e) in fields {
+                collect_calls_expr(e, out);
+            }
+        }
         ExprKind::Unary { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::MerkleTreePathRoot { path: operand, .. }
+        | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::MaybeSome(operand) => collect_calls_expr(operand, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, out);

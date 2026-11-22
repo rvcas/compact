@@ -77,6 +77,14 @@ impl<'a> Formatter<'a> {
                     main
                 }
             }
+            NodeTag::StructDecl => {
+                let d = self.ast.struct_decl(node);
+                if d.exported {
+                    TokenIndex(main.0.saturating_sub(1))
+                } else {
+                    main
+                }
+            }
             NodeTag::WitnessDecl => {
                 let d = self.ast.witness_decl(node);
                 if d.exported {
@@ -148,6 +156,34 @@ impl<'a> Formatter<'a> {
                     variants.join(", ")
                 )
                 .unwrap();
+            }
+            NodeTag::StructDecl => {
+                let decl = self.ast.struct_decl(node);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                writeln!(
+                    self.out,
+                    "struct {} {{",
+                    self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+                let fields: Vec<_> = self
+                    .ast
+                    .extra_nodes(decl.fields_start, decl.fields_end)
+                    .collect();
+                for f in fields {
+                    let sf = self.ast.struct_field(f);
+                    write!(
+                        self.out,
+                        "  {}: ",
+                        self.ast.token_text(sf.name_token, self.source)
+                    )
+                    .unwrap();
+                    self.format_type(sf.type_node);
+                    self.out.push_str(";\n");
+                }
+                self.out.push('}');
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ast.ledger_decl(node);
@@ -233,7 +269,7 @@ impl<'a> Formatter<'a> {
     fn format_type(&mut self, node: NodeIndex) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
-            NodeTag::TypeNamed | NodeTag::TypeNat => {
+            NodeTag::TypeNamed | NodeTag::TypeNat | NodeTag::TypeString => {
                 self.out
                     .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
             }
@@ -278,16 +314,35 @@ impl<'a> Formatter<'a> {
             let tok = self.ast.node_main_token(stmt);
             self.emit_comments_before(tok, indent + 1);
             self.out.push_str(&inner_pad);
-            self.format_stmt(stmt);
+            self.format_stmt(stmt, indent + 1);
             self.out.push('\n');
         }
         self.out.push_str(&"  ".repeat(indent));
         self.out.push('}');
     }
 
-    fn format_stmt(&mut self, node: NodeIndex) {
+    fn format_stmt(&mut self, node: NodeIndex, indent: usize) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
+            NodeTag::IfStmt => {
+                let stmt = self.ast.if_stmt(node);
+                self.out.push_str("if (");
+                self.format_expr(stmt.cond);
+                self.out.push_str(") ");
+                if self.ast.node_tag(stmt.then_branch) == NodeTag::Block {
+                    self.format_block(stmt.then_branch, indent);
+                } else {
+                    self.format_stmt(stmt.then_branch, indent);
+                }
+                if let Some(else_branch) = stmt.else_branch {
+                    self.out.push_str(" else ");
+                    match self.ast.node_tag(else_branch) {
+                        NodeTag::IfStmt => self.format_stmt(else_branch, indent),
+                        NodeTag::Block => self.format_block(else_branch, indent),
+                        _ => self.format_stmt(else_branch, indent),
+                    }
+                }
+            }
             NodeTag::ConstStmt => {
                 let stmt = self.ast.const_stmt(node);
                 write!(
@@ -443,6 +498,29 @@ impl<'a> Formatter<'a> {
                 self.format_expr(NodeIndex(data.lhs));
                 self.out.push(')');
             }
+            NodeTag::StructLitExpr => {
+                let lit = self.ast.struct_lit_expr(node);
+                self.format_type(lit.type_node);
+                self.out.push_str("{ ");
+                let fields: Vec<_> = self
+                    .ast
+                    .extra_nodes(lit.fields_start, lit.fields_end)
+                    .collect();
+                for (i, f) in fields.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    let sf = self.ast.struct_lit_field(f);
+                    write!(
+                        self.out,
+                        "{}: ",
+                        self.ast.token_text(sf.name_token, self.source)
+                    )
+                    .unwrap();
+                    self.format_expr(sf.value);
+                }
+                self.out.push_str(" }");
+            }
             _ => {}
         }
     }
@@ -507,6 +585,21 @@ mod tests {
             circuit get():Maybe<Field>{return state==STATE.set?some<Field>(value):none<Field>();}
             circuit clear():[]{authority=default<Bytes<32>>;value=default<Field>;state=STATE.unset;}
             circuit public_key(sk:Bytes<32>):Bytes<32>{return disclose(persistentHash<Vector<2,Bytes<32>>>([pad(32,"lares:tiny:pk:"),sk]));}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_struct_if_and_opaque() {
+        assert_compact_snapshot!(
+            r#"
+            struct Pair{a:Field;b:Opaque<"string">;}
+            enum State{a,b,c,}
+            ledger s:State;
+            ledger t:Maybe<Opaque<"string">>;
+            circuit next(x:State):State{if(x==State.a&&true){return State.b;}else if(x==State.b||false){return State.c;}else{return State.a;}}
+            circuit set_t(v:Opaque<"string">):[]{t.write(Maybe<Opaque<"string">>{is_some:true,value:disclose(v)});}
             "#,
             fmt
         );

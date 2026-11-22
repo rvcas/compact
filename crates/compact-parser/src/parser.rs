@@ -108,7 +108,8 @@ impl<'a> Parser<'a> {
             | TokenTag::Pure
             | TokenTag::Circuit
             | TokenTag::Witness
-            | TokenTag::Enum => self.parse_decl(),
+            | TokenTag::Enum
+            | TokenTag::Struct => self.parse_decl(),
             other => {
                 let tok = self.current_tok();
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -174,6 +175,7 @@ impl<'a> Parser<'a> {
 
         match self.peek() {
             TokenTag::Enum => self.parse_enum_decl(flags),
+            TokenTag::Struct => self.parse_struct_decl(flags),
             TokenTag::Ledger => self.parse_ledger_decl(flags),
             TokenTag::Witness => self.parse_witness_decl(flags),
             TokenTag::Circuit => self.parse_circuit_decl(flags),
@@ -183,13 +185,45 @@ impl<'a> Parser<'a> {
                     self.file,
                     self.ast.token_span(tok),
                     format!(
-                        "expected `enum`, `ledger`, `witness`, or `circuit` after modifiers, found `{}`",
+                        "expected `enum`, `struct`, `ledger`, `witness`, or `circuit` after modifiers, found `{}`",
                         other.as_str()
                     ),
                 ));
                 None
             }
         }
+    }
+
+    fn parse_struct_decl(&mut self, flags: u32) -> Option<NodeIndex> {
+        let struct_tok = self.expect(TokenTag::Struct)?;
+        let name_tok = self.expect(TokenTag::Ident)?;
+        self.expect(TokenTag::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
+            let fname = self.expect(TokenTag::Ident)?;
+            self.expect(TokenTag::Colon)?;
+            let fty = self.parse_type()?;
+            let field = self
+                .ast
+                .push_node(NodeTag::StructField, fname, NodeData::new(fty.0, 0));
+            fields.push(field.0);
+            if matches!(self.peek(), TokenTag::Semi | TokenTag::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenTag::RBrace)?;
+        if self.peek() == TokenTag::Semi {
+            self.advance();
+        }
+        let (fstart, fend) = self.ast.push_extra_slice(&fields);
+        let (extra_start, _) = self.ast.push_extra_slice(&[name_tok.0, fstart, fend]);
+        Some(self.ast.push_node(
+            NodeTag::StructDecl,
+            struct_tok,
+            NodeData::new(extra_start, flags),
+        ))
     }
 
     fn parse_enum_decl(&mut self, flags: u32) -> Option<NodeIndex> {
@@ -372,6 +406,10 @@ impl<'a> Parser<'a> {
                 let nat_tok = self.advance();
                 self.ast
                     .push_node(NodeTag::TypeNat, nat_tok, NodeData::default())
+            } else if self.peek() == TokenTag::String {
+                let str_tok = self.advance();
+                self.ast
+                    .push_node(NodeTag::TypeString, str_tok, NodeData::default())
             } else {
                 self.parse_type()?
             };
@@ -411,6 +449,7 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Option<NodeIndex> {
         match self.peek() {
+            TokenTag::If => self.parse_if_stmt(),
             TokenTag::Return => {
                 let ret_tok = self.advance();
                 let expr = if self.peek() == TokenTag::Semi {
@@ -468,12 +507,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_if_stmt(&mut self) -> Option<NodeIndex> {
+        let if_tok = self.expect(TokenTag::If)?;
+        self.expect(TokenTag::LParen)?;
+        let cond = self.parse_expr()?;
+        self.expect(TokenTag::RParen)?;
+        let then_branch = if self.peek() == TokenTag::LBrace {
+            self.parse_block()?
+        } else {
+            self.parse_stmt()?
+        };
+        let else_branch = if self.peek() == TokenTag::Else {
+            self.advance();
+            if self.peek() == TokenTag::If {
+                self.parse_if_stmt()?
+            } else if self.peek() == TokenTag::LBrace {
+                self.parse_block()?
+            } else {
+                self.parse_stmt()?
+            }
+        } else {
+            NodeIndex::NONE
+        };
+        let (extra_start, _) =
+            self.ast
+                .push_extra_slice(&[cond.0, then_branch.0, else_branch.0]);
+        Some(self.ast.push_node(
+            NodeTag::IfStmt,
+            if_tok,
+            NodeData::new(extra_start, 0),
+        ))
+    }
+
     fn parse_expr(&mut self) -> Option<NodeIndex> {
         self.parse_ternary_expr()
     }
 
     fn parse_ternary_expr(&mut self) -> Option<NodeIndex> {
-        let cond = self.parse_equality_expr()?;
+        let cond = self.parse_or_expr()?;
         if self.peek() == TokenTag::Question {
             let q_tok = self.advance();
             let then_branch = self.parse_expr()?;
@@ -490,6 +561,34 @@ impl<'a> Parser<'a> {
         } else {
             Some(cond)
         }
+    }
+
+    fn parse_or_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_and_expr()?;
+        while self.peek() == TokenTag::PipePipe {
+            let op_tok = self.advance();
+            let rhs = self.parse_and_expr()?;
+            lhs = self.ast.push_node(
+                NodeTag::BinaryExpr,
+                op_tok,
+                NodeData::new(lhs.0, rhs.0),
+            );
+        }
+        Some(lhs)
+    }
+
+    fn parse_and_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_equality_expr()?;
+        while self.peek() == TokenTag::AmpAmp {
+            let op_tok = self.advance();
+            let rhs = self.parse_equality_expr()?;
+            lhs = self.ast.push_node(
+                NodeTag::BinaryExpr,
+                op_tok,
+                NodeData::new(lhs.0, rhs.0),
+            );
+        }
+        Some(lhs)
     }
 
     fn parse_equality_expr(&mut self) -> Option<NodeIndex> {
@@ -559,7 +658,7 @@ impl<'a> Parser<'a> {
                     );
                 }
                 TokenTag::LAngle => {
-                    // Speculatively parse generic call `<type_args>(args)`.
+                    // Speculatively parse generic call `<type_args>(args)` or generic struct literal `<type_args>{ fields }`.
                     let saved_cursor = self.cursor;
                     let saved_diags = self.diagnostics.diagnostics.len();
                     let saved_extra = self.ast.extra_data.len();
@@ -592,12 +691,36 @@ impl<'a> Parser<'a> {
                             lparen,
                             NodeData::new(extra_start, rparen.0),
                         );
+                    } else if self.diagnostics.diagnostics.len() == saved_diags
+                        && self.peek() == TokenTag::LBrace
+                        && self.ast.node_tag(expr) == NodeTag::IdentExpr
+                    {
+                        // Re-parse type_args? Wait: we already parsed targs if we refactor cleanly below!
+                        self.cursor = saved_cursor;
+                        self.diagnostics.diagnostics.truncate(saved_diags);
+                        self.ast.extra_data.truncate(saved_extra);
+                        let targs = self.parse_type_args()?;
+                        let (targs_start, targs_end) = self.ast.push_extra_slice(&targs);
+                        let type_node = self.ast.push_node(
+                            NodeTag::TypeGeneric,
+                            self.ast.node_main_token(expr),
+                            NodeData::new(targs_start, targs_end),
+                        );
+                        expr = self.parse_struct_lit_body(type_node)?;
                     } else {
                         self.cursor = saved_cursor;
                         self.diagnostics.diagnostics.truncate(saved_diags);
                         self.ast.extra_data.truncate(saved_extra);
                         break;
                     }
+                }
+                TokenTag::LBrace if self.ast.node_tag(expr) == NodeTag::IdentExpr => {
+                    let type_node = self.ast.push_node(
+                        NodeTag::TypeNamed,
+                        self.ast.node_main_token(expr),
+                        NodeData::default(),
+                    );
+                    expr = self.parse_struct_lit_body(type_node)?;
                 }
                 TokenTag::LParen => {
                     let lparen = self.advance();
@@ -625,6 +748,33 @@ impl<'a> Parser<'a> {
             }
         }
         Some(expr)
+    }
+
+    fn parse_struct_lit_body(&mut self, type_node: NodeIndex) -> Option<NodeIndex> {
+        let lbrace = self.expect(TokenTag::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
+            let fname = self.expect(TokenTag::Ident)?;
+            self.expect(TokenTag::Colon)?;
+            let val = self.parse_expr()?;
+            let fnode = self
+                .ast
+                .push_node(NodeTag::StructLitField, fname, NodeData::new(val.0, 0));
+            fields.push(fnode.0);
+            if self.peek() == TokenTag::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let rbrace = self.expect(TokenTag::RBrace)?;
+        let (fstart, fend) = self.ast.push_extra_slice(&fields);
+        let (extra_start, _) = self.ast.push_extra_slice(&[type_node.0, fstart, fend]);
+        Some(self.ast.push_node(
+            NodeTag::StructLitExpr,
+            lbrace,
+            NodeData::new(extra_start, rbrace.0),
+        ))
     }
 
     fn parse_primary_expr(&mut self) -> Option<NodeIndex> {

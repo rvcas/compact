@@ -71,6 +71,10 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             map.insert("type-name".into(), Value::String("Bytes".into()));
             map.insert("length".into(), Value::Number((*len as u64).into()));
         }
+        Type::Opaque(ts_ty) => {
+            map.insert("type-name".into(), Value::String("Opaque".into()));
+            map.insert("tsType".into(), Value::String(ts_ty.clone()));
+        }
         Type::Vector(len, elem) => {
             map.insert("type-name".into(), Value::String("Vector".into()));
             map.insert("length".into(), Value::Number((*len as u64).into()));
@@ -92,21 +96,47 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
                 Value::Array(decl.variants.iter().cloned().map(Value::String).collect()),
             );
         }
-        Type::Maybe(inner) => {
-            let mut is_some = Map::new();
-            is_some.insert("name".into(), Value::String("is_some".into()));
-            is_some.insert("type".into(), type_to_json(program, &Type::Boolean));
-
-            let mut value = Map::new();
-            value.insert("name".into(), Value::String("value".into()));
-            value.insert("type".into(), type_to_json(program, inner));
-
+        Type::Struct(id) => {
+            let decl = program.struct_decl(*id);
+            let elements = decl
+                .fields
+                .iter()
+                .map(|f| {
+                    let mut el = Map::new();
+                    el.insert("name".into(), Value::String(f.name.clone()));
+                    el.insert("type".into(), type_to_json(program, &f.ty));
+                    Value::Object(el)
+                })
+                .collect();
             map.insert("type-name".into(), Value::String("Struct".into()));
-            map.insert("name".into(), Value::String("Maybe".into()));
-            map.insert(
-                "elements".into(),
-                Value::Array(vec![Value::Object(is_some), Value::Object(value)]),
-            );
+            map.insert("name".into(), Value::String(decl.name.clone()));
+            map.insert("elements".into(), Value::Array(elements));
+        }
+        Type::Maybe(_)
+        | Type::MerkleTreeDigest
+        | Type::MerkleTreePathEntry
+        | Type::MerkleTreePath(_, _) => {
+            let name = match ty {
+                Type::Maybe(_) => "Maybe",
+                Type::MerkleTreeDigest => "MerkleTreeDigest",
+                Type::MerkleTreePathEntry => "MerkleTreePathEntry",
+                Type::MerkleTreePath(_, _) => "MerkleTreePath",
+                _ => unreachable!(),
+            };
+            let elements = program
+                .struct_fields_of(ty)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(fname, fty)| {
+                    let mut el = Map::new();
+                    el.insert("name".into(), Value::String(fname));
+                    el.insert("type".into(), type_to_json(program, &fty));
+                    Value::Object(el)
+                })
+                .collect();
+            map.insert("type-name".into(), Value::String("Struct".into()));
+            map.insert("name".into(), Value::String(name.into()));
+            map.insert("elements".into(), Value::Array(elements));
         }
     }
     Value::Object(map)
@@ -134,6 +164,15 @@ fn ledger_field_to_json(program: &Program, field: &LedgerField) -> Value {
         }
         LedgerAdt::Cell => {
             map.insert("storage".into(), Value::String("Cell".into()));
+            map.insert("type".into(), type_to_json(program, &field.value_type));
+        }
+        LedgerAdt::Set => {
+            map.insert("storage".into(), Value::String("Set".into()));
+            map.insert("type".into(), type_to_json(program, &field.value_type));
+        }
+        LedgerAdt::MerkleTree(depth) => {
+            map.insert("storage".into(), Value::String("MerkleTree".into()));
+            map.insert("depth".into(), Value::Number((depth as u64).into()));
             map.insert("type".into(), type_to_json(program, &field.value_type));
         }
     }
@@ -348,6 +387,14 @@ mod tests {
               return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
             }
             "#,
+            contract_info_for
+        );
+    }
+
+    #[test]
+    fn contract_info_election() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/election.compact"),
             contract_info_for
         );
     }

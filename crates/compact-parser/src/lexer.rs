@@ -233,6 +233,14 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                     TokenTag::Bang
                 }
             }
+            b'&' if pos + 1 < len && bytes[pos + 1] == b'&' => {
+                pos += 2;
+                TokenTag::AmpAmp
+            }
+            b'|' if pos + 1 < len && bytes[pos + 1] == b'|' => {
+                pos += 2;
+                TokenTag::PipePipe
+            }
             _ => {
                 let ch = src[pos..].chars().next().unwrap();
                 pos += ch.len_utf8();

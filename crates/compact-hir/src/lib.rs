@@ -6,6 +6,9 @@ use compact_span::Span;
 pub struct EnumId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LedgerFieldId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +29,9 @@ pub enum LedgerAdt {
     /// Implicit single-value cell wrapping ordinary Compact types (e.g. `Field`, `Bytes<32>`, enums).
     Cell,
     Counter,
+    Set,
+    /// Bounded Merkle tree of depth `nat` (`2 <= nat <= 32`).
+    MerkleTree(u32),
 }
 
 impl LedgerAdt {
@@ -33,6 +39,8 @@ impl LedgerAdt {
         match self {
             Self::Cell => "Cell",
             Self::Counter => "Counter",
+            Self::Set => "Set",
+            Self::MerkleTree(_) => "MerkleTree",
         }
     }
 }
@@ -45,6 +53,11 @@ pub enum LedgerOp {
     CounterIncrement,
     CounterDecrement,
     CounterRead,
+    SetMember,
+    SetInsert,
+    SetRemove,
+    MerkleTreeInsert,
+    MerkleTreeCheckRoot,
 }
 
 impl LedgerOp {
@@ -55,13 +68,23 @@ impl LedgerOp {
             Self::CounterIncrement => "increment",
             Self::CounterDecrement => "decrement",
             Self::CounterRead => "read",
+            Self::SetMember => "member",
+            Self::SetInsert => "insert",
+            Self::SetRemove => "remove",
+            Self::MerkleTreeInsert => "insert",
+            Self::MerkleTreeCheckRoot => "checkRoot",
         }
     }
 
     pub fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::CellWrite | Self::CounterIncrement | Self::CounterDecrement
+            Self::CellWrite
+                | Self::CounterIncrement
+                | Self::CounterDecrement
+                | Self::SetInsert
+                | Self::SetRemove
+                | Self::MerkleTreeInsert
         )
     }
 }
@@ -72,11 +95,20 @@ pub enum Type {
     Boolean,
     Uint(u32),
     Bytes(u32),
+    /// Opaque host type (e.g. `Opaque<"string">`, `Opaque<"Uint8Array">`).
+    Opaque(String),
     Vector(u32, Box<Type>),
     Tuple(Vec<Type>),
     Enum(EnumId),
+    Struct(StructId),
     /// Standard-library `Maybe<T> { is_some: Boolean, value: T }`.
     Maybe(Box<Type>),
+    /// Standard-library `MerkleTreeDigest { field: Field }`.
+    MerkleTreeDigest,
+    /// Standard-library `MerkleTreePathEntry { sibling: MerkleTreeDigest, goes_left: Boolean }`.
+    MerkleTreePathEntry,
+    /// Standard-library `MerkleTreePath<N, T> { leaf: T, path: Vector<N, MerkleTreePathEntry> }`.
+    MerkleTreePath(u32, Box<Type>),
 }
 
 impl Type {
@@ -94,6 +126,22 @@ pub struct EnumDecl {
     pub id: EnumId,
     pub name: String,
     pub variants: Vec<String>,
+    pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub id: StructId,
+    pub name: String,
+    pub fields: Vec<StructField>,
     pub exported: bool,
     pub span: Span,
 }
@@ -148,6 +196,8 @@ pub enum BinaryOp {
     Sub,
     Eq,
     Neq,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone)]
@@ -206,8 +256,22 @@ pub enum ExprKind {
         input_ty: Type,
         arg: Box<Expr>,
     },
+    MerkleTreePathRoot {
+        depth: u32,
+        leaf_ty: Type,
+        path: Box<Expr>,
+    },
     MaybeSome(Box<Expr>),
     MaybeNone(Type),
+    /// Struct literal (fields stored in declaration order).
+    StructLit {
+        fields: Vec<(String, Expr)>,
+    },
+    /// Struct field access (`base.field`).
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +288,12 @@ pub enum Stmt {
         name: String,
         ty: Type,
         init: Expr,
+        span: Span,
+    },
+    If {
+        cond: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Vec<Stmt>,
         span: Span,
     },
     Expr(Expr),
@@ -251,6 +321,7 @@ pub struct Circuit {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub enums: Vec<EnumDecl>,
+    pub structs: Vec<StructDecl>,
     pub ledger_fields: Vec<LedgerField>,
     pub witnesses: Vec<WitnessDecl>,
     pub constructor: Option<Constructor>,
@@ -262,6 +333,40 @@ pub struct Program {
 impl Program {
     pub fn enum_decl(&self, id: EnumId) -> &EnumDecl {
         &self.enums[id.0 as usize]
+    }
+
+    pub fn struct_decl(&self, id: StructId) -> &StructDecl {
+        &self.structs[id.0 as usize]
+    }
+
+    /// Return ordered `(field_name, field_type)` pairs for any user-defined or stdlib struct type.
+    pub fn struct_fields_of(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
+        match ty {
+            Type::Struct(id) => Some(
+                self.struct_decl(*id)
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect(),
+            ),
+            Type::Maybe(inner) => Some(vec![
+                ("is_some".to_owned(), Type::Boolean),
+                ("value".to_owned(), (**inner).clone()),
+            ]),
+            Type::MerkleTreeDigest => Some(vec![("field".to_owned(), Type::Field)]),
+            Type::MerkleTreePathEntry => Some(vec![
+                ("sibling".to_owned(), Type::MerkleTreeDigest),
+                ("goes_left".to_owned(), Type::Boolean),
+            ]),
+            Type::MerkleTreePath(depth, leaf) => Some(vec![
+                ("leaf".to_owned(), (**leaf).clone()),
+                (
+                    "path".to_owned(),
+                    Type::Vector(*depth, Box::new(Type::MerkleTreePathEntry)),
+                ),
+            ]),
+            _ => None,
+        }
     }
 
     pub fn ledger_field(&self, id: LedgerFieldId) -> &LedgerField {
@@ -286,13 +391,20 @@ impl Program {
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
             Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::Opaque(ts_ty) => format!("Opaque<\"{ts_ty}\">"),
             Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {
                 let inner: Vec<_> = elems.iter().map(|e| self.format_type(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
             Type::Enum(id) => self.enum_decl(*id).name.clone(),
+            Type::Struct(id) => self.struct_decl(*id).name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
+            Type::MerkleTreeDigest => "MerkleTreeDigest".into(),
+            Type::MerkleTreePathEntry => "MerkleTreePathEntry".into(),
+            Type::MerkleTreePath(depth, leaf) => {
+                format!("MerkleTreePath<{depth}, {}>", self.format_type(leaf))
+            }
         }
     }
 
@@ -310,6 +422,22 @@ impl Program {
                 if e.exported { "export " } else { "" },
                 e.name,
                 e.variants.join(", ")
+            )
+            .unwrap();
+        }
+        for s in &self.structs {
+            let fields: Vec<_> = s
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, self.format_type(&f.ty)))
+                .collect();
+            writeln!(
+                out,
+                "  Struct #{} {}{} {{ {} }}",
+                s.id.0,
+                if s.exported { "export " } else { "" },
+                s.name,
+                fields.join(", ")
             )
             .unwrap();
         }
@@ -378,6 +506,19 @@ impl Program {
                         name,
                         self.format_type(ty),
                         init.kind
+                    )
+                    .unwrap(),
+                    Stmt::If {
+                        cond,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => writeln!(
+                        out,
+                        "    If {:?} then ({} stmts) else ({} stmts)",
+                        cond.kind,
+                        then_branch.len(),
+                        else_branch.len()
                     )
                     .unwrap(),
                     Stmt::Expr(e) => writeln!(out, "    ExprStmt {:?}", e.kind).unwrap(),

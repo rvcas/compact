@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use compact_hir::{
     BinaryOp, Circuit, CircuitId, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId, Param,
-    Program as HirProgram, Stmt, Type, UnaryOp,
+    Program as HirProgram, Stmt, StructDecl, Type, UnaryOp,
 };
 use compact_span::Span as CompactSpan;
 use oxc_allocator::{Allocator, ArenaVec, GetAllocator};
@@ -15,7 +15,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{SPAN, SourceType, Span};
 use oxc_str::{Ident, Str};
 use oxc_syntax::number::NumberBase;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator};
 use oxc_transformer::{TransformOptions, Transformer};
 use thiserror::Error;
 
@@ -225,6 +225,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             Type::Field | Type::Uint(_) => TSType::new_ts_big_int_keyword(SPAN, self),
             Type::Boolean => TSType::new_ts_boolean_keyword(SPAN, self),
             Type::Bytes(_) => self.ts_type_ref("Uint8Array", None),
+            Type::Opaque(ts_ty) => match ts_ty.as_str() {
+                "string" => TSType::new_ts_string_keyword(SPAN, self),
+                other => self.ts_type_ref(other, None),
+            },
             Type::Vector(len, elem) => {
                 let mut ts_elems = ArenaVec::with_capacity_in(*len as usize, self);
                 for _ in 0..*len {
@@ -236,10 +240,21 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 let decl = self.input.program.enum_decl(*id);
                 self.ts_type_ref(&decl.name, None)
             }
+            Type::Struct(id) => {
+                let decl = self.input.program.struct_decl(*id);
+                self.ts_type_ref(&decl.name, None)
+            }
             Type::Maybe(inner) => {
                 let mut targs = ArenaVec::with_capacity_in(1, self);
                 targs.push(self.hir_type_to_ts(inner));
                 self.ts_type_ref("Maybe", Some(targs))
+            }
+            Type::MerkleTreeDigest => self.ts_runtime_type("MerkleTreeDigest", None),
+            Type::MerkleTreePathEntry => self.ts_runtime_type("MerkleTreePathEntry", None),
+            Type::MerkleTreePath(_, leaf) => {
+                let mut targs = ArenaVec::with_capacity_in(1, self);
+                targs.push(self.hir_type_to_ts(leaf));
+                self.ts_runtime_type("MerkleTreePath", Some(targs))
             }
             Type::Tuple(elems) => {
                 let mut ts_elems = ArenaVec::with_capacity_in(elems.len(), self);
@@ -269,7 +284,14 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 | ExprKind::Cast { expr: operand, .. }
                 | ExprKind::Disclose(operand)
                 | ExprKind::PersistentHash { arg: operand, .. }
+                | ExprKind::MerkleTreePathRoot { path: operand, .. }
+                | ExprKind::FieldAccess { base: operand, .. }
                 | ExprKind::MaybeSome(operand) => visit_expr(operand, out),
+                ExprKind::StructLit { fields } => {
+                    for (_, e) in fields {
+                        visit_expr(e, out);
+                    }
+                }
                 ExprKind::Binary { lhs, rhs, .. } => {
                     visit_expr(lhs, out);
                     visit_expr(rhs, out);
@@ -303,6 +325,16 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             for stmt in stmts {
                 match stmt {
                     Stmt::Const { init, .. } => visit_expr(init, out),
+                    Stmt::If {
+                        cond,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        visit_expr(cond, out);
+                        visit_stmts(then_branch, out);
+                        visit_stmts(else_branch, out);
+                    }
                     Stmt::Expr(e) => visit_expr(e, out),
                     Stmt::Return { value: Some(e), .. } => visit_expr(e, out),
                     Stmt::Return { value: None, .. } => {}
@@ -414,6 +446,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             body.push(self.build_enum_decl(enum_decl));
         }
 
+        // Emit struct type aliases.
+        for struct_decl in &self.input.program.structs {
+            body.push(self.build_struct_decl(struct_decl));
+        }
+
         // Emit helper functions for non-exported circuits and any circuit called by another circuit/constructor.
         let called_circuits = self.collect_called_circuits();
         for circuit in &self.input.program.circuits {
@@ -511,6 +548,39 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             Statement::new_export_declaration(span, enum_decl, self)
         } else {
             Statement::from(enum_decl)
+        }
+    }
+
+    fn build_struct_decl(&self, decl: &StructDecl) -> Statement<'a> {
+        let mut members = ArenaVec::with_capacity_in(decl.fields.len(), self);
+        for f in &decl.fields {
+            members.push(TSSignature::new_ts_property_signature(
+                SPAN,
+                false,
+                false,
+                false,
+                PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                    SPAN,
+                    self.ident(&f.name),
+                    self,
+                )),
+                Some(self.ts_type_annotation(self.hir_type_to_ts(&f.ty))),
+                self,
+            ));
+        }
+        let obj = TSType::new_ts_type_literal(SPAN, members, self);
+        let td = Declaration::new_ts_type_alias_declaration(
+            self.oxc_span(decl.span),
+            BindingIdentifier::new(SPAN, self.ident(&decl.name), self),
+            None,
+            obj,
+            false,
+            self,
+        );
+        if decl.exported {
+            Statement::new_export_declaration(SPAN, td, self)
+        } else {
+            Statement::from(td)
         }
     }
 
@@ -897,6 +967,8 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             let decode_fn = match field.adt {
                 LedgerAdt::Counter => "decodeCounter",
                 LedgerAdt::Cell => "decodeCell",
+                LedgerAdt::Set => "decodeSet",
+                LedgerAdt::MerkleTree(_) => "decodeMerkleTree",
             };
             let mut args = ArenaVec::with_capacity_in(2, self);
             args.push(Argument::from(self.expr_ident(SPAN, "state")));
@@ -1208,57 +1280,8 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         );
 
         let mut locals = HashMap::new();
-        let mut stmts = ArenaVec::new_in(self);
-        let mut returned = false;
-
-        for stmt in &circuit.body {
-            match stmt {
-                Stmt::Const {
-                    local,
-                    name,
-                    ty,
-                    init,
-                    span,
-                } => {
-                    locals.insert(*local, name.clone());
-                    let init_expr = self.lower_expr(&circuit.params, init, &locals);
-                    let declarator = VariableDeclarator::new(
-                        self.oxc_span(*span),
-                        self.binding_ident(self.oxc_span(*span), name),
-                        Some(self.ts_type_annotation(self.hir_type_to_ts(ty))),
-                        Some(init_expr),
-                        false,
-                        self,
-                    );
-                    let mut declarators = ArenaVec::with_capacity_in(1, self);
-                    declarators.push(declarator);
-                    stmts.push(Statement::from(Declaration::new_variable_declaration(
-                        self.oxc_span(*span),
-                        VariableDeclarationKind::Const,
-                        declarators,
-                        false,
-                        self,
-                    )));
-                }
-                Stmt::Expr(expr) => {
-                    stmts.push(Statement::new_expression_statement(
-                        self.oxc_span(expr.span),
-                        self.lower_expr(&circuit.params, expr, &locals),
-                        self,
-                    ));
-                }
-                Stmt::Return { value, span } => {
-                    returned = true;
-                    let result_expr = value
-                        .as_ref()
-                        .map(|e| self.lower_expr(&circuit.params, e, &locals))
-                        .unwrap_or_else(|| {
-                            Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self)
-                        });
-                    stmts.push(self.return_circuit_results(self.oxc_span(*span), result_expr));
-                }
-            }
-        }
+        let (mut stmts, returned) =
+            self.lower_stmts_inner(&circuit.params, &circuit.body, &mut locals, true);
 
         if !returned {
             let empty = Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self);
@@ -1316,7 +1339,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
 
     fn lower_stmts_for(&self, params: &[Param], body: &[Stmt]) -> ArenaVec<'a, Statement<'a>> {
         let mut locals = HashMap::new();
+        self.lower_stmts_inner(params, body, &mut locals, false).0
+    }
+
+    fn lower_stmts_inner(
+        &self,
+        params: &[Param],
+        body: &[Stmt],
+        locals: &mut HashMap<LocalId, String>,
+        wrap_circuit_results: bool,
+    ) -> (ArenaVec<'a, Statement<'a>>, bool) {
         let mut stmts = ArenaVec::new_in(self);
+        let mut returned = false;
         for stmt in body {
             match stmt {
                 Stmt::Const {
@@ -1327,7 +1361,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     span,
                 } => {
                     locals.insert(*local, name.clone());
-                    let init_expr = self.lower_expr(params, init, &locals);
+                    let init_expr = self.lower_expr(params, init, locals);
                     let declarator = VariableDeclarator::new(
                         self.oxc_span(*span),
                         self.binding_ident(self.oxc_span(*span), name),
@@ -1346,23 +1380,72 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         self,
                     )));
                 }
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    span,
+                } => {
+                    let test = self.lower_expr(params, cond, locals);
+                    let mut then_locals = locals.clone();
+                    let (then_stmts, then_ret) = self.lower_stmts_inner(
+                        params,
+                        then_branch,
+                        &mut then_locals,
+                        wrap_circuit_results,
+                    );
+                    let consequent = Statement::new_block_statement(SPAN, then_stmts, self);
+                    let (alternate, else_ret) = if else_branch.is_empty() {
+                        (None, false)
+                    } else {
+                        let mut else_locals = locals.clone();
+                        let (else_stmts, er) = self.lower_stmts_inner(
+                            params,
+                            else_branch,
+                            &mut else_locals,
+                            wrap_circuit_results,
+                        );
+                        (Some(Statement::new_block_statement(SPAN, else_stmts, self)), er)
+                    };
+                    if then_ret && else_ret {
+                        returned = true;
+                    }
+                    stmts.push(Statement::new_if_statement(
+                        self.oxc_span(*span),
+                        test,
+                        consequent,
+                        alternate,
+                        self,
+                    ));
+                }
                 Stmt::Expr(expr) => {
                     stmts.push(Statement::new_expression_statement(
                         self.oxc_span(expr.span),
-                        self.lower_expr(params, expr, &locals),
+                        self.lower_expr(params, expr, locals),
                         self,
                     ));
                 }
                 Stmt::Return { value, span } => {
-                    stmts.push(Statement::new_return_statement(
-                        self.oxc_span(*span),
-                        value.as_ref().map(|e| self.lower_expr(params, e, &locals)),
-                        self,
-                    ));
+                    returned = true;
+                    if wrap_circuit_results {
+                        let result_expr = value
+                            .as_ref()
+                            .map(|e| self.lower_expr(params, e, locals))
+                            .unwrap_or_else(|| {
+                                Expression::new_array_expression(SPAN, ArenaVec::new_in(self), self)
+                            });
+                        stmts.push(self.return_circuit_results(self.oxc_span(*span), result_expr));
+                    } else {
+                        stmts.push(Statement::new_return_statement(
+                            self.oxc_span(*span),
+                            value.as_ref().map(|e| self.lower_expr(params, e, locals)),
+                            self,
+                        ));
+                    }
                 }
             }
         }
-        stmts
+        (stmts, returned)
     }
 
     fn default_expr_for_type(&self, span: Span, ty: &Type) -> Expression<'a> {
@@ -1375,6 +1458,21 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 self,
             ),
             Type::Boolean => self.expr_bool(span, false),
+            Type::Opaque(ts_ty) => {
+                if ts_ty == "string" {
+                    self.expr_str(span, "")
+                } else {
+                    let mut args = ArenaVec::with_capacity_in(1, self);
+                    args.push(Argument::from(self.expr_num(span, 0.0)));
+                    Expression::new_new_expression(
+                        span,
+                        self.expr_ident(span, ts_ty),
+                        None,
+                        args,
+                        self,
+                    )
+                }
+            }
             Type::Bytes(len) => {
                 let mut args = ArenaVec::with_capacity_in(1, self);
                 args.push(Argument::from(self.expr_num(span, *len as f64)));
@@ -1408,36 +1506,33 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 }
                 Expression::new_array_expression(span, arr, self)
             }
-            Type::Maybe(inner) => {
-                let mut props = ArenaVec::with_capacity_in(2, self);
-                props.push(ObjectPropertyKind::new_object_property(
-                    span,
-                    PropertyKind::Init,
-                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+            Type::Struct(_)
+            | Type::Maybe(_)
+            | Type::MerkleTreeDigest
+            | Type::MerkleTreePathEntry
+            | Type::MerkleTreePath(_, _) => {
+                let fields = self
+                    .input
+                    .program
+                    .struct_fields_of(ty)
+                    .unwrap_or_default();
+                let mut props = ArenaVec::with_capacity_in(fields.len(), self);
+                for (fname, fty) in fields {
+                    props.push(ObjectPropertyKind::new_object_property(
                         span,
-                        self.ident("is_some"),
+                        PropertyKind::Init,
+                        PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                            span,
+                            self.ident(&fname),
+                            self,
+                        )),
+                        self.default_expr_for_type(span, &fty),
+                        false,
+                        false,
+                        false,
                         self,
-                    )),
-                    self.expr_bool(span, false),
-                    false,
-                    false,
-                    false,
-                    self,
-                ));
-                props.push(ObjectPropertyKind::new_object_property(
-                    span,
-                    PropertyKind::Init,
-                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
-                        span,
-                        self.ident("value"),
-                        self,
-                    )),
-                    self.default_expr_for_type(span, inner),
-                    false,
-                    false,
-                    false,
-                    self,
-                ));
+                    ));
+                }
                 Expression::new_object_expression(span, props, self)
             }
         }
@@ -1512,10 +1607,31 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 )
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let lop = if *op == BinaryOp::And {
+                        LogicalOperator::And
+                    } else {
+                        LogicalOperator::Or
+                    };
+                    return Expression::new_logical_expression(
+                        span,
+                        self.lower_expr(params, lhs, locals),
+                        lop,
+                        self.lower_expr(params, rhs, locals),
+                        self,
+                    );
+                }
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
                     && matches!(
                         lhs.ty,
-                        Type::Bytes(_) | Type::Vector(_, _) | Type::Tuple(_) | Type::Maybe(_)
+                        Type::Bytes(_)
+                            | Type::Vector(_, _)
+                            | Type::Tuple(_)
+                            | Type::Struct(_)
+                            | Type::Maybe(_)
+                            | Type::MerkleTreeDigest
+                            | Type::MerkleTreePathEntry
+                            | Type::MerkleTreePath(_, _)
                     )
                 {
                     let mut eq_args = ArenaVec::with_capacity_in(2, self);
@@ -1542,6 +1658,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     BinaryOp::Sub => BinaryOperator::Subtraction,
                     BinaryOp::Eq => BinaryOperator::StrictEquality,
                     BinaryOp::Neq => BinaryOperator::StrictInequality,
+                    BinaryOp::And | BinaryOp::Or => unreachable!(),
                 };
                 Expression::new_binary_expression(
                     span,
@@ -1614,6 +1731,42 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     ),
                     call_args,
                 )
+            }
+            ExprKind::MerkleTreePathRoot { path, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, path, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "merkleTreePathRoot",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::StructLit { fields } => {
+                let mut props = ArenaVec::with_capacity_in(fields.len(), self);
+                for (fname, fexpr) in fields {
+                    props.push(ObjectPropertyKind::new_object_property(
+                        span,
+                        PropertyKind::Init,
+                        PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                            span,
+                            self.ident(fname),
+                            self,
+                        )),
+                        self.lower_expr(params, fexpr, locals),
+                        false,
+                        false,
+                        false,
+                        self,
+                    ));
+                }
+                Expression::new_object_expression(span, props, self)
+            }
+            ExprKind::FieldAccess { base, field } => {
+                self.expr_member(span, self.lower_expr(params, base, locals), field)
             }
             ExprKind::MaybeSome(inner) => {
                 let mut props = ArenaVec::with_capacity_in(2, self);
@@ -1791,6 +1944,31 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                                 self.expr_ident(span, "__compactRuntime"),
                                 "readCounter",
                             ),
+                            call_args,
+                        )
+                    }
+                    LedgerOp::SetMember
+                    | LedgerOp::SetInsert
+                    | LedgerOp::SetRemove
+                    | LedgerOp::MerkleTreeInsert
+                    | LedgerOp::MerkleTreeCheckRoot => {
+                        let rt_fn = match op {
+                            LedgerOp::SetMember => "setMember",
+                            LedgerOp::SetInsert => "setInsert",
+                            LedgerOp::SetRemove => "setRemove",
+                            LedgerOp::MerkleTreeInsert => "merkleTreeInsert",
+                            LedgerOp::MerkleTreeCheckRoot => "merkleTreeCheckRoot",
+                            _ => unreachable!(),
+                        };
+                        let mut call_args = ArenaVec::with_capacity_in(3, self);
+                        call_args.push(Argument::from(self.expr_ident(span, "context")));
+                        call_args.push(Argument::from(
+                            self.expr_num(span, ledger_field.path[0] as f64),
+                        ));
+                        call_args.push(Argument::from(self.lower_expr(params, &args[0], locals)));
+                        self.expr_call(
+                            span,
+                            self.expr_member(span, self.expr_ident(span, "__compactRuntime"), rt_fn),
                             call_args,
                         )
                     }
@@ -2092,6 +2270,14 @@ mod tests {
               return disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "lares:tiny:pk:"), sk]));
             }
             "#,
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_election_contract() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/election.compact"),
             compile_ts_bundle
         );
     }

@@ -102,6 +102,8 @@ pub enum TokenTag {
     EqEq,
     BangEq,
     Bang,
+    AmpAmp,
+    PipePipe,
 
     // Special
     Eof,
@@ -159,6 +161,8 @@ impl TokenTag {
             Self::EqEq => "==",
             Self::BangEq => "!=",
             Self::Bang => "!",
+            Self::AmpAmp => "&&",
+            Self::PipePipe => "||",
             Self::Eof => "end of file",
             Self::Invalid => "invalid token",
         }
@@ -211,6 +215,12 @@ pub enum NodeTag {
     /// `main_token = enum`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+3] = [name_tok, variants_start, variants_end]`.
     EnumDecl,
+    /// `[export] struct <name> { <field>: <type>; ... }`
+    /// `main_token = struct`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+3] = [name_tok, fields_start, fields_end]`.
+    StructDecl,
+    /// `<name>: <type>` inside a struct declaration — `main_token = name_tok`, `data = (type_node, 0)`.
+    StructField,
     /// `[export] [sealed] ledger <name>: <type>;`
     /// `main_token = ledger`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+2] = [name_tok, type_node]`.
@@ -236,10 +246,16 @@ pub enum NodeTag {
     TypeGeneric,
     /// Numeric type argument (e.g. `32` in `Bytes<32>`) — `main_token = nat_tok`.
     TypeNat,
+    /// String type argument (e.g. `"string"` in `Opaque<"string">`) — `main_token = string_tok`.
+    TypeString,
     /// Tuple type (e.g. `[]`, `[Field, Boolean]`) — `main_token = '['`, `data = (extra_start, extra_end)`.
     TypeTuple,
     /// Block `{ <stmt>* }` — `main_token = '{'`, `data = (extra_start, extra_end)`.
     Block,
+    /// `if (<cond>) <then_block> [else <else_block_or_if>]`
+    /// `main_token = if`, `data = (extra_start, 0)`,
+    /// `extra_data[extra_start..+3] = [cond_expr, then_node, opt_else_node]`.
+    IfStmt,
     /// `const <name>[: <type>] = <expr>;`
     /// `main_token = const`, `data = (extra_start, semi_tok)`,
     /// `extra_data[extra_start..+3] = [name_tok, opt_type_node, init_expr]`.
@@ -288,6 +304,12 @@ pub enum NodeTag {
     AssertExpr,
     /// `disclose(<expr>)` — `main_token = disclose`, `data = (expr_node, rparen_tok)`.
     DiscloseExpr,
+    /// Struct literal `<Type> { <field>: <expr>, ... }`
+    /// `main_token = '{'`, `data = (extra_start, rbrace_tok)`,
+    /// `extra_data[extra_start..+3] = [type_node, fields_start, fields_end]`.
+    StructLitExpr,
+    /// Struct literal field `<name>: <expr>` — `main_token = name_tok`, `data = (value_expr, 0)`.
+    StructLitField,
 }
 
 /// Fixed-width payload stored alongside every AST node (Zig-style two-word `Data`).
@@ -334,6 +356,44 @@ pub struct EnumDecl {
     pub variants_start: u32,
     pub variants_end: u32,
     pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructDecl {
+    pub struct_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub fields_start: u32,
+    pub fields_end: u32,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructField {
+    pub name_token: TokenIndex,
+    pub type_node: NodeIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IfStmt {
+    pub if_token: TokenIndex,
+    pub cond: NodeIndex,
+    pub then_branch: NodeIndex,
+    pub else_branch: Option<NodeIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructLitExpr {
+    pub lbrace_token: TokenIndex,
+    pub rbrace_token: TokenIndex,
+    pub type_node: NodeIndex,
+    pub fields_start: u32,
+    pub fields_end: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StructLitField {
+    pub name_token: TokenIndex,
+    pub value: NodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -558,6 +618,62 @@ impl Ast {
         }
     }
 
+    pub fn struct_decl(&self, node: NodeIndex) -> StructDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::StructDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        StructDecl {
+            struct_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            fields_start: self.extra_data[base + 1],
+            fields_end: self.extra_data[base + 2],
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
+        }
+    }
+
+    pub fn struct_field(&self, node: NodeIndex) -> StructField {
+        debug_assert_eq!(self.node_tag(node), NodeTag::StructField);
+        let data = self.node_data(node);
+        StructField {
+            name_token: self.node_main_token(node),
+            type_node: NodeIndex(data.lhs),
+        }
+    }
+
+    pub fn if_stmt(&self, node: NodeIndex) -> IfStmt {
+        debug_assert_eq!(self.node_tag(node), NodeTag::IfStmt);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        IfStmt {
+            if_token: self.node_main_token(node),
+            cond: NodeIndex(self.extra_data[base]),
+            then_branch: NodeIndex(self.extra_data[base + 1]),
+            else_branch: NodeIndex(self.extra_data[base + 2]).into_option(),
+        }
+    }
+
+    pub fn struct_lit_expr(&self, node: NodeIndex) -> StructLitExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::StructLitExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        StructLitExpr {
+            lbrace_token: self.node_main_token(node),
+            rbrace_token: TokenIndex(data.rhs),
+            type_node: NodeIndex(self.extra_data[base]),
+            fields_start: self.extra_data[base + 1],
+            fields_end: self.extra_data[base + 2],
+        }
+    }
+
+    pub fn struct_lit_field(&self, node: NodeIndex) -> StructLitField {
+        debug_assert_eq!(self.node_tag(node), NodeTag::StructLitField);
+        let data = self.node_data(node);
+        StructLitField {
+            name_token: self.node_main_token(node),
+            value: NodeIndex(data.lhs),
+        }
+    }
+
     pub fn ledger_decl(&self, node: NodeIndex) -> LedgerDecl {
         debug_assert_eq!(self.node_tag(node), NodeTag::LedgerDecl);
         let data = self.node_data(node);
@@ -732,6 +848,17 @@ impl Ast {
                 }
                 span
             }
+            NodeTag::StructDecl => {
+                let decl = self.struct_decl(node);
+                let mut span = main.merge(self.token_span(decl.name_token));
+                if let Some(last) = self.extra_nodes(decl.fields_start, decl.fields_end).last() {
+                    span = span.merge(self.node_span(last));
+                }
+                span
+            }
+            NodeTag::StructField | NodeTag::Param | NodeTag::StructLitField => {
+                main.merge(self.node_span(NodeIndex(data.lhs)))
+            }
             NodeTag::LedgerDecl => {
                 let decl = self.ledger_decl(node);
                 main.merge(self.node_span(decl.type_node))
@@ -748,9 +875,9 @@ impl Ast {
                 let decl = self.circuit_decl(node);
                 main.merge(self.node_span(decl.body))
             }
-            NodeTag::Param => main.merge(self.node_span(NodeIndex(data.lhs))),
             NodeTag::TypeNamed
             | NodeTag::TypeNat
+            | NodeTag::TypeString
             | NodeTag::IdentExpr
             | NodeTag::IntLitExpr
             | NodeTag::BoolLitExpr
@@ -761,6 +888,11 @@ impl Ast {
                     span = span.merge(self.node_span(last));
                 }
                 span
+            }
+            NodeTag::IfStmt => {
+                let stmt = self.if_stmt(node);
+                let end = stmt.else_branch.unwrap_or(stmt.then_branch);
+                main.merge(self.node_span(end))
             }
             NodeTag::ConstStmt => {
                 let stmt = self.const_stmt(node);
@@ -811,6 +943,11 @@ impl Ast {
                 main.merge(self.token_span(a.rparen_token))
             }
             NodeTag::DiscloseExpr => main.merge(self.token_span(TokenIndex(data.rhs))),
+            NodeTag::StructLitExpr => {
+                let lit = self.struct_lit_expr(node);
+                self.node_span(lit.type_node)
+                    .merge(self.token_span(lit.rbrace_token))
+            }
         }
     }
 
@@ -863,6 +1000,29 @@ impl Ast {
                     variants.join(", ")
                 )
                 .unwrap();
+            }
+            NodeTag::StructDecl => {
+                let decl = self.struct_decl(node);
+                let mods_str = if decl.exported { "[export] " } else { "" };
+                writeln!(
+                    out,
+                    "{pad}StructDecl {mods_str}{}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                for field in self.extra_nodes(decl.fields_start, decl.fields_end) {
+                    self.dump_node(field, source, indent + 1, out);
+                }
+            }
+            NodeTag::StructField => {
+                let field = self.struct_field(node);
+                writeln!(
+                    out,
+                    "{pad}StructField {}",
+                    self.token_text(field.name_token, source)
+                )
+                .unwrap();
+                self.dump_node(field.type_node, source, indent + 1, out);
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ledger_decl(node);
@@ -991,6 +1151,14 @@ impl Ast {
                 )
                 .unwrap();
             }
+            NodeTag::TypeString => {
+                writeln!(
+                    out,
+                    "{pad}TypeString {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+            }
             NodeTag::TypeTuple => {
                 writeln!(out, "{pad}TypeTuple").unwrap();
                 for elem in self.extra_nodes(data.lhs, data.rhs) {
@@ -1001,6 +1169,15 @@ impl Ast {
                 writeln!(out, "{pad}Block").unwrap();
                 for stmt in self.extra_nodes(data.lhs, data.rhs) {
                     self.dump_node(stmt, source, indent + 1, out);
+                }
+            }
+            NodeTag::IfStmt => {
+                let stmt = self.if_stmt(node);
+                writeln!(out, "{pad}IfStmt").unwrap();
+                self.dump_node(stmt.cond, source, indent + 1, out);
+                self.dump_node(stmt.then_branch, source, indent + 1, out);
+                if let Some(else_branch) = stmt.else_branch {
+                    self.dump_node(else_branch, source, indent + 1, out);
                 }
             }
             NodeTag::ConstStmt => {
@@ -1143,6 +1320,24 @@ impl Ast {
             NodeTag::DiscloseExpr => {
                 writeln!(out, "{pad}DiscloseExpr").unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
+            NodeTag::StructLitExpr => {
+                let lit = self.struct_lit_expr(node);
+                writeln!(out, "{pad}StructLitExpr").unwrap();
+                self.dump_node(lit.type_node, source, indent + 1, out);
+                for field in self.extra_nodes(lit.fields_start, lit.fields_end) {
+                    self.dump_node(field, source, indent + 1, out);
+                }
+            }
+            NodeTag::StructLitField => {
+                let field = self.struct_lit_field(node);
+                writeln!(
+                    out,
+                    "{pad}StructLitField {}",
+                    self.token_text(field.name_token, source)
+                )
+                .unwrap();
+                self.dump_node(field.value, source, indent + 1, out);
             }
         }
     }
