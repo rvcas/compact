@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
 use compact_hir::{
-    BinaryOp, Circuit, CircuitId, Constructor, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt,
-    LedgerField, LedgerFieldId, LedgerOp, LocalId, NativeWitnessKind, NewTypeDecl, NewTypeId,
-    Param, ParamId, Program, Stmt, StructDecl, StructField, StructId, Type, UnaryOp, WitnessDecl,
-    WitnessId,
+    BinaryOp, Circuit, CircuitId, Constructor, CurveFieldKind, CurveKind, EnumDecl, EnumId, Expr,
+    ExprKind, LedgerAdt, LedgerField, LedgerFieldId, LedgerOp, LocalId, NativeWitnessKind,
+    NewTypeDecl, NewTypeId, Param, ParamId, Program, Stmt, StructDecl, StructField, StructId, Type,
+    UnaryOp, WitnessDecl, WitnessId,
 };
 use compact_span::{SourceFile, Span};
 
@@ -902,6 +902,12 @@ impl<'a> Analyzer<'a> {
             } else if let Some(&gid) = self.scope.generic_circuits.get(&name) {
                 if is_module_instance {
                     exports.generic_circuits.insert(name, gid);
+                } else if self.generic_circuits[gid].gparams.is_empty()
+                    && let Some(cid) =
+                        self.instantiate_generic_circuit(gid, &[], self.units.ast().token_span(tok))
+                {
+                    self.circuit_sigs[cid.0 as usize].exported = true;
+                    self.circuit_sigs[cid.0 as usize].name = name;
                 }
             } else if let Some(&eid) = self.scope.enums.get(&name) {
                 if is_module_instance {
@@ -1942,6 +1948,17 @@ impl<'a> Analyzer<'a> {
                 match name.as_str() {
                     "Field" => Some(Type::Field),
                     "Boolean" => Some(Type::Boolean),
+                    "JubjubScalar" => Some(Type::CurveField(CurveFieldKind::JubjubScalar)),
+                    "JubjubPoint" => Some(Type::CurvePoint(CurveKind::Jubjub)),
+                    "Secp256k1Base" => Some(Type::CurveField(CurveFieldKind::Secp256k1Base)),
+                    "Secp256k1Scalar" => Some(Type::CurveField(CurveFieldKind::Secp256k1Scalar)),
+                    "Secp256k1Point" => Some(Type::CurvePoint(CurveKind::Secp256k1)),
+                    "Secp256r1Base" => Some(Type::CurveField(CurveFieldKind::Secp256r1Base)),
+                    "Secp256r1Scalar" => Some(Type::CurveField(CurveFieldKind::Secp256r1Scalar)),
+                    "Secp256r1Point" => Some(Type::CurvePoint(CurveKind::Secp256r1)),
+                    "Curve25519Base" => Some(Type::CurveField(CurveFieldKind::Curve25519Base)),
+                    "Curve25519Scalar" => Some(Type::CurveField(CurveFieldKind::Curve25519Scalar)),
+                    "Curve25519Point" => Some(Type::CurvePoint(CurveKind::Curve25519)),
                     "MerkleTreeDigest" => Some(Type::MerkleTreeDigest),
                     "MerkleTreePathEntry" => Some(Type::MerkleTreePathEntry),
                     _ => {
@@ -2216,6 +2233,8 @@ impl<'a> Analyzer<'a> {
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
             Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::CurveField(f) => f.type_name().into(),
+            Type::CurvePoint(c) => c.point_type_name().into(),
             Type::Opaque(ts_ty) => format!("Opaque<\"{ts_ty}\">"),
             Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {
@@ -3607,23 +3626,25 @@ impl<'a> Analyzer<'a> {
                         })
                     }
                     TokenTag::Minus => {
-                        if operand.ty != Type::Field {
+                        let op_u = self.underlying_type(&operand.ty);
+                        if !matches!(op_u, Type::Field | Type::CurveField(_)) {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 operand.span,
                                 format!(
-                                    "unary `-` expects `Field`, found `{}`",
+                                    "unary `-` expects a field type, found `{}`",
                                     self.format_type(&operand.ty)
                                 ),
                             ));
                             return None;
                         }
+                        let ty = operand.ty.clone();
                         Some(Expr {
                             kind: ExprKind::Unary {
                                 op: UnaryOp::Neg,
                                 operand: Box::new(operand),
                             },
-                            ty: Type::Field,
+                            ty,
                             span,
                         })
                     }
@@ -3701,6 +3722,23 @@ impl<'a> Analyzer<'a> {
                         ));
                         return None;
                     }
+                }
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                    && !matches!(
+                        self.underlying_type(&lhs.ty),
+                        Type::Field | Type::Uint(_) | Type::CurveField(_)
+                    )
+                {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        span,
+                        format!(
+                            "arithmetic operator `{}` requires numeric or field operands, found `{}`",
+                            self.units.ast().token_tag(op_tok).as_str(),
+                            self.format_type(&lhs.ty)
+                        ),
+                    ));
+                    return None;
                 }
                 if matches!(
                     op,
@@ -3791,13 +3829,32 @@ impl<'a> Analyzer<'a> {
                         (src_u, dst_u),
                         (Type::Uint(_), Type::Field)
                             | (Type::Uint(_), Type::Uint(_))
+                            | (Type::Field, Type::Uint(_))
                             | (Type::Boolean, Type::Field)
                             | (Type::Enum(_), Type::Field)
                             | (Type::Field, Type::Field)
+                            | (
+                                Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_),
+                                Type::CurveField(CurveFieldKind::JubjubScalar)
+                            )
+                            | (
+                                Type::CurveField(CurveFieldKind::JubjubScalar),
+                                Type::Field | Type::Uint(_)
+                            )
+                            | (Type::CurveField(_), Type::Bytes(32))
+                            | (Type::Bytes(32), Type::CurveField(_))
+                            | (
+                                Type::Bytes(64),
+                                Type::CurveField(CurveFieldKind::Curve25519Scalar)
+                            )
                     )
                     || matches!(
                         (src_u, dst_u),
                         (Type::Bytes(n), Type::Field) if *n <= 31
+                    )
+                    || matches!(
+                        (src_u, dst_u),
+                        (Type::Field, Type::Bytes(n)) if *n <= 32
                     )
                     || matches!(
                         (src_u, dst_u),
@@ -3984,6 +4041,299 @@ impl<'a> Analyzer<'a> {
                             return Some(Expr {
                                 kind: ExprKind::UpgradeFromTransient(Box::new(arg)),
                                 ty: Type::Bytes(32),
+                                span,
+                            });
+                        }
+                        "neg" | "inv" => {
+                            let is_inv = callee_name == "inv";
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`{callee_name}` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let arg = self.check_expr(arg_nodes[0], scope, None)?;
+                            let arg_u = self.underlying_type(&arg.ty).clone();
+                            if !matches!(arg_u, Type::CurveField(f) if f.is_foreign()) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    arg.span,
+                                    format!(
+                                        "`{callee_name}` expects a foreign field element, found `{}`",
+                                        self.format_type(&arg.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let ty = arg.ty.clone();
+                            let kind = if is_inv {
+                                ExprKind::FieldInv(Box::new(arg))
+                            } else {
+                                ExprKind::Unary {
+                                    op: UnaryOp::Neg,
+                                    operand: Box::new(arg),
+                                }
+                            };
+                            return Some(Expr { kind, ty, span });
+                        }
+                        "ecAdd" => {
+                            if arg_nodes.len() != 2 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`ecAdd` expects 2 arguments, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let lhs = self.check_expr(arg_nodes[0], scope, None)?;
+                            let rhs = self.check_expr(arg_nodes[1], scope, Some(&lhs.ty))?;
+                            let lhs_u = self.underlying_type(&lhs.ty).clone();
+                            let rhs_u = self.underlying_type(&rhs.ty).clone();
+                            let Type::CurvePoint(curve) = lhs_u else {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    lhs.span,
+                                    format!(
+                                        "`ecAdd` expects elliptic curve points, found `{}`",
+                                        self.format_type(&lhs.ty)
+                                    ),
+                                ));
+                                return None;
+                            };
+                            if rhs_u != Type::CurvePoint(curve) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    rhs.span,
+                                    format!(
+                                        "`ecAdd` curve mismatch: expected `{}`, found `{}`",
+                                        curve.point_type_name(),
+                                        self.format_type(&rhs.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::EcAdd {
+                                    lhs: Box::new(lhs),
+                                    rhs: Box::new(rhs),
+                                },
+                                ty: Type::CurvePoint(curve),
+                                span,
+                            });
+                        }
+                        "ecNeg" => {
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`ecNeg` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let expected = Type::CurvePoint(CurveKind::Jubjub);
+                            let arg = self.check_expr(arg_nodes[0], scope, Some(&expected))?;
+                            if *self.underlying_type(&arg.ty) != expected {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    arg.span,
+                                    format!(
+                                        "`ecNeg` expects `JubjubPoint`, found `{}`",
+                                        self.format_type(&arg.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::EcNeg(Box::new(arg)),
+                                ty: expected,
+                                span,
+                            });
+                        }
+                        "ecMul" => {
+                            if arg_nodes.len() != 2 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`ecMul` expects 2 arguments, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let point = self.check_expr(arg_nodes[0], scope, None)?;
+                            let point_u = self.underlying_type(&point.ty).clone();
+                            let Type::CurvePoint(curve) = point_u else {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    point.span,
+                                    format!(
+                                        "`ecMul` first argument must be an elliptic curve point, found `{}`",
+                                        self.format_type(&point.ty)
+                                    ),
+                                ));
+                                return None;
+                            };
+                            let expected_scalar = Type::CurveField(curve.scalar_field());
+                            let scalar =
+                                self.check_expr(arg_nodes[1], scope, Some(&expected_scalar))?;
+                            if *self.underlying_type(&scalar.ty) != expected_scalar {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    scalar.span,
+                                    format!(
+                                        "`ecMul` scalar mismatch: expected `{}`, found `{}`",
+                                        curve.scalar_field().type_name(),
+                                        self.format_type(&scalar.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::EcMul {
+                                    point: Box::new(point),
+                                    scalar: Box::new(scalar),
+                                },
+                                ty: Type::CurvePoint(curve),
+                                span,
+                            });
+                        }
+                        "ecMulGenerator" => {
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`ecMulGenerator` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let scalar = self.check_expr(arg_nodes[0], scope, None)?;
+                            let scalar_u = self.underlying_type(&scalar.ty).clone();
+                            let curve = match scalar_u {
+                                Type::CurveField(f) => f.scalar_curve(),
+                                _ => None,
+                            };
+                            let Some(curve) = curve else {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    scalar.span,
+                                    format!(
+                                        "`ecMulGenerator` expects a curve scalar field, found `{}`",
+                                        self.format_type(&scalar.ty)
+                                    ),
+                                ));
+                                return None;
+                            };
+                            return Some(Expr {
+                                kind: ExprKind::EcMulGenerator(Box::new(scalar)),
+                                ty: Type::CurvePoint(curve),
+                                span,
+                            });
+                        }
+                        "constructJubjubPoint" => {
+                            if arg_nodes.len() != 2 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`constructJubjubPoint` expects 2 arguments, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let mut x = self.check_expr(arg_nodes[0], scope, Some(&Type::Field))?;
+                            let mut y = self.check_expr(arg_nodes[1], scope, Some(&Type::Field))?;
+                            if !self.coerce_or_check(&mut x, &Type::Field) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    x.span,
+                                    format!(
+                                        "`constructJubjubPoint` x coordinate expects `Field`, found `{}`",
+                                        self.format_type(&x.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            if !self.coerce_or_check(&mut y, &Type::Field) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    y.span,
+                                    format!(
+                                        "`constructJubjubPoint` y coordinate expects `Field`, found `{}`",
+                                        self.format_type(&y.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::ConstructJubjubPoint {
+                                    x: Box::new(x),
+                                    y: Box::new(y),
+                                },
+                                ty: Type::CurvePoint(CurveKind::Jubjub),
+                                span,
+                            });
+                        }
+                        "jubjubPointX" | "jubjubPointY" | "secp256k1PointX" | "secp256k1PointY"
+                        | "secp256r1PointX" | "secp256r1PointY" | "curve25519PointX"
+                        | "curve25519PointY" => {
+                            let (curve, is_y) = match callee_name.as_str() {
+                                "jubjubPointX" => (CurveKind::Jubjub, false),
+                                "jubjubPointY" => (CurveKind::Jubjub, true),
+                                "secp256k1PointX" => (CurveKind::Secp256k1, false),
+                                "secp256k1PointY" => (CurveKind::Secp256k1, true),
+                                "secp256r1PointX" => (CurveKind::Secp256r1, false),
+                                "secp256r1PointY" => (CurveKind::Secp256r1, true),
+                                "curve25519PointX" => (CurveKind::Curve25519, false),
+                                "curve25519PointY" => (CurveKind::Curve25519, true),
+                                _ => unreachable!(),
+                            };
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`{callee_name}` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let expected = Type::CurvePoint(curve);
+                            let pt = self.check_expr(arg_nodes[0], scope, Some(&expected))?;
+                            if *self.underlying_type(&pt.ty) != expected {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    pt.span,
+                                    format!(
+                                        "`{callee_name}` expects `{}`, found `{}`",
+                                        curve.point_type_name(),
+                                        self.format_type(&pt.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::PointCoord {
+                                    point: Box::new(pt),
+                                    is_y,
+                                },
+                                ty: curve.coord_type(),
                                 span,
                             });
                         }
@@ -4910,6 +5260,102 @@ impl<'a> Analyzer<'a> {
                         arg: Box::new(arg),
                     },
                     ty: Type::Bytes(32),
+                    span: call_span,
+                })
+            }
+            "keccak256" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`keccak256<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut arg = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut arg, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        arg.span,
+                        format!(
+                            "`keccak256` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&arg.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Keccak256 {
+                        input_ty,
+                        arg: Box::new(arg),
+                    },
+                    ty: Type::Bytes(32),
+                    span: call_span,
+                })
+            }
+            "sha512" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`sha512<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut arg = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut arg, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        arg.span,
+                        format!(
+                            "`sha512` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&arg.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Sha512 {
+                        input_ty,
+                        arg: Box::new(arg),
+                    },
+                    ty: Type::Bytes(64),
+                    span: call_span,
+                })
+            }
+            "hashToCurve" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`hashToCurve<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut arg = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut arg, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        arg.span,
+                        format!(
+                            "`hashToCurve` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&arg.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::HashToCurve {
+                        input_ty,
+                        arg: Box::new(arg),
+                    },
+                    ty: Type::CurvePoint(CurveKind::Jubjub),
                     span: call_span,
                 })
             }
@@ -6162,13 +6608,30 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::Keccak256 { arg: operand, .. }
+        | ExprKind::Sha512 { arg: operand, .. }
         | ExprKind::TransientHash { arg: operand, .. }
         | ExprKind::DegradeToTransient(operand)
         | ExprKind::UpgradeFromTransient(operand)
+        | ExprKind::FieldInv(operand)
+        | ExprKind::EcNeg(operand)
+        | ExprKind::EcMulGenerator(operand)
+        | ExprKind::HashToCurve { arg: operand, .. }
+        | ExprKind::PointCoord { point: operand, .. }
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_effects(operand, calls),
+        ExprKind::EcAdd { lhs: a, rhs: b }
+        | ExprKind::EcMul {
+            point: a,
+            scalar: b,
+        }
+        | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+            let (l1, w1) = expr_effects(a, calls);
+            let (l2, w2) = expr_effects(b, calls);
+            (l1 | l2, w1 | w2)
+        }
         ExprKind::PersistentCommit { value, rand, .. }
         | ExprKind::TransientCommit { value, rand, .. } => {
             let (l1, w1) = expr_effects(value, calls);
@@ -6633,6 +7096,58 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("disclose")),
             "expected witness disclosure error through stdlib mintShieldedToken, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_curve_points_in_ec_add() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            export circuit bad_add(a: JubjubPoint, b: Secp256k1Point): JubjubPoint {
+              return ecAdd(a, b);
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked
+                .diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("ecAdd") && d.message.contains("mismatch")),
+            "expected curve mismatch error in ecAdd, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_arithmetic_on_curve_points() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            export circuit bad_plus(a: Secp256k1Point, b: Secp256k1Point): Secp256k1Point {
+              return a + b;
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked
+                .diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("arithmetic operator")),
+            "expected arithmetic operator rejection on curve points, got: {:?}",
             checked.diagnostics
         );
     }

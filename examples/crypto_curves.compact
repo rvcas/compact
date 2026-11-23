@@ -1,0 +1,74 @@
+pragma language_version >= 0.28;
+
+import CompactStandardLibrary;
+
+export { secp256k1EthereumAddress }
+
+export ledger verified_eth_address: Bytes<20>;
+export ledger jubjub_pk: JubjubPoint;
+export ledger secp_pk: Secp256k1Point;
+export ledger p256_pk: Secp256r1Point;
+export ledger ed_pk: Curve25519Point;
+export ledger field_acc: Secp256k1Base;
+export ledger digest_keccak: Bytes<32>;
+export ledger digest_sha512: Bytes<64>;
+
+export circuit verify_jubjub_schnorr(
+  msg: Vector<2, Field>,
+  sig: JubjubSchnorrSignature,
+  pk: JubjubPoint
+): Boolean {
+  assert(jubjubSchnorrVerify<2>(msg, sig, pk), "invalid schnorr signature");
+  const hashed = hashToCurve<Vector<2, Field>>(msg);
+  const reconstructed = constructJubjubPoint(jubjubPointX(hashed), jubjubPointY(hashed));
+  const cancelled = ecAdd(reconstructed, ecNeg(reconstructed));
+  assert(cancelled == default<JubjubPoint>, "ecNeg cancels point");
+  jubjub_pk = disclose(pk);
+  return true;
+}
+
+export circuit verify_secp256k1_and_eth(
+  msgHash: Bytes<32>,
+  sig: Secp256k1EcdsaSignature,
+  pk: Secp256k1Point
+): Bytes<20> {
+  assert(secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+  const addr = secp256k1EthereumAddress(pk);
+  verified_eth_address = disclose(addr);
+  secp_pk = disclose(pk);
+  return addr;
+}
+
+export circuit verify_secp256r1(
+  msgHash: Bytes<32>,
+  sig: Secp256r1EcdsaSignature,
+  pk: Secp256r1Point
+): Boolean {
+  assert(secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+  p256_pk = disclose(pk);
+  return true;
+}
+
+export circuit verify_ed25519(
+  msg: Bytes<32>,
+  sig: Ed25519Signature,
+  pk: Curve25519Point
+): Boolean {
+  assert(ed25519Verify<32>(msg, sig, pk), "invalid ed25519 signature");
+  ed_pk = disclose(pk);
+  return true;
+}
+
+export circuit foreign_field_and_hashes(
+  a: Secp256k1Base,
+  b: Secp256k1Base,
+  payload: Bytes<32>
+): Secp256k1Base {
+  const sum = a + b;
+  const diff = sum - neg(b);
+  const prod = diff * inv(b);
+  field_acc = disclose(prod);
+  digest_keccak = disclose(keccak256<Bytes<32>>(payload));
+  digest_sha512 = disclose(sha512<Bytes<32>>(payload));
+  return field_acc;
+}

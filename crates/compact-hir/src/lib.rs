@@ -221,12 +221,132 @@ impl LedgerOp {
     }
 }
 
+/// Elliptic curve families supported natively in Compact / ZKIR v3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurveKind {
+    Jubjub,
+    Secp256k1,
+    Secp256r1,
+    Curve25519,
+}
+
+impl CurveKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Jubjub => "Jubjub",
+            Self::Secp256k1 => "Secp256k1",
+            Self::Secp256r1 => "Secp256r1",
+            Self::Curve25519 => "Curve25519",
+        }
+    }
+
+    pub fn point_type_name(self) -> &'static str {
+        match self {
+            Self::Jubjub => "JubjubPoint",
+            Self::Secp256k1 => "Secp256k1Point",
+            Self::Secp256r1 => "Secp256r1Point",
+            Self::Curve25519 => "Curve25519Point",
+        }
+    }
+
+    pub fn scalar_field(self) -> CurveFieldKind {
+        match self {
+            Self::Jubjub => CurveFieldKind::JubjubScalar,
+            Self::Secp256k1 => CurveFieldKind::Secp256k1Scalar,
+            Self::Secp256r1 => CurveFieldKind::Secp256r1Scalar,
+            Self::Curve25519 => CurveFieldKind::Curve25519Scalar,
+        }
+    }
+
+    /// Coordinate type returned by `*PointX` / `*PointY` (`Field` for Jubjub, base field for foreign curves).
+    pub fn coord_type(self) -> Type {
+        match self {
+            Self::Jubjub => Type::Field,
+            Self::Secp256k1 => Type::CurveField(CurveFieldKind::Secp256k1Base),
+            Self::Secp256r1 => Type::CurveField(CurveFieldKind::Secp256r1Base),
+            Self::Curve25519 => Type::CurveField(CurveFieldKind::Curve25519Base),
+        }
+    }
+}
+
+/// Non-native prime field types associated with elliptic curves in Compact / ZKIR v3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurveFieldKind {
+    JubjubScalar,
+    Secp256k1Base,
+    Secp256k1Scalar,
+    Secp256r1Base,
+    Secp256r1Scalar,
+    Curve25519Base,
+    Curve25519Scalar,
+}
+
+impl CurveFieldKind {
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::JubjubScalar => "JubjubScalar",
+            Self::Secp256k1Base => "Secp256k1Base",
+            Self::Secp256k1Scalar => "Secp256k1Scalar",
+            Self::Secp256r1Base => "Secp256r1Base",
+            Self::Secp256r1Scalar => "Secp256r1Scalar",
+            Self::Curve25519Base => "Curve25519Base",
+            Self::Curve25519Scalar => "Curve25519Scalar",
+        }
+    }
+
+    /// Lowercase prefix for `__compactRuntime.<prefix>Add|Sub|Mul|Neg|Inv`.
+    pub fn runtime_prefix(self) -> &'static str {
+        match self {
+            Self::JubjubScalar => "jubjubScalar",
+            Self::Secp256k1Base => "secp256k1Base",
+            Self::Secp256k1Scalar => "secp256k1Scalar",
+            Self::Secp256r1Base => "secp256r1Base",
+            Self::Secp256r1Scalar => "secp256r1Scalar",
+            Self::Curve25519Base => "curve25519Base",
+            Self::Curve25519Scalar => "curve25519Scalar",
+        }
+    }
+
+    /// Uppercase constant suffix for `__compactRuntime.MAX_<CONST>`.
+    pub fn runtime_max_const(self) -> &'static str {
+        match self {
+            Self::JubjubScalar => "MAX_JUBJUB_SCALAR",
+            Self::Secp256k1Base => "MAX_SECP256K1_BASE",
+            Self::Secp256k1Scalar => "MAX_SECP256K1_SCALAR",
+            Self::Secp256r1Base => "MAX_SECP256R1_BASE",
+            Self::Secp256r1Scalar => "MAX_SECP256R1_SCALAR",
+            Self::Curve25519Base => "MAX_CURVE25519_BASE",
+            Self::Curve25519Scalar => "MAX_CURVE25519_SCALAR",
+        }
+    }
+
+    /// Curve whose scalar field this is, if it is a scalar field.
+    pub fn scalar_curve(self) -> Option<CurveKind> {
+        match self {
+            Self::JubjubScalar => Some(CurveKind::Jubjub),
+            Self::Secp256k1Scalar => Some(CurveKind::Secp256k1),
+            Self::Secp256r1Scalar => Some(CurveKind::Secp256r1),
+            Self::Curve25519Scalar => Some(CurveKind::Curve25519),
+            Self::Secp256k1Base | Self::Secp256r1Base | Self::Curve25519Base => None,
+        }
+    }
+
+    /// True for foreign 256-bit fields (all non-Jubjub base/scalar fields).
+    pub fn is_foreign(self) -> bool {
+        !matches!(self, Self::JubjubScalar)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Field,
     Boolean,
     Uint(u32),
     Bytes(u32),
+    /// Non-native elliptic curve base or scalar prime field.
+    CurveField(CurveFieldKind),
+    /// Elliptic curve point (`JubjubPoint`, `Secp256k1Point`, `Secp256r1Point`, `Curve25519Point`).
+    CurvePoint(CurveKind),
     /// Opaque host type (e.g. `Opaque<"string">`, `Opaque<"Uint8Array">`).
     Opaque(String),
     Vector(u32, Box<Type>),
@@ -432,6 +552,14 @@ pub enum ExprKind {
         input_ty: Type,
         arg: Box<Expr>,
     },
+    Keccak256 {
+        input_ty: Type,
+        arg: Box<Expr>,
+    },
+    Sha512 {
+        input_ty: Type,
+        arg: Box<Expr>,
+    },
     TransientHash {
         input_ty: Type,
         arg: Box<Expr>,
@@ -448,6 +576,37 @@ pub enum ExprKind {
     },
     DegradeToTransient(Box<Expr>),
     UpgradeFromTransient(Box<Expr>),
+    /// Multiplicative inverse in a foreign prime field (`inv(s)`).
+    FieldInv(Box<Expr>),
+    /// Elliptic curve point addition (`ecAdd(a, b)`).
+    EcAdd {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Elliptic curve point negation (`ecNeg(a)` on `JubjubPoint`).
+    EcNeg(Box<Expr>),
+    /// Elliptic curve scalar multiplication (`ecMul(pt, scalar)`).
+    EcMul {
+        point: Box<Expr>,
+        scalar: Box<Expr>,
+    },
+    /// Elliptic curve generator multiplication (`ecMulGenerator(scalar)`).
+    EcMulGenerator(Box<Expr>),
+    /// Hash arbitrary Compact value to a `JubjubPoint` (`hashToCurve<T>(val)`).
+    HashToCurve {
+        input_ty: Type,
+        arg: Box<Expr>,
+    },
+    /// Construct a `JubjubPoint` from `(x: Field, y: Field)` affine coordinates.
+    ConstructJubjubPoint {
+        x: Box<Expr>,
+        y: Box<Expr>,
+    },
+    /// Extract the affine X (`is_y = false`) or Y (`is_y = true`) coordinate of a curve point.
+    PointCoord {
+        point: Box<Expr>,
+        is_y: bool,
+    },
     /// Pack `N` `Uint<8>` byte expressions into a `Bytes<N>` value (`Bytes[b0, b1, ...]`).
     BytesPack(Vec<Expr>),
     /// Scoped block expression evaluating `stmts` in order and yielding `tail`.
@@ -636,6 +795,8 @@ impl Program {
             Type::Boolean => "Boolean".into(),
             Type::Uint(bits) => format!("Uint<{bits}>"),
             Type::Bytes(len) => format!("Bytes<{len}>"),
+            Type::CurveField(f) => f.type_name().into(),
+            Type::CurvePoint(c) => c.point_type_name().into(),
             Type::Opaque(ts_ty) => format!("Opaque<\"{ts_ty}\">"),
             Type::Vector(len, elem) => format!("Vector<{len}, {}>", self.format_type(elem)),
             Type::Tuple(elems) => {

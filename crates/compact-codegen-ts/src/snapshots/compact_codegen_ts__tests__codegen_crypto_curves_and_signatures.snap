@@ -1,0 +1,979 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+pragma language_version >= 0.28;
+
+import CompactStandardLibrary;
+
+export { secp256k1EthereumAddress }
+
+export ledger verified_eth_address: Bytes<20>;
+export ledger jubjub_pk: JubjubPoint;
+export ledger secp_pk: Secp256k1Point;
+export ledger p256_pk: Secp256r1Point;
+export ledger ed_pk: Curve25519Point;
+export ledger field_acc: Secp256k1Base;
+export ledger digest_keccak: Bytes<32>;
+export ledger digest_sha512: Bytes<64>;
+
+export circuit verify_jubjub_schnorr(
+  msg: Vector<2, Field>,
+  sig: JubjubSchnorrSignature,
+  pk: JubjubPoint
+): Boolean {
+  assert(jubjubSchnorrVerify<2>(msg, sig, pk), "invalid schnorr signature");
+  const hashed = hashToCurve<Vector<2, Field>>(msg);
+  const reconstructed = constructJubjubPoint(jubjubPointX(hashed), jubjubPointY(hashed));
+  const cancelled = ecAdd(reconstructed, ecNeg(reconstructed));
+  assert(cancelled == default<JubjubPoint>, "ecNeg cancels point");
+  jubjub_pk = disclose(pk);
+  return true;
+}
+
+export circuit verify_secp256k1_and_eth(
+  msgHash: Bytes<32>,
+  sig: Secp256k1EcdsaSignature,
+  pk: Secp256k1Point
+): Bytes<20> {
+  assert(secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+  const addr = secp256k1EthereumAddress(pk);
+  verified_eth_address = disclose(addr);
+  secp_pk = disclose(pk);
+  return addr;
+}
+
+export circuit verify_secp256r1(
+  msgHash: Bytes<32>,
+  sig: Secp256r1EcdsaSignature,
+  pk: Secp256r1Point
+): Boolean {
+  assert(secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+  p256_pk = disclose(pk);
+  return true;
+}
+
+export circuit verify_ed25519(
+  msg: Bytes<32>,
+  sig: Ed25519Signature,
+  pk: Curve25519Point
+): Boolean {
+  assert(ed25519Verify<32>(msg, sig, pk), "invalid ed25519 signature");
+  ed_pk = disclose(pk);
+  return true;
+}
+
+export circuit foreign_field_and_hashes(
+  a: Secp256k1Base,
+  b: Secp256k1Base,
+  payload: Bytes<32>
+): Secp256k1Base {
+  const sum = a + b;
+  const diff = sum - neg(b);
+  const prod = diff * inv(b);
+  field_acc = disclose(prod);
+  digest_keccak = disclose(keccak256<Bytes<32>>(payload));
+  digest_sha512 = disclose(sha512<Bytes<32>>(payload));
+  return field_acc;
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type JubjubSchnorrSignature = {
+	announcement: __compactRuntime.JubjubPoint;
+	response: bigint;
+};
+type Secp256k1EcdsaSignature = {
+	r: bigint;
+	s: bigint;
+};
+type Secp256r1EcdsaSignature = {
+	r: bigint;
+	s: bigint;
+};
+type Ed25519Signature = {
+	r: __compactRuntime.Curve25519Point;
+	s: bigint;
+};
+type JubjubSchnorrHashInput_2 = {
+	annX: bigint;
+	annY: bigint;
+	pkX: bigint;
+	pkY: bigint;
+	msg: [bigint, bigint];
+};
+function _secp256k1EthereumAddress(pk: __compactRuntime.Secp256k1Point): Uint8Array {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+	const hash: Uint8Array = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+	return hash.slice(12, 32);
+}
+function _jubjubSchnorrVerify_2(msg: [bigint, bigint], signature: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): boolean {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 1n
+	}), "JubjubPoint identity is not a permitted jubjubSchnorrVerify verification key");
+	const __pat_0: JubjubSchnorrSignature = signature;
+	const announcement: __compactRuntime.JubjubPoint = __pat_0.announcement;
+	const response: bigint = __pat_0.response;
+	const cNative: bigint = __compactRuntime.transientHash({
+		annX: __compactRuntime.jubjubPointX(announcement),
+		annY: __compactRuntime.jubjubPointY(announcement),
+		pkX: __compactRuntime.jubjubPointX(pk),
+		pkY: __compactRuntime.jubjubPointY(pk),
+		msg
+	});
+	const c: bigint = __compactRuntime.convertNumericToJubjubScalar(cNative);
+	const lhs: __compactRuntime.JubjubPoint = __compactRuntime.ecMulGenerator(__compactRuntime.convertNumericToJubjubScalar(response));
+	const rhs: __compactRuntime.JubjubPoint = __compactRuntime.ecAdd(announcement, __compactRuntime.ecMul(pk, c));
+	return __compactRuntime.equal(lhs, rhs);
+}
+function _secp256k1EcdsaVerify(msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): boolean {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted secp256k1EcdsaVerify verification key");
+	const z: bigint = __compactRuntime.convertBytesToField(_reverseBytes32(msgHash), __compactRuntime.MAX_SECP256K1_SCALAR);
+	const __pat_1: Secp256k1EcdsaSignature = sig;
+	const r: bigint = __pat_1.r;
+	const s: bigint = __pat_1.s;
+	const w: bigint = __compactRuntime.secp256k1ScalarInv(s);
+	const u1: bigint = __compactRuntime.secp256k1ScalarMul(z, w);
+	const u2: bigint = __compactRuntime.secp256k1ScalarMul(r, w);
+	const point: __compactRuntime.Secp256k1Point = __compactRuntime.secp256k1Add(__compactRuntime.secp256k1MulGenerator(u1), __compactRuntime.secp256k1Mul(pk, u2));
+	return __compactRuntime.convertBytesToField(__compactRuntime.convertBigintToBytes(32, __compactRuntime.secp256k1PointX(point)), __compactRuntime.MAX_SECP256K1_SCALAR) === r;
+}
+function _secp256r1EcdsaVerify(msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): boolean {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256r1Point identity is not a permitted secp256r1EcdsaVerify verification key");
+	const z: bigint = __compactRuntime.convertBytesToField(_reverseBytes32(msgHash), __compactRuntime.MAX_SECP256R1_SCALAR);
+	const __pat_1: Secp256r1EcdsaSignature = sig;
+	const r: bigint = __pat_1.r;
+	const s: bigint = __pat_1.s;
+	const w: bigint = __compactRuntime.secp256r1ScalarInv(s);
+	const u1: bigint = __compactRuntime.secp256r1ScalarMul(z, w);
+	const u2: bigint = __compactRuntime.secp256r1ScalarMul(r, w);
+	const point: __compactRuntime.Secp256r1Point = __compactRuntime.secp256r1Add(__compactRuntime.secp256r1MulGenerator(u1), __compactRuntime.secp256r1Mul(pk, u2));
+	return __compactRuntime.convertBytesToField(__compactRuntime.convertBigintToBytes(32, __compactRuntime.secp256r1PointX(point)), __compactRuntime.MAX_SECP256R1_SCALAR) === r;
+}
+function _ed25519Verify_32(msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): boolean {
+	__compactRuntime.assert(!__compactRuntime.equal(__compactRuntime.convertBigintToBytes(32, __compactRuntime.curve25519PointX(pk)), new Uint8Array([
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	])), "Curve25519Point identity is not a permitted ed25519Verify verification key");
+	const __pat_0: Ed25519Signature = sig;
+	const r: __compactRuntime.Curve25519Point = __pat_0.r;
+	const s: bigint = __pat_0.s;
+	const k: bigint = __compactRuntime.convertBytesToField(__compactRuntime.sha512([
+		_ed25519Encode(r),
+		_ed25519Encode(pk),
+		msg
+	]), __compactRuntime.MAX_CURVE25519_SCALAR);
+	return __compactRuntime.equal(__compactRuntime.curve25519MulGenerator(s), __compactRuntime.curve25519Add(r, __compactRuntime.curve25519Mul(pk, k)));
+}
+function _secp256k1BaseBigEndian(b: bigint): [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] {
+	const vec: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = Array.from(__compactRuntime.convertBigintToBytes(32, b), (b) => {
+		return BigInt(b);
+	});
+	return [
+		vec[31],
+		vec[30],
+		vec[29],
+		vec[28],
+		vec[27],
+		vec[26],
+		vec[25],
+		vec[24],
+		vec[23],
+		vec[22],
+		vec[21],
+		vec[20],
+		vec[19],
+		vec[18],
+		vec[17],
+		vec[16],
+		vec[15],
+		vec[14],
+		vec[13],
+		vec[12],
+		vec[11],
+		vec[10],
+		vec[9],
+		vec[8],
+		vec[7],
+		vec[6],
+		vec[5],
+		vec[4],
+		vec[3],
+		vec[2],
+		vec[1],
+		vec[0]
+	];
+}
+function _reverseBytes32(b: Uint8Array): Uint8Array {
+	const v: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = Array.from(b, (b) => {
+		return BigInt(b);
+	});
+	return new Uint8Array([
+		Number(v[31]),
+		Number(v[30]),
+		Number(v[29]),
+		Number(v[28]),
+		Number(v[27]),
+		Number(v[26]),
+		Number(v[25]),
+		Number(v[24]),
+		Number(v[23]),
+		Number(v[22]),
+		Number(v[21]),
+		Number(v[20]),
+		Number(v[19]),
+		Number(v[18]),
+		Number(v[17]),
+		Number(v[16]),
+		Number(v[15]),
+		Number(v[14]),
+		Number(v[13]),
+		Number(v[12]),
+		Number(v[11]),
+		Number(v[10]),
+		Number(v[9]),
+		Number(v[8]),
+		Number(v[7]),
+		Number(v[6]),
+		Number(v[5]),
+		Number(v[4]),
+		Number(v[3]),
+		Number(v[2]),
+		Number(v[1]),
+		Number(v[0])
+	]);
+}
+function _ed25519Encode(p: __compactRuntime.Curve25519Point): Uint8Array {
+	const y: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = Array.from(__compactRuntime.convertBigintToBytes(32, __compactRuntime.curve25519PointY(p)), (b) => {
+		return BigInt(b);
+	});
+	const sign: bigint = _curve25519BaseIsOdd(__compactRuntime.curve25519PointX(p)) ? 128n : 0n;
+	return new Uint8Array([
+		Number(y[0]),
+		Number(y[1]),
+		Number(y[2]),
+		Number(y[3]),
+		Number(y[4]),
+		Number(y[5]),
+		Number(y[6]),
+		Number(y[7]),
+		Number(y[8]),
+		Number(y[9]),
+		Number(y[10]),
+		Number(y[11]),
+		Number(y[12]),
+		Number(y[13]),
+		Number(y[14]),
+		Number(y[15]),
+		Number(y[16]),
+		Number(y[17]),
+		Number(y[18]),
+		Number(y[19]),
+		Number(y[20]),
+		Number(y[21]),
+		Number(y[22]),
+		Number(y[23]),
+		Number(y[24]),
+		Number(y[25]),
+		Number(y[26]),
+		Number(y[27]),
+		Number(y[28]),
+		Number(y[29]),
+		Number(y[30]),
+		Number(y[31] + sign)
+	]);
+}
+function _curve25519BaseIsOdd(x: bigint): boolean {
+	const b: bigint = Array.from(__compactRuntime.convertBigintToBytes(32, x), (b) => {
+		return BigInt(b);
+	})[0];
+	const b6: bigint = b >= 128n ? b - 128n : b;
+	const b5: bigint = b6 >= 64n ? b6 - 64n : b6;
+	const b4: bigint = b5 >= 32n ? b5 - 32n : b5;
+	const b3: bigint = b4 >= 16n ? b4 - 16n : b4;
+	const b2: bigint = b3 >= 8n ? b3 - 8n : b3;
+	const b1: bigint = b2 >= 4n ? b2 - 4n : b2;
+	return (b1 >= 2n ? b1 - 2n : b1) === 1n;
+}
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	verify_jubjub_schnorr(context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean>;
+	verify_secp256k1_and_eth(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+	verify_secp256r1(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean>;
+	verify_ed25519(context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean>;
+	foreign_field_and_hashes(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type PureCircuits = {
+	secp256k1EthereumAddress(pk: __compactRuntime.Secp256k1Point): Uint8Array;
+};
+export type Circuits<T> = {
+	verify_jubjub_schnorr(context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean>;
+	verify_secp256k1_and_eth(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+	verify_secp256r1(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean>;
+	verify_ed25519(context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean>;
+	foreign_field_and_hashes(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint>;
+	secp256k1EthereumAddress(context: __compactRuntime.CircuitContext<T>, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+};
+export type Ledger = {
+	readonly verified_eth_address: Uint8Array;
+	readonly jubjub_pk: __compactRuntime.JubjubPoint;
+	readonly secp_pk: __compactRuntime.Secp256k1Point;
+	readonly p256_pk: __compactRuntime.Secp256r1Point;
+	readonly ed_pk: __compactRuntime.Curve25519Point;
+	readonly field_acc: bigint;
+	readonly digest_keccak: Uint8Array;
+	readonly digest_sha512: Uint8Array;
+};
+export const pureCircuits: PureCircuits = { secp256k1EthereumAddress: (pk: __compactRuntime.Secp256k1Point): Uint8Array => {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+	const hash: Uint8Array = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+	return hash.slice(12, 32);
+} };
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {
+		verified_eth_address: __compactRuntime.decodeCell(state, 0),
+		jubjub_pk: __compactRuntime.decodeCell(state, 1),
+		secp_pk: __compactRuntime.decodeCell(state, 2),
+		p256_pk: __compactRuntime.decodeCell(state, 3),
+		ed_pk: __compactRuntime.decodeCell(state, 4),
+		field_acc: __compactRuntime.decodeCell(state, 5),
+		digest_keccak: __compactRuntime.decodeCell(state, 6),
+		digest_sha512: __compactRuntime.decodeCell(state, 7)
+	};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			verify_jubjub_schnorr: (context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_jubjubSchnorrVerify_2(msg, sig, pk), "invalid schnorr signature");
+				const hashed: __compactRuntime.JubjubPoint = __compactRuntime.hashToCurve(msg);
+				const reconstructed: __compactRuntime.JubjubPoint = __compactRuntime.constructJubjubPoint(__compactRuntime.jubjubPointX(hashed), __compactRuntime.jubjubPointY(hashed));
+				const cancelled: __compactRuntime.JubjubPoint = __compactRuntime.ecAdd(reconstructed, __compactRuntime.ecNeg(reconstructed));
+				__compactRuntime.assert(__compactRuntime.equal(cancelled, {
+					x: 0n,
+					y: 1n
+				}), "ecNeg cancels point");
+				__compactRuntime.writeCell(context, 1, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_secp256k1_and_eth: (context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array> => {
+				__compactRuntime.assert(_secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+				const addr: Uint8Array = _secp256k1EthereumAddress(pk);
+				__compactRuntime.writeCell(context, 0, addr);
+				__compactRuntime.writeCell(context, 2, pk);
+				return {
+					result: addr,
+					context
+				};
+			},
+			verify_secp256r1: (context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+				__compactRuntime.writeCell(context, 3, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_ed25519: (context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_ed25519Verify_32(msg, sig, pk), "invalid ed25519 signature");
+				__compactRuntime.writeCell(context, 4, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			foreign_field_and_hashes: (context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint> => {
+				const sum: bigint = __compactRuntime.secp256k1BaseAdd(a, b);
+				const diff: bigint = __compactRuntime.secp256k1BaseSub(sum, __compactRuntime.secp256k1BaseNeg(b));
+				const prod: bigint = __compactRuntime.secp256k1BaseMul(diff, __compactRuntime.secp256k1BaseInv(b));
+				__compactRuntime.writeCell(context, 5, prod);
+				__compactRuntime.writeCell(context, 6, __compactRuntime.keccak256(payload));
+				__compactRuntime.writeCell(context, 7, __compactRuntime.sha512(payload));
+				return {
+					result: __compactRuntime.readCell(context, 5),
+					context
+				};
+			}
+		};
+		this.circuits = {
+			verify_jubjub_schnorr: (context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_jubjubSchnorrVerify_2(msg, sig, pk), "invalid schnorr signature");
+				const hashed: __compactRuntime.JubjubPoint = __compactRuntime.hashToCurve(msg);
+				const reconstructed: __compactRuntime.JubjubPoint = __compactRuntime.constructJubjubPoint(__compactRuntime.jubjubPointX(hashed), __compactRuntime.jubjubPointY(hashed));
+				const cancelled: __compactRuntime.JubjubPoint = __compactRuntime.ecAdd(reconstructed, __compactRuntime.ecNeg(reconstructed));
+				__compactRuntime.assert(__compactRuntime.equal(cancelled, {
+					x: 0n,
+					y: 1n
+				}), "ecNeg cancels point");
+				__compactRuntime.writeCell(context, 1, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_secp256k1_and_eth: (context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array> => {
+				__compactRuntime.assert(_secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+				const addr: Uint8Array = _secp256k1EthereumAddress(pk);
+				__compactRuntime.writeCell(context, 0, addr);
+				__compactRuntime.writeCell(context, 2, pk);
+				return {
+					result: addr,
+					context
+				};
+			},
+			verify_secp256r1: (context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+				__compactRuntime.writeCell(context, 3, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_ed25519: (context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_ed25519Verify_32(msg, sig, pk), "invalid ed25519 signature");
+				__compactRuntime.writeCell(context, 4, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			foreign_field_and_hashes: (context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint> => {
+				const sum: bigint = __compactRuntime.secp256k1BaseAdd(a, b);
+				const diff: bigint = __compactRuntime.secp256k1BaseSub(sum, __compactRuntime.secp256k1BaseNeg(b));
+				const prod: bigint = __compactRuntime.secp256k1BaseMul(diff, __compactRuntime.secp256k1BaseInv(b));
+				__compactRuntime.writeCell(context, 5, prod);
+				__compactRuntime.writeCell(context, 6, __compactRuntime.keccak256(payload));
+				__compactRuntime.writeCell(context, 7, __compactRuntime.sha512(payload));
+				return {
+					result: __compactRuntime.readCell(context, 5),
+					context
+				};
+			},
+			secp256k1EthereumAddress: (context: __compactRuntime.CircuitContext<T>, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array> => {
+				__compactRuntime.assert(!__compactRuntime.equal(pk, {
+					x: 0n,
+					y: 0n,
+					identity: true
+				}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+				const hash: Uint8Array = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+				return {
+					result: hash.slice(12, 32),
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+function _secp256k1EthereumAddress(pk) {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+	const hash = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+	return hash.slice(12, 32);
+}
+function _jubjubSchnorrVerify_2(msg, signature, pk) {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 1n
+	}), "JubjubPoint identity is not a permitted jubjubSchnorrVerify verification key");
+	const __pat_0 = signature;
+	const announcement = __pat_0.announcement;
+	const response = __pat_0.response;
+	const cNative = __compactRuntime.transientHash({
+		annX: __compactRuntime.jubjubPointX(announcement),
+		annY: __compactRuntime.jubjubPointY(announcement),
+		pkX: __compactRuntime.jubjubPointX(pk),
+		pkY: __compactRuntime.jubjubPointY(pk),
+		msg
+	});
+	const c = __compactRuntime.convertNumericToJubjubScalar(cNative);
+	const lhs = __compactRuntime.ecMulGenerator(__compactRuntime.convertNumericToJubjubScalar(response));
+	const rhs = __compactRuntime.ecAdd(announcement, __compactRuntime.ecMul(pk, c));
+	return __compactRuntime.equal(lhs, rhs);
+}
+function _secp256k1EcdsaVerify(msgHash, sig, pk) {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted secp256k1EcdsaVerify verification key");
+	const z = __compactRuntime.convertBytesToField(_reverseBytes32(msgHash), __compactRuntime.MAX_SECP256K1_SCALAR);
+	const __pat_1 = sig;
+	const r = __pat_1.r;
+	const s = __pat_1.s;
+	const w = __compactRuntime.secp256k1ScalarInv(s);
+	const u1 = __compactRuntime.secp256k1ScalarMul(z, w);
+	const u2 = __compactRuntime.secp256k1ScalarMul(r, w);
+	const point = __compactRuntime.secp256k1Add(__compactRuntime.secp256k1MulGenerator(u1), __compactRuntime.secp256k1Mul(pk, u2));
+	return __compactRuntime.convertBytesToField(__compactRuntime.convertBigintToBytes(32, __compactRuntime.secp256k1PointX(point)), __compactRuntime.MAX_SECP256K1_SCALAR) === r;
+}
+function _secp256r1EcdsaVerify(msgHash, sig, pk) {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256r1Point identity is not a permitted secp256r1EcdsaVerify verification key");
+	const z = __compactRuntime.convertBytesToField(_reverseBytes32(msgHash), __compactRuntime.MAX_SECP256R1_SCALAR);
+	const __pat_1 = sig;
+	const r = __pat_1.r;
+	const s = __pat_1.s;
+	const w = __compactRuntime.secp256r1ScalarInv(s);
+	const u1 = __compactRuntime.secp256r1ScalarMul(z, w);
+	const u2 = __compactRuntime.secp256r1ScalarMul(r, w);
+	const point = __compactRuntime.secp256r1Add(__compactRuntime.secp256r1MulGenerator(u1), __compactRuntime.secp256r1Mul(pk, u2));
+	return __compactRuntime.convertBytesToField(__compactRuntime.convertBigintToBytes(32, __compactRuntime.secp256r1PointX(point)), __compactRuntime.MAX_SECP256R1_SCALAR) === r;
+}
+function _ed25519Verify_32(msg, sig, pk) {
+	__compactRuntime.assert(!__compactRuntime.equal(__compactRuntime.convertBigintToBytes(32, __compactRuntime.curve25519PointX(pk)), new Uint8Array([
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	])), "Curve25519Point identity is not a permitted ed25519Verify verification key");
+	const __pat_0 = sig;
+	const r = __pat_0.r;
+	const s = __pat_0.s;
+	const k = __compactRuntime.convertBytesToField(__compactRuntime.sha512([
+		_ed25519Encode(r),
+		_ed25519Encode(pk),
+		msg
+	]), __compactRuntime.MAX_CURVE25519_SCALAR);
+	return __compactRuntime.equal(__compactRuntime.curve25519MulGenerator(s), __compactRuntime.curve25519Add(r, __compactRuntime.curve25519Mul(pk, k)));
+}
+function _secp256k1BaseBigEndian(b) {
+	const vec = Array.from(__compactRuntime.convertBigintToBytes(32, b), (b) => {
+		return BigInt(b);
+	});
+	return [
+		vec[31],
+		vec[30],
+		vec[29],
+		vec[28],
+		vec[27],
+		vec[26],
+		vec[25],
+		vec[24],
+		vec[23],
+		vec[22],
+		vec[21],
+		vec[20],
+		vec[19],
+		vec[18],
+		vec[17],
+		vec[16],
+		vec[15],
+		vec[14],
+		vec[13],
+		vec[12],
+		vec[11],
+		vec[10],
+		vec[9],
+		vec[8],
+		vec[7],
+		vec[6],
+		vec[5],
+		vec[4],
+		vec[3],
+		vec[2],
+		vec[1],
+		vec[0]
+	];
+}
+function _reverseBytes32(b) {
+	const v = Array.from(b, (b) => {
+		return BigInt(b);
+	});
+	return new Uint8Array([
+		Number(v[31]),
+		Number(v[30]),
+		Number(v[29]),
+		Number(v[28]),
+		Number(v[27]),
+		Number(v[26]),
+		Number(v[25]),
+		Number(v[24]),
+		Number(v[23]),
+		Number(v[22]),
+		Number(v[21]),
+		Number(v[20]),
+		Number(v[19]),
+		Number(v[18]),
+		Number(v[17]),
+		Number(v[16]),
+		Number(v[15]),
+		Number(v[14]),
+		Number(v[13]),
+		Number(v[12]),
+		Number(v[11]),
+		Number(v[10]),
+		Number(v[9]),
+		Number(v[8]),
+		Number(v[7]),
+		Number(v[6]),
+		Number(v[5]),
+		Number(v[4]),
+		Number(v[3]),
+		Number(v[2]),
+		Number(v[1]),
+		Number(v[0])
+	]);
+}
+function _ed25519Encode(p) {
+	const y = Array.from(__compactRuntime.convertBigintToBytes(32, __compactRuntime.curve25519PointY(p)), (b) => {
+		return BigInt(b);
+	});
+	const sign = _curve25519BaseIsOdd(__compactRuntime.curve25519PointX(p)) ? 128n : 0n;
+	return new Uint8Array([
+		Number(y[0]),
+		Number(y[1]),
+		Number(y[2]),
+		Number(y[3]),
+		Number(y[4]),
+		Number(y[5]),
+		Number(y[6]),
+		Number(y[7]),
+		Number(y[8]),
+		Number(y[9]),
+		Number(y[10]),
+		Number(y[11]),
+		Number(y[12]),
+		Number(y[13]),
+		Number(y[14]),
+		Number(y[15]),
+		Number(y[16]),
+		Number(y[17]),
+		Number(y[18]),
+		Number(y[19]),
+		Number(y[20]),
+		Number(y[21]),
+		Number(y[22]),
+		Number(y[23]),
+		Number(y[24]),
+		Number(y[25]),
+		Number(y[26]),
+		Number(y[27]),
+		Number(y[28]),
+		Number(y[29]),
+		Number(y[30]),
+		Number(y[31] + sign)
+	]);
+}
+function _curve25519BaseIsOdd(x) {
+	const b = Array.from(__compactRuntime.convertBigintToBytes(32, x), (b) => {
+		return BigInt(b);
+	})[0];
+	const b6 = b >= 128n ? b - 128n : b;
+	const b5 = b6 >= 64n ? b6 - 64n : b6;
+	const b4 = b5 >= 32n ? b5 - 32n : b5;
+	const b3 = b4 >= 16n ? b4 - 16n : b4;
+	const b2 = b3 >= 8n ? b3 - 8n : b3;
+	const b1 = b2 >= 4n ? b2 - 4n : b2;
+	return (b1 >= 2n ? b1 - 2n : b1) === 1n;
+}
+export const pureCircuits = { secp256k1EthereumAddress: (pk) => {
+	__compactRuntime.assert(!__compactRuntime.equal(pk, {
+		x: 0n,
+		y: 0n,
+		identity: true
+	}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+	const hash = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+	return hash.slice(12, 32);
+} };
+export const ledger = (state) => {
+	return {
+		verified_eth_address: __compactRuntime.decodeCell(state, 0),
+		jubjub_pk: __compactRuntime.decodeCell(state, 1),
+		secp_pk: __compactRuntime.decodeCell(state, 2),
+		p256_pk: __compactRuntime.decodeCell(state, 3),
+		ed_pk: __compactRuntime.decodeCell(state, 4),
+		field_acc: __compactRuntime.decodeCell(state, 5),
+		digest_keccak: __compactRuntime.decodeCell(state, 6),
+		digest_sha512: __compactRuntime.decodeCell(state, 7)
+	};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			verify_jubjub_schnorr: (context, msg, sig, pk) => {
+				__compactRuntime.assert(_jubjubSchnorrVerify_2(msg, sig, pk), "invalid schnorr signature");
+				const hashed = __compactRuntime.hashToCurve(msg);
+				const reconstructed = __compactRuntime.constructJubjubPoint(__compactRuntime.jubjubPointX(hashed), __compactRuntime.jubjubPointY(hashed));
+				const cancelled = __compactRuntime.ecAdd(reconstructed, __compactRuntime.ecNeg(reconstructed));
+				__compactRuntime.assert(__compactRuntime.equal(cancelled, {
+					x: 0n,
+					y: 1n
+				}), "ecNeg cancels point");
+				__compactRuntime.writeCell(context, 1, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_secp256k1_and_eth: (context, msgHash, sig, pk) => {
+				__compactRuntime.assert(_secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+				const addr = _secp256k1EthereumAddress(pk);
+				__compactRuntime.writeCell(context, 0, addr);
+				__compactRuntime.writeCell(context, 2, pk);
+				return {
+					result: addr,
+					context
+				};
+			},
+			verify_secp256r1: (context, msgHash, sig, pk) => {
+				__compactRuntime.assert(_secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+				__compactRuntime.writeCell(context, 3, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_ed25519: (context, msg, sig, pk) => {
+				__compactRuntime.assert(_ed25519Verify_32(msg, sig, pk), "invalid ed25519 signature");
+				__compactRuntime.writeCell(context, 4, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			foreign_field_and_hashes: (context, a, b, payload) => {
+				const sum = __compactRuntime.secp256k1BaseAdd(a, b);
+				const diff = __compactRuntime.secp256k1BaseSub(sum, __compactRuntime.secp256k1BaseNeg(b));
+				const prod = __compactRuntime.secp256k1BaseMul(diff, __compactRuntime.secp256k1BaseInv(b));
+				__compactRuntime.writeCell(context, 5, prod);
+				__compactRuntime.writeCell(context, 6, __compactRuntime.keccak256(payload));
+				__compactRuntime.writeCell(context, 7, __compactRuntime.sha512(payload));
+				return {
+					result: __compactRuntime.readCell(context, 5),
+					context
+				};
+			}
+		};
+		this.circuits = {
+			verify_jubjub_schnorr: (context, msg, sig, pk) => {
+				__compactRuntime.assert(_jubjubSchnorrVerify_2(msg, sig, pk), "invalid schnorr signature");
+				const hashed = __compactRuntime.hashToCurve(msg);
+				const reconstructed = __compactRuntime.constructJubjubPoint(__compactRuntime.jubjubPointX(hashed), __compactRuntime.jubjubPointY(hashed));
+				const cancelled = __compactRuntime.ecAdd(reconstructed, __compactRuntime.ecNeg(reconstructed));
+				__compactRuntime.assert(__compactRuntime.equal(cancelled, {
+					x: 0n,
+					y: 1n
+				}), "ecNeg cancels point");
+				__compactRuntime.writeCell(context, 1, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_secp256k1_and_eth: (context, msgHash, sig, pk) => {
+				__compactRuntime.assert(_secp256k1EcdsaVerify(msgHash, sig, pk), "invalid secp256k1 signature");
+				const addr = _secp256k1EthereumAddress(pk);
+				__compactRuntime.writeCell(context, 0, addr);
+				__compactRuntime.writeCell(context, 2, pk);
+				return {
+					result: addr,
+					context
+				};
+			},
+			verify_secp256r1: (context, msgHash, sig, pk) => {
+				__compactRuntime.assert(_secp256r1EcdsaVerify(msgHash, sig, pk), "invalid secp256r1 signature");
+				__compactRuntime.writeCell(context, 3, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			verify_ed25519: (context, msg, sig, pk) => {
+				__compactRuntime.assert(_ed25519Verify_32(msg, sig, pk), "invalid ed25519 signature");
+				__compactRuntime.writeCell(context, 4, pk);
+				return {
+					result: true,
+					context
+				};
+			},
+			foreign_field_and_hashes: (context, a, b, payload) => {
+				const sum = __compactRuntime.secp256k1BaseAdd(a, b);
+				const diff = __compactRuntime.secp256k1BaseSub(sum, __compactRuntime.secp256k1BaseNeg(b));
+				const prod = __compactRuntime.secp256k1BaseMul(diff, __compactRuntime.secp256k1BaseInv(b));
+				__compactRuntime.writeCell(context, 5, prod);
+				__compactRuntime.writeCell(context, 6, __compactRuntime.keccak256(payload));
+				__compactRuntime.writeCell(context, 7, __compactRuntime.sha512(payload));
+				return {
+					result: __compactRuntime.readCell(context, 5),
+					context
+				};
+			},
+			secp256k1EthereumAddress: (context, pk) => {
+				__compactRuntime.assert(!__compactRuntime.equal(pk, {
+					x: 0n,
+					y: 0n,
+					identity: true
+				}), "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+				const hash = __compactRuntime.keccak256([_secp256k1BaseBigEndian(__compactRuntime.secp256k1PointX(pk)), _secp256k1BaseBigEndian(__compactRuntime.secp256k1PointY(pk))]);
+				return {
+					result: hash.slice(12, 32),
+					context
+				};
+			}
+		};
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type JubjubSchnorrSignature = {
+	announcement: __compactRuntime.JubjubPoint;
+	response: bigint;
+};
+type Secp256k1EcdsaSignature = {
+	r: bigint;
+	s: bigint;
+};
+type Secp256r1EcdsaSignature = {
+	r: bigint;
+	s: bigint;
+};
+type Ed25519Signature = {
+	r: __compactRuntime.Curve25519Point;
+	s: bigint;
+};
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	verify_jubjub_schnorr(context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean>;
+	verify_secp256k1_and_eth(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+	verify_secp256r1(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean>;
+	verify_ed25519(context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean>;
+	foreign_field_and_hashes(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint>;
+};
+export type PureCircuits = {
+	secp256k1EthereumAddress(pk: __compactRuntime.Secp256k1Point): Uint8Array;
+};
+export type Circuits<T> = {
+	verify_jubjub_schnorr(context: __compactRuntime.CircuitContext<T>, msg: [bigint, bigint], sig: JubjubSchnorrSignature, pk: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<T, boolean>;
+	verify_secp256k1_and_eth(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256k1EcdsaSignature, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+	verify_secp256r1(context: __compactRuntime.CircuitContext<T>, msgHash: Uint8Array, sig: Secp256r1EcdsaSignature, pk: __compactRuntime.Secp256r1Point): __compactRuntime.CircuitResults<T, boolean>;
+	verify_ed25519(context: __compactRuntime.CircuitContext<T>, msg: Uint8Array, sig: Ed25519Signature, pk: __compactRuntime.Curve25519Point): __compactRuntime.CircuitResults<T, boolean>;
+	foreign_field_and_hashes(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, payload: Uint8Array): __compactRuntime.CircuitResults<T, bigint>;
+	secp256k1EthereumAddress(context: __compactRuntime.CircuitContext<T>, pk: __compactRuntime.Secp256k1Point): __compactRuntime.CircuitResults<T, Uint8Array>;
+};
+export type Ledger = {
+	readonly verified_eth_address: Uint8Array;
+	readonly jubjub_pk: __compactRuntime.JubjubPoint;
+	readonly secp_pk: __compactRuntime.Secp256k1Point;
+	readonly p256_pk: __compactRuntime.Secp256r1Point;
+	readonly ed_pk: __compactRuntime.Curve25519Point;
+	readonly field_acc: bigint;
+	readonly digest_keccak: Uint8Array;
+	readonly digest_sha512: Uint8Array;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}
+export {};

@@ -269,4 +269,151 @@ export circuit unshieldedBalanceGt(color: Bytes<32>, amount: Uint<128>): Boolean
 export circuit unshieldedBalanceLte(color: Bytes<32>, amount: Uint<128>): Boolean {
   return !unshieldedBalanceGt(color, amount);
 }
+
+export struct JubjubSchnorrSignature {
+  announcement: JubjubPoint;
+  response: Field;
+}
+
+struct JubjubSchnorrHashInput<#N> {
+  annX: Field;
+  annY: Field;
+  pkX: Field;
+  pkY: Field;
+  msg: Vector<N, Field>;
+}
+
+export circuit jubjubSchnorrVerify<#N>(
+  msg: Vector<N, Field>,
+  signature: JubjubSchnorrSignature,
+  pk: JubjubPoint
+): Boolean {
+  assert(pk != default<JubjubPoint>, "JubjubPoint identity is not a permitted jubjubSchnorrVerify verification key");
+  const { announcement, response } = signature;
+  const cNative = transientHash<JubjubSchnorrHashInput<N>>(
+    JubjubSchnorrHashInput<N> {
+      annX: jubjubPointX(announcement),
+      annY: jubjubPointY(announcement),
+      pkX: jubjubPointX(pk),
+      pkY: jubjubPointY(pk),
+      msg: msg
+    }
+  );
+  const c = cNative as JubjubScalar;
+  const lhs = ecMulGenerator(response as JubjubScalar);
+  const rhs = ecAdd(announcement, ecMul(pk, c));
+  return lhs == rhs;
+}
+
+export struct Secp256k1EcdsaSignature {
+  r: Secp256k1Scalar;
+  s: Secp256k1Scalar;
+}
+
+circuit reverseBytes32(b: Bytes<32>): Bytes<32> {
+  const v = b as Vector<32, Uint<8>>;
+  return Bytes[
+    v[31], v[30], v[29], v[28], v[27], v[26], v[25], v[24],
+    v[23], v[22], v[21], v[20], v[19], v[18], v[17], v[16],
+    v[15], v[14], v[13], v[12], v[11], v[10], v[9],  v[8],
+    v[7],  v[6],  v[5],  v[4],  v[3],  v[2],  v[1],  v[0]
+  ];
+}
+
+export circuit secp256k1EcdsaVerify(
+  msgHash: Bytes<32>,
+  sig: Secp256k1EcdsaSignature,
+  pk: Secp256k1Point
+): Boolean {
+  assert(pk != default<Secp256k1Point>, "Secp256k1Point identity is not a permitted secp256k1EcdsaVerify verification key");
+  const z: Secp256k1Scalar = reverseBytes32(msgHash) as Secp256k1Scalar;
+  const { r, s } = sig;
+  const w: Secp256k1Scalar = inv(s);
+  const u1: Secp256k1Scalar = z * w;
+  const u2: Secp256k1Scalar = r * w;
+  const point: Secp256k1Point = ecAdd(ecMulGenerator(u1), ecMul(pk, u2));
+  return (secp256k1PointX(point) as Bytes<32>) as Secp256k1Scalar == r;
+}
+
+circuit secp256k1BaseBigEndian(b: Secp256k1Base): Vector<32, Uint<8>> {
+  const vec = b as Bytes<32> as Vector<32, Uint<8>>;
+  return [
+    vec[31], vec[30], vec[29], vec[28], vec[27], vec[26], vec[25], vec[24],
+    vec[23], vec[22], vec[21], vec[20], vec[19], vec[18], vec[17], vec[16],
+    vec[15], vec[14], vec[13], vec[12], vec[11], vec[10], vec[9],  vec[8],
+    vec[7],  vec[6],  vec[5],  vec[4],  vec[3],  vec[2],  vec[1],  vec[0]
+  ];
+}
+
+export circuit secp256k1EthereumAddress(pk: Secp256k1Point): Bytes<20> {
+  assert(pk != default<Secp256k1Point>, "Secp256k1Point identity is not a permitted input to secp256k1EthereumAddress");
+  const hash = keccak256<[Vector<32, Uint<8>>, Vector<32, Uint<8>>]>([
+    secp256k1BaseBigEndian(secp256k1PointX(pk)),
+    secp256k1BaseBigEndian(secp256k1PointY(pk))
+  ]);
+  return slice<20>(hash, 12);
+}
+
+export struct Secp256r1EcdsaSignature {
+  r: Secp256r1Scalar;
+  s: Secp256r1Scalar;
+}
+
+export circuit secp256r1EcdsaVerify(
+  msgHash: Bytes<32>,
+  sig: Secp256r1EcdsaSignature,
+  pk: Secp256r1Point
+): Boolean {
+  assert(pk != default<Secp256r1Point>, "Secp256r1Point identity is not a permitted secp256r1EcdsaVerify verification key");
+  const z: Secp256r1Scalar = reverseBytes32(msgHash) as Secp256r1Scalar;
+  const { r, s } = sig;
+  const w: Secp256r1Scalar = inv(s);
+  const u1: Secp256r1Scalar = z * w;
+  const u2: Secp256r1Scalar = r * w;
+  const point: Secp256r1Point = ecAdd(ecMulGenerator(u1), ecMul(pk, u2));
+  return (secp256r1PointX(point) as Bytes<32>) as Secp256r1Scalar == r;
+}
+
+export struct Ed25519Signature {
+  r: Curve25519Point;
+  s: Curve25519Scalar;
+}
+
+circuit curve25519BaseIsOdd(x: Curve25519Base): Boolean {
+  const b = (x as Bytes<32> as Vector<32, Uint<8>>)[0];
+  const b6 = b  >= 128 ? b  - 128 : b;
+  const b5 = b6 >= 64  ? b6 - 64  : b6;
+  const b4 = b5 >= 32  ? b5 - 32  : b5;
+  const b3 = b4 >= 16  ? b4 - 16  : b4;
+  const b2 = b3 >= 8   ? b3 - 8   : b3;
+  const b1 = b2 >= 4   ? b2 - 4   : b2;
+  return (b1 >= 2 ? b1 - 2 : b1) == 1;
+}
+
+circuit ed25519Encode(p: Curve25519Point): Bytes<32> {
+  const y = curve25519PointY(p) as Bytes<32> as Vector<32, Uint<8>>;
+  const sign = curve25519BaseIsOdd(curve25519PointX(p)) ? 128 : 0;
+  return Bytes[
+    y[0],  y[1],  y[2],  y[3],  y[4],  y[5],  y[6],  y[7],
+    y[8],  y[9],  y[10], y[11], y[12], y[13], y[14], y[15],
+    y[16], y[17], y[18], y[19], y[20], y[21], y[22], y[23],
+    y[24], y[25], y[26], y[27], y[28], y[29], y[30],
+    (y[31] + sign) as Uint<8>
+  ];
+}
+
+export circuit ed25519Verify<#n>(
+  msg: Bytes<n>,
+  sig: Ed25519Signature,
+  pk: Curve25519Point
+): Boolean {
+  assert((curve25519PointX(pk) as Bytes<32>) != pad(32, ""), "Curve25519Point identity is not a permitted ed25519Verify verification key");
+  const { r, s } = sig;
+  const k = sha512<[Bytes<32>, Bytes<32>, Bytes<n>]>([
+    ed25519Encode(r),
+    ed25519Encode(pk),
+    msg
+  ]) as Curve25519Scalar;
+  return ecMulGenerator(s) == ecAdd(r, ecMul(pk, k));
+}
 "#;

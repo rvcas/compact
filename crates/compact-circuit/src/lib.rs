@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use compact_hir::{
-    BinaryOp, Circuit, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId, NativeWitnessKind, Program,
-    Stmt, Type, UnaryOp,
+    BinaryOp, Circuit, CurveFieldKind, CurveKind, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
+    NativeWitnessKind, Program, Stmt, Type, UnaryOp,
 };
 
 /// Number of bytes packed per native BLS12-381 scalar wire in ZKIR v3 (248 bits).
@@ -36,6 +36,62 @@ impl CircuitVal {
     }
 }
 
+/// ZKIR v3.1 wire type for typed circuit inputs, outputs, and public/private inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireType {
+    Native,
+    JubjubPoint,
+    JubjubScalar,
+    Secp256k1Point,
+    Secp256k1Base,
+    Secp256k1Scalar,
+    Secp256r1Point,
+    Secp256r1Base,
+    Secp256r1Scalar,
+    Curve25519Point,
+    Curve25519Base,
+    Curve25519Scalar,
+}
+
+impl WireType {
+    pub fn from_field(field: CurveFieldKind) -> Self {
+        match field {
+            CurveFieldKind::JubjubScalar => Self::JubjubScalar,
+            CurveFieldKind::Secp256k1Base => Self::Secp256k1Base,
+            CurveFieldKind::Secp256k1Scalar => Self::Secp256k1Scalar,
+            CurveFieldKind::Secp256r1Base => Self::Secp256r1Base,
+            CurveFieldKind::Secp256r1Scalar => Self::Secp256r1Scalar,
+            CurveFieldKind::Curve25519Base => Self::Curve25519Base,
+            CurveFieldKind::Curve25519Scalar => Self::Curve25519Scalar,
+        }
+    }
+
+    pub fn from_point(curve: CurveKind) -> Self {
+        match curve {
+            CurveKind::Jubjub => Self::JubjubPoint,
+            CurveKind::Secp256k1 => Self::Secp256k1Point,
+            CurveKind::Secp256r1 => Self::Secp256r1Point,
+            CurveKind::Curve25519 => Self::Curve25519Point,
+        }
+    }
+
+    /// Number of raw `Native` field elements produced by `Instruction::Encode` for this wire type.
+    pub fn encoded_native_count(self) -> usize {
+        match self {
+            Self::Native | Self::JubjubScalar => 1,
+            Self::JubjubPoint
+            | Self::Secp256k1Base
+            | Self::Secp256k1Scalar
+            | Self::Secp256r1Base
+            | Self::Secp256r1Scalar
+            | Self::Curve25519Base
+            | Self::Curve25519Scalar => 2,
+            Self::Curve25519Point => 4,
+            Self::Secp256k1Point | Self::Secp256r1Point => 5,
+        }
+    }
+}
+
 /// Alignment atom for Impact VM cell encoding and hash gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlignmentAtom {
@@ -53,6 +109,25 @@ impl AlignmentAtom {
             Type::Boolean | Type::Enum(_) => vec![Self::Bytes(1)],
             Type::Uint(bits) => vec![Self::Bytes((*bits).div_ceil(8))],
             Type::Bytes(len) => vec![Self::Bytes(*len)],
+            Type::CurveField(CurveFieldKind::JubjubScalar) => vec![Self::Field],
+            Type::CurveField(CurveFieldKind::Curve25519Scalar) => {
+                vec![Self::Bytes(26), Self::Bytes(7)]
+            }
+            Type::CurveField(_) => vec![Self::Bytes(24), Self::Bytes(8)],
+            Type::CurvePoint(CurveKind::Jubjub) => vec![Self::Field, Self::Field],
+            Type::CurvePoint(CurveKind::Secp256k1 | CurveKind::Secp256r1) => vec![
+                Self::Bytes(24),
+                Self::Bytes(8),
+                Self::Bytes(24),
+                Self::Bytes(8),
+                Self::Field,
+            ],
+            Type::CurvePoint(CurveKind::Curve25519) => vec![
+                Self::Bytes(24),
+                Self::Bytes(8),
+                Self::Bytes(24),
+                Self::Bytes(8),
+            ],
             Type::Opaque(_) => vec![Self::Compress],
             Type::Vector(len, elem) => {
                 let single = Self::alignment_of(program, elem);
@@ -91,10 +166,50 @@ impl AlignmentAtom {
     }
 }
 
-/// Number of native scalar field wires representing a Compact type in ZKIR.
+/// Ordered ZKIR wire types representing a Compact type.
+pub fn wire_types(program: &Program, ty: &Type) -> Vec<WireType> {
+    match program.underlying_type(ty) {
+        Type::Field | Type::Boolean | Type::Uint(_) | Type::Enum(_) | Type::Opaque(_) => {
+            vec![WireType::Native]
+        }
+        Type::Bytes(0) => Vec::new(),
+        Type::Bytes(len) => vec![WireType::Native; (*len).div_ceil(FIELD_BYTES) as usize],
+        Type::CurveField(f) => vec![WireType::from_field(*f)],
+        Type::CurvePoint(c) => vec![WireType::from_point(*c)],
+        Type::Vector(len, elem) => {
+            let single = wire_types(program, elem);
+            let mut out = Vec::with_capacity(single.len() * (*len as usize));
+            for _ in 0..*len {
+                out.extend_from_slice(&single);
+            }
+            out
+        }
+        Type::Tuple(elems) => elems.iter().flat_map(|e| wire_types(program, e)).collect(),
+        Type::Struct(_)
+        | Type::Maybe(_)
+        | Type::Either(_, _)
+        | Type::MerkleTreeDigest
+        | Type::MerkleTreePathEntry
+        | Type::MerkleTreePath(_, _) => program
+            .struct_fields_of(ty)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|(_, fty)| wire_types(program, fty))
+            .collect(),
+        Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
+    }
+}
+
+/// Number of ZKIR wires representing a Compact type.
 pub fn wire_count(program: &Program, ty: &Type) -> usize {
     match program.underlying_type(ty) {
-        Type::Field | Type::Boolean | Type::Uint(_) | Type::Enum(_) | Type::Opaque(_) => 1,
+        Type::Field
+        | Type::Boolean
+        | Type::Uint(_)
+        | Type::Enum(_)
+        | Type::Opaque(_)
+        | Type::CurveField(_)
+        | Type::CurvePoint(_) => 1,
         Type::Bytes(0) => 0,
         Type::Bytes(len) => (*len).div_ceil(FIELD_BYTES) as usize,
         Type::Vector(len, elem) => (*len as usize) * wire_count(program, elem),
@@ -114,6 +229,58 @@ pub fn wire_count(program: &Program, ty: &Type) -> usize {
     }
 }
 
+/// Default native-encoded Impact cell values for a Compact type.
+fn default_encoded_native_values(program: &Program, ty: &Type) -> Vec<CircuitVal> {
+    match program.underlying_type(ty) {
+        Type::Field | Type::Boolean | Type::Uint(_) | Type::Enum(_) | Type::Opaque(_) => {
+            vec![CircuitVal::Imm(0)]
+        }
+        Type::Bytes(0) => Vec::new(),
+        Type::Bytes(len) => vec![CircuitVal::Imm(0); (*len).div_ceil(FIELD_BYTES) as usize],
+        Type::CurveField(f) => {
+            vec![CircuitVal::Imm(0); WireType::from_field(*f).encoded_native_count()]
+        }
+        Type::CurvePoint(CurveKind::Jubjub) => vec![CircuitVal::Imm(0), CircuitVal::Imm(1)],
+        Type::CurvePoint(CurveKind::Secp256k1 | CurveKind::Secp256r1) => vec![
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(1),
+        ],
+        Type::CurvePoint(CurveKind::Curve25519) => vec![
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(0),
+            CircuitVal::Imm(1),
+            CircuitVal::Imm(0),
+        ],
+        Type::Vector(len, elem) => {
+            let single = default_encoded_native_values(program, elem);
+            let mut out = Vec::with_capacity(single.len() * (*len as usize));
+            for _ in 0..*len {
+                out.extend_from_slice(&single);
+            }
+            out
+        }
+        Type::Tuple(elems) => elems
+            .iter()
+            .flat_map(|e| default_encoded_native_values(program, e))
+            .collect(),
+        Type::Struct(_)
+        | Type::Maybe(_)
+        | Type::Either(_, _)
+        | Type::MerkleTreeDigest
+        | Type::MerkleTreePathEntry
+        | Type::MerkleTreePath(_, _) => program
+            .struct_fields_of(ty)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|(_, fty)| default_encoded_native_values(program, fty))
+            .collect(),
+        Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
+    }
+}
+
 /// Range constraint required on a circuit input or private witness wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireConstraint {
@@ -126,7 +293,9 @@ enum WireConstraint {
 
 fn wire_constraints(program: &Program, ty: &Type) -> Vec<WireConstraint> {
     match program.underlying_type(ty) {
-        Type::Field | Type::Opaque(_) => vec![WireConstraint::None],
+        Type::Field | Type::Opaque(_) | Type::CurveField(_) | Type::CurvePoint(_) => {
+            vec![WireConstraint::None]
+        }
         Type::Boolean => vec![WireConstraint::Boolean],
         Type::Uint(bits) => vec![WireConstraint::Bits(*bits)],
         Type::Enum(id) => {
@@ -355,7 +524,7 @@ fn adt_initial_state_value(program: &Program, adt: &LedgerAdt) -> ImpactStateVal
     match adt {
         LedgerAdt::Cell(ty) => ImpactStateValue::Cell {
             alignment: AlignmentAtom::alignment_of(program, ty),
-            values: vec![CircuitVal::Imm(0); wire_count(program, ty)],
+            values: default_encoded_native_values(program, ty),
         },
         LedgerAdt::Counter => ImpactStateValue::cell_u64(0),
         LedgerAdt::Set(_) | LedgerAdt::Map { .. } => ImpactStateValue::EmptyMap,
@@ -517,10 +686,12 @@ impl ImpactVmOp {
 pub enum CircuitInstr {
     PublicInput {
         guard: Option<CircuitVal>,
+        val_t: WireType,
         output: CircuitVar,
     },
     PrivateInput {
         guard: Option<CircuitVal>,
+        val_t: WireType,
         output: CircuitVar,
     },
     ConstrainToBoolean {
@@ -544,11 +715,25 @@ pub enum CircuitInstr {
         val: CircuitVal,
         output: CircuitVar,
     },
+    Encode {
+        input: CircuitVal,
+        outputs: Vec<CircuitVar>,
+    },
     Impact {
         guard: CircuitVal,
         op: ImpactVmOp,
     },
     PersistentHash {
+        alignment: Vec<AlignmentAtom>,
+        inputs: Vec<CircuitVal>,
+        output: CircuitVar,
+    },
+    Keccak256 {
+        alignment: Vec<AlignmentAtom>,
+        inputs: Vec<CircuitVal>,
+        output: CircuitVar,
+    },
+    Sha512 {
         alignment: Vec<AlignmentAtom>,
         inputs: Vec<CircuitVal>,
         output: CircuitVar,
@@ -560,6 +745,30 @@ pub enum CircuitInstr {
     BytesIntoNatives {
         bytes: CircuitVar,
         outputs: Vec<CircuitVar>,
+    },
+    BytesFromNatives {
+        inputs: Vec<CircuitVal>,
+        len: u32,
+        output: CircuitVar,
+    },
+    ToBytes {
+        input: CircuitVal,
+        output: CircuitVar,
+    },
+    FromBytes {
+        bytes: CircuitVar,
+        val_t: WireType,
+        output: CircuitVar,
+    },
+    Slice {
+        bytes: CircuitVar,
+        start: u32,
+        len: u32,
+        output: CircuitVar,
+    },
+    JubjubScalarFromNative {
+        native: CircuitVal,
+        output: CircuitVar,
     },
     DivModPowerOfTwo {
         val: CircuitVal,
@@ -590,6 +799,33 @@ pub enum CircuitInstr {
         a: CircuitVal,
         output: CircuitVar,
     },
+    Inv {
+        a: CircuitVal,
+        output: CircuitVar,
+    },
+    EcMul {
+        a: CircuitVal,
+        scalar: CircuitVal,
+        output: CircuitVar,
+    },
+    EcMulGenerator {
+        scalar: CircuitVal,
+        output: CircuitVar,
+    },
+    HashToCurve {
+        inputs: Vec<CircuitVal>,
+        output: CircuitVar,
+    },
+    IntoCoordinates {
+        point: CircuitVal,
+        x: CircuitVar,
+        y: CircuitVar,
+    },
+    FromCoordinates {
+        x: CircuitVal,
+        y: CircuitVal,
+        output: CircuitVar,
+    },
     CondSelect {
         bit: CircuitVal,
         a: CircuitVal,
@@ -610,10 +846,10 @@ pub struct ProofCircuit {
     pub name: String,
     /// Debug name hints indexed by `CircuitVar.id`.
     pub var_names: Vec<String>,
-    /// Input SSA variables (each scalar wire).
-    pub inputs: Vec<CircuitVar>,
-    /// Number of scalar output wires produced by the final `Output` instruction.
-    pub output_count: usize,
+    /// Typed input SSA variables.
+    pub inputs: Vec<(CircuitVar, WireType)>,
+    /// Typed output wire list produced by the final `Output` instruction.
+    pub output_types: Vec<WireType>,
     pub instructions: Vec<CircuitInstr>,
 }
 
@@ -799,16 +1035,126 @@ impl<'a> CircuitLowerer<'a> {
         out
     }
 
+    /// Convert typed curve/foreign-field wires to raw `Native` limbs via `Encode` for Impact VM
+    /// cells and hash gates, leaving already-`Native` wires untouched.
+    fn encode_to_native_wires(&mut self, ty: &Type, vals: Vec<CircuitVal>) -> Vec<CircuitVal> {
+        let wtypes = wire_types(self.program, ty);
+        debug_assert_eq!(wtypes.len(), vals.len());
+        if wtypes.iter().all(|wt| *wt == WireType::Native) {
+            return vals;
+        }
+        let mut out = Vec::with_capacity(vals.len());
+        for (wt, val) in wtypes.into_iter().zip(vals) {
+            if wt == WireType::Native {
+                out.push(val);
+            } else {
+                let n = wt.encoded_native_count();
+                let mut enc_vars = Vec::with_capacity(n);
+                for _ in 0..n {
+                    enc_vars.push(self.fresh_var("fld"));
+                }
+                self.instructions.push(CircuitInstr::Encode {
+                    input: val,
+                    outputs: enc_vars.clone(),
+                });
+                for v in enc_vars {
+                    out.push(CircuitVal::Var(v));
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit ZKIR instructions producing the default value for `ty`.
+    fn lower_default(&mut self, ty: &Type) -> Vec<CircuitVal> {
+        match self.program.underlying_type(ty).clone() {
+            Type::Field | Type::Boolean | Type::Uint(_) | Type::Enum(_) | Type::Opaque(_) => {
+                vec![CircuitVal::Imm(0)]
+            }
+            Type::Bytes(0) => Vec::new(),
+            Type::Bytes(len) => vec![CircuitVal::Imm(0); len.div_ceil(FIELD_BYTES) as usize],
+            Type::CurveField(CurveFieldKind::JubjubScalar) => {
+                let out = self.fresh_var("t");
+                self.instructions
+                    .push(CircuitInstr::JubjubScalarFromNative {
+                        native: CircuitVal::Imm(0),
+                        output: out,
+                    });
+                vec![CircuitVal::Var(out)]
+            }
+            Type::CurveField(field) => {
+                let tmp = self.fresh_var("tmp");
+                self.instructions.push(CircuitInstr::ToBytes {
+                    input: CircuitVal::Imm(0),
+                    output: tmp,
+                });
+                let out = self.fresh_var("t");
+                self.instructions.push(CircuitInstr::FromBytes {
+                    bytes: tmp,
+                    val_t: WireType::from_field(field),
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            Type::CurvePoint(CurveKind::Jubjub) => {
+                let out = self.fresh_var("t");
+                self.instructions.push(CircuitInstr::FromCoordinates {
+                    x: CircuitVal::Imm(0),
+                    y: CircuitVal::Imm(1),
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            Type::CurvePoint(curve) => {
+                let zero_scalar = self.lower_default(&Type::CurveField(curve.scalar_field()));
+                let out = self.fresh_var("t");
+                self.instructions.push(CircuitInstr::EcMulGenerator {
+                    scalar: zero_scalar.into_iter().next().unwrap(),
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            Type::Vector(len, elem) => {
+                let mut out = Vec::new();
+                for _ in 0..len {
+                    out.extend(self.lower_default(&elem));
+                }
+                out
+            }
+            Type::Tuple(elems) => {
+                let mut out = Vec::new();
+                for e in elems {
+                    out.extend(self.lower_default(&e));
+                }
+                out
+            }
+            Type::Struct(_)
+            | Type::Maybe(_)
+            | Type::Either(_, _)
+            | Type::MerkleTreeDigest
+            | Type::MerkleTreePathEntry
+            | Type::MerkleTreePath(_, _) => {
+                let mut out = Vec::new();
+                for (_, fty) in self.program.struct_fields_of(ty).unwrap_or_default() {
+                    out.extend(self.lower_default(&fty));
+                }
+                out
+            }
+            Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
+        }
+    }
+
     fn lower_root_circuit(mut self, circuit: &Circuit) -> ProofCircuit {
         let mut inputs = Vec::new();
         let mut param_vals: Vec<Vec<CircuitVal>> = Vec::with_capacity(circuit.params.len());
         let mut input_constraints: Vec<(CircuitVar, WireConstraint)> = Vec::new();
         for p in &circuit.params {
+            let wtypes = wire_types(self.program, &p.ty);
             let constraints = wire_constraints(self.program, &p.ty);
             let mut wires = Vec::with_capacity(constraints.len());
-            for c in constraints {
+            for (wt, c) in wtypes.into_iter().zip(constraints) {
                 let var = self.fresh_var(&p.name);
-                inputs.push(var);
+                inputs.push((var, wt));
                 input_constraints.push((var, c));
                 wires.push(CircuitVal::Var(var));
             }
@@ -819,8 +1165,8 @@ impl<'a> CircuitLowerer<'a> {
         }
 
         let ret_vals = self.lower_circuit_body(circuit, &param_vals, &CircuitVal::TRUE);
-        let output_count = wire_count(self.program, &circuit.ret_type);
-        if output_count > 0 {
+        let output_types = wire_types(self.program, &circuit.ret_type);
+        if !output_types.is_empty() {
             self.instructions
                 .push(CircuitInstr::Output { vals: ret_vals });
         }
@@ -829,7 +1175,7 @@ impl<'a> CircuitLowerer<'a> {
             name: circuit.name.clone(),
             var_names: self.var_names,
             inputs,
-            output_count,
+            output_types,
             instructions: self.instructions,
         }
     }
@@ -989,7 +1335,7 @@ impl<'a> CircuitLowerer<'a> {
             ExprKind::IntLit(v) => vec![CircuitVal::Imm(*v as i128)],
             ExprKind::BoolLit(b) => vec![CircuitVal::Imm(i128::from(*b))],
             ExprKind::BytesLit(bytes) => bytes_to_wires(bytes),
-            ExprKind::Default(ty) => vec![CircuitVal::Imm(0); wire_count(self.program, ty)],
+            ExprKind::Default(ty) => self.lower_default(ty),
             ExprKind::DefaultAdt(_) => Vec::new(),
             ExprKind::EnumVariant { variant_idx, .. } => {
                 vec![CircuitVal::Imm(*variant_idx as i128)]
@@ -1098,33 +1444,62 @@ impl<'a> CircuitLowerer<'a> {
                         if *start == 0 && *len == *blen {
                             return base_vals;
                         }
-                        // Extract bytes `[start .. start + len]` within the low 31-byte chunk
-                        // using `div_mod_power_of_two` on the packed little-endian scalar wire.
-                        let mut wire = base_vals.last().cloned().unwrap_or(CircuitVal::Imm(0));
-                        let chunk_bytes = (*blen).min(FIELD_BYTES);
-                        if *start > 0 {
-                            let q = self.fresh_var("quo");
-                            let rem = self.fresh_var("rem");
-                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
-                                val: wire,
-                                bits: *start * 8,
-                                quotient: q,
-                                remainder: rem,
+                        if *blen <= FIELD_BYTES && *start + *len <= FIELD_BYTES {
+                            // Extract bytes `[start .. start + len]` within the single 31-byte chunk
+                            // using `div_mod_power_of_two` on the packed little-endian scalar wire.
+                            let mut wire = base_vals.last().cloned().unwrap_or(CircuitVal::Imm(0));
+                            if *start > 0 {
+                                let q = self.fresh_var("quo");
+                                let rem = self.fresh_var("rem");
+                                self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                    val: wire,
+                                    bits: *start * 8,
+                                    quotient: q,
+                                    remainder: rem,
+                                });
+                                wire = CircuitVal::Var(q);
+                            }
+                            if *start + *len < *blen {
+                                let q = self.fresh_var("quo");
+                                let rem = self.fresh_var("rem");
+                                self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                    val: wire,
+                                    bits: *len * 8,
+                                    quotient: q,
+                                    remainder: rem,
+                                });
+                                wire = CircuitVal::Var(rem);
+                            }
+                            vec![wire]
+                        } else {
+                            // General multi-chunk `Bytes` slice using ZKIR v3.1 `Slice`.
+                            let mut rev_in = base_vals;
+                            rev_in.reverse();
+                            let b_in = self.fresh_var("bytes");
+                            self.instructions.push(CircuitInstr::BytesFromNatives {
+                                inputs: rev_in,
+                                len: *blen,
+                                output: b_in,
                             });
-                            wire = CircuitVal::Var(q);
-                        }
-                        if *start + *len < chunk_bytes {
-                            let q = self.fresh_var("quo");
-                            let rem = self.fresh_var("rem");
-                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
-                                val: wire,
-                                bits: *len * 8,
-                                quotient: q,
-                                remainder: rem,
+                            let b_out = self.fresh_var("bytes");
+                            self.instructions.push(CircuitInstr::Slice {
+                                bytes: b_in,
+                                start: *start,
+                                len: *len,
+                                output: b_out,
                             });
-                            wire = CircuitVal::Var(rem);
+                            let out_count = (*len).div_ceil(FIELD_BYTES) as usize;
+                            let mut out_vars = Vec::with_capacity(out_count);
+                            for _ in 0..out_count {
+                                out_vars.push(self.fresh_var("t"));
+                            }
+                            self.instructions.push(CircuitInstr::BytesIntoNatives {
+                                bytes: b_out,
+                                outputs: out_vars.clone(),
+                            });
+                            out_vars.reverse();
+                            out_vars.into_iter().map(CircuitVal::Var).collect()
                         }
-                        vec![wire]
                     }
                     _ => unreachable!("sema validated Slice target"),
                 }
@@ -1136,7 +1511,7 @@ impl<'a> CircuitLowerer<'a> {
             }
             ExprKind::MaybeNone(inner_ty) => {
                 let mut out = vec![CircuitVal::FALSE];
-                out.extend(vec![CircuitVal::Imm(0); wire_count(self.program, inner_ty)]);
+                out.extend(self.lower_default(inner_ty));
                 out
             }
             ExprKind::Disclose(inner) => {
@@ -1146,9 +1521,9 @@ impl<'a> CircuitLowerer<'a> {
                 expr: inner,
                 target,
             } => {
-                let src_u = self.program.underlying_type(&inner.ty);
-                let dst_u = self.program.underlying_type(target);
-                match (src_u, dst_u) {
+                let src_u = self.program.underlying_type(&inner.ty).clone();
+                let dst_u = self.program.underlying_type(target).clone();
+                match (&src_u, &dst_u) {
                     (Type::Bytes(n), Type::Vector(_, _)) => {
                         let wires = self.lower_expr(inner, param_vals, locals, guard);
                         self.unpack_bytes_wires(&wires, *n)
@@ -1156,6 +1531,125 @@ impl<'a> CircuitLowerer<'a> {
                     (Type::Vector(_, _), Type::Bytes(_)) => {
                         let byte_vals = self.lower_expr(inner, param_vals, locals, guard);
                         self.pack_bytes_wires(&byte_vals)
+                    }
+                    (
+                        Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_),
+                        Type::CurveField(CurveFieldKind::JubjubScalar),
+                    ) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions
+                            .push(CircuitInstr::JubjubScalarFromNative {
+                                native: val,
+                                output: out,
+                            });
+                        vec![CircuitVal::Var(out)]
+                    }
+                    (
+                        Type::CurveField(CurveFieldKind::JubjubScalar),
+                        Type::Field | Type::Uint(_),
+                    ) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions.push(CircuitInstr::Encode {
+                            input: val,
+                            outputs: vec![out],
+                        });
+                        if let Type::Uint(bits) = dst_u {
+                            self.instructions.push(CircuitInstr::ConstrainBits {
+                                val: CircuitVal::Var(out),
+                                bits,
+                            });
+                        }
+                        vec![CircuitVal::Var(out)]
+                    }
+                    (Type::Field, Type::Uint(bits)) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions
+                            .push(CircuitInstr::Copy { val, output: out });
+                        self.instructions.push(CircuitInstr::ConstrainBits {
+                            val: CircuitVal::Var(out),
+                            bits: *bits,
+                        });
+                        vec![CircuitVal::Var(out)]
+                    }
+                    (Type::Field, Type::Bytes(n)) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        if *n == 0 {
+                            Vec::new()
+                        } else if *n <= FIELD_BYTES {
+                            let out = self.fresh_var(hint.unwrap_or("t"));
+                            self.instructions
+                                .push(CircuitInstr::Copy { val, output: out });
+                            self.instructions.push(CircuitInstr::ConstrainBits {
+                                val: CircuitVal::Var(out),
+                                bits: *n * 8,
+                            });
+                            vec![CircuitVal::Var(out)]
+                        } else {
+                            let hi = self.fresh_var("hi");
+                            let lo = self.fresh_var("lo");
+                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                val,
+                                bits: FIELD_BYTES * 8,
+                                quotient: hi,
+                                remainder: lo,
+                            });
+                            vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+                        }
+                    }
+                    (Type::CurveField(_), Type::Bytes(32)) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let tmp = self.fresh_var("bytes");
+                        self.instructions.push(CircuitInstr::ToBytes {
+                            input: val,
+                            output: tmp,
+                        });
+                        let lo = self.fresh_var(hint.unwrap_or("t"));
+                        let hi = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions.push(CircuitInstr::BytesIntoNatives {
+                            bytes: tmp,
+                            outputs: vec![lo, hi],
+                        });
+                        vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+                    }
+                    (Type::Bytes(n), Type::CurveField(field)) => {
+                        let mut wires = self.lower_expr(inner, param_vals, locals, guard);
+                        wires.reverse();
+                        let tmp = self.fresh_var("bytes");
+                        self.instructions.push(CircuitInstr::BytesFromNatives {
+                            inputs: wires,
+                            len: *n,
+                            output: tmp,
+                        });
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions.push(CircuitInstr::FromBytes {
+                            bytes: tmp,
+                            val_t: WireType::from_field(*field),
+                            output: out,
+                        });
+                        vec![CircuitVal::Var(out)]
                     }
                     _ => self.lower_expr_with_hint(inner, param_vals, locals, guard, hint),
                 }
@@ -1382,12 +1876,14 @@ impl<'a> CircuitLowerer<'a> {
                 } else {
                     Some(guard.clone())
                 };
+                let wtypes = wire_types(self.program, &w.ret_type);
                 let constraints = wire_constraints(self.program, &w.ret_type);
                 let mut out = Vec::with_capacity(constraints.len());
-                for c in constraints {
+                for (wt, c) in wtypes.into_iter().zip(constraints) {
                     let v = self.fresh_var(var_hint);
                     self.instructions.push(CircuitInstr::PrivateInput {
                         guard: pi_guard.clone(),
+                        val_t: wt,
                         output: v,
                     });
                     self.emit_wire_constraint(v, c);
@@ -1407,12 +1903,14 @@ impl<'a> CircuitLowerer<'a> {
                         } else {
                             Some(guard.clone())
                         };
+                        let wtypes = wire_types(self.program, &expr.ty);
                         let constraints = wire_constraints(self.program, &expr.ty);
                         let mut out = Vec::with_capacity(constraints.len());
-                        for c in constraints {
+                        for (wt, c) in wtypes.into_iter().zip(constraints) {
                             let v = self.fresh_var(var_hint);
                             self.instructions.push(CircuitInstr::PrivateInput {
                                 guard: pi_guard.clone(),
+                                val_t: wt,
                                 output: v,
                             });
                             self.emit_wire_constraint(v, c);
@@ -1426,7 +1924,8 @@ impl<'a> CircuitLowerer<'a> {
                 }
             }
             ExprKind::PersistentHash { input_ty, arg } => {
-                let inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let raw_inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let inputs = self.encode_to_native_wires(input_ty, raw_inputs);
                 let alignment = AlignmentAtom::alignment_of(self.program, input_ty);
                 let bytes_var = self.fresh_var("bytes");
                 self.instructions.push(CircuitInstr::PersistentHash {
@@ -1445,8 +1944,52 @@ impl<'a> CircuitLowerer<'a> {
                 });
                 vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
             }
-            ExprKind::TransientHash { arg, .. } => {
-                let inputs = self.lower_expr(arg, param_vals, locals, guard);
+            ExprKind::Keccak256 { input_ty, arg } => {
+                let raw_inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let inputs = self.encode_to_native_wires(input_ty, raw_inputs);
+                let alignment = AlignmentAtom::alignment_of(self.program, input_ty);
+                let bytes_var = self.fresh_var("bytes");
+                self.instructions.push(CircuitInstr::Keccak256 {
+                    alignment,
+                    inputs,
+                    output: bytes_var,
+                });
+                let out_hint = hint.unwrap_or("hash");
+                let lo = self.fresh_var(out_hint);
+                let hi = self.fresh_var(out_hint);
+                self.instructions.push(CircuitInstr::BytesIntoNatives {
+                    bytes: bytes_var,
+                    outputs: vec![lo, hi],
+                });
+                vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+            }
+            ExprKind::Sha512 { input_ty, arg } => {
+                let raw_inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let inputs = self.encode_to_native_wires(input_ty, raw_inputs);
+                let alignment = AlignmentAtom::alignment_of(self.program, input_ty);
+                let bytes_var = self.fresh_var("bytes");
+                self.instructions.push(CircuitInstr::Sha512 {
+                    alignment,
+                    inputs,
+                    output: bytes_var,
+                });
+                let out_hint = hint.unwrap_or("hash");
+                let w0 = self.fresh_var(out_hint);
+                let w1 = self.fresh_var(out_hint);
+                let w2 = self.fresh_var(out_hint);
+                self.instructions.push(CircuitInstr::BytesIntoNatives {
+                    bytes: bytes_var,
+                    outputs: vec![w0, w1, w2],
+                });
+                vec![
+                    CircuitVal::Var(w2),
+                    CircuitVal::Var(w1),
+                    CircuitVal::Var(w0),
+                ]
+            }
+            ExprKind::TransientHash { input_ty, arg } => {
+                let raw_inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let inputs = self.encode_to_native_wires(input_ty, raw_inputs);
                 let out = self.fresh_var(hint.unwrap_or("hash"));
                 self.instructions.push(CircuitInstr::TransientHash {
                     inputs,
@@ -1460,7 +2003,8 @@ impl<'a> CircuitLowerer<'a> {
                 rand,
             } => {
                 // Upstream swaps `(value, rand)` so `rand` (`Bytes<32>`) comes first in `persistent_hash`.
-                let val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let raw_val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let val_wires = self.encode_to_native_wires(input_ty, raw_val_wires);
                 let rand_wires = self.lower_expr(rand, param_vals, locals, guard);
                 let mut alignment = vec![AlignmentAtom::Bytes(32)];
                 alignment.extend(AlignmentAtom::alignment_of(self.program, input_ty));
@@ -1481,9 +2025,14 @@ impl<'a> CircuitLowerer<'a> {
                 });
                 vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
             }
-            ExprKind::TransientCommit { value, rand, .. } => {
+            ExprKind::TransientCommit {
+                input_ty,
+                value,
+                rand,
+            } => {
                 // Upstream moves `rand` (`Field`) first before `value` wires in `transient_hash`.
-                let val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let raw_val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let val_wires = self.encode_to_native_wires(input_ty, raw_val_wires);
                 let rand_wires = self.lower_expr(rand, param_vals, locals, guard);
                 let mut inputs = rand_wires;
                 inputs.extend(val_wires);
@@ -1493,6 +2042,131 @@ impl<'a> CircuitLowerer<'a> {
                     output: out,
                 });
                 vec![CircuitVal::Var(out)]
+            }
+            ExprKind::FieldInv(inner) => {
+                let val = self
+                    .lower_expr(inner, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("inv"));
+                self.instructions.push(CircuitInstr::Inv {
+                    a: val,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::EcAdd { lhs, rhs } => {
+                let a = self
+                    .lower_expr(lhs, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let b = self
+                    .lower_expr(rhs, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions
+                    .push(CircuitInstr::Add { a, b, output: out });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::EcNeg(inner) => {
+                let pt = self
+                    .lower_expr(inner, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let x = self.fresh_var("x");
+                let y = self.fresh_var("y");
+                self.instructions
+                    .push(CircuitInstr::IntoCoordinates { point: pt, x, y });
+                let neg_x = self.fresh_var("neg");
+                self.instructions.push(CircuitInstr::Neg {
+                    a: CircuitVal::Var(x),
+                    output: neg_x,
+                });
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions.push(CircuitInstr::FromCoordinates {
+                    x: CircuitVal::Var(neg_x),
+                    y: CircuitVal::Var(y),
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::EcMul { point, scalar } => {
+                let pt = self
+                    .lower_expr(point, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let sc = self
+                    .lower_expr(scalar, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions.push(CircuitInstr::EcMul {
+                    a: pt,
+                    scalar: sc,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::EcMulGenerator(scalar) => {
+                let sc = self
+                    .lower_expr(scalar, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions.push(CircuitInstr::EcMulGenerator {
+                    scalar: sc,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::HashToCurve { input_ty, arg } => {
+                let raw_inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let inputs = self.encode_to_native_wires(input_ty, raw_inputs);
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions.push(CircuitInstr::HashToCurve {
+                    inputs,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::ConstructJubjubPoint { x, y } => {
+                let xv = self
+                    .lower_expr(x, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let yv = self
+                    .lower_expr(y, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("pt"));
+                self.instructions.push(CircuitInstr::FromCoordinates {
+                    x: xv,
+                    y: yv,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::PointCoord { point, is_y } => {
+                let pt = self
+                    .lower_expr(point, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let x = self.fresh_var(if *is_y { "ignore" } else { hint.unwrap_or("x") });
+                let y = self.fresh_var(if *is_y { hint.unwrap_or("y") } else { "ignore" });
+                self.instructions
+                    .push(CircuitInstr::IntoCoordinates { point: pt, x, y });
+                vec![CircuitVal::Var(if *is_y { y } else { x })]
             }
             ExprKind::DegradeToTransient(inner) => {
                 let wires = self.lower_expr(inner, param_vals, locals, guard);
@@ -1537,8 +2211,9 @@ impl<'a> CircuitLowerer<'a> {
                 // Leaf preimage hash: `persistentHash(LeafPreimage { domain_sep: "mdn:lh", data: path.leaf })`
                 let mut alignment = vec![AlignmentAtom::Bytes(6)];
                 alignment.extend(AlignmentAtom::alignment_of(self.program, leaf_ty));
+                let encoded_leaf = self.encode_to_native_wires(leaf_ty, leaf_vals.to_vec());
                 let mut hash_inputs = bytes_to_wires(b"mdn:lh");
-                hash_inputs.extend_from_slice(leaf_vals);
+                hash_inputs.extend(encoded_leaf);
 
                 let bytes_var = self.fresh_var("bytes");
                 self.instructions.push(CircuitInstr::PersistentHash {
@@ -1614,7 +2289,8 @@ impl<'a> CircuitLowerer<'a> {
                     .map(|&s| PathSegment::Static(s))
                     .collect();
                 for key_expr in key_path {
-                    let vals = self.lower_expr(key_expr, param_vals, locals, guard);
+                    let raw_vals = self.lower_expr(key_expr, param_vals, locals, guard);
+                    let vals = self.encode_to_native_wires(&key_expr.ty, raw_vals);
                     let align = AlignmentAtom::alignment_of(self.program, &key_expr.ty);
                     full_path.push(PathSegment::Dynamic {
                         alignment: align,
@@ -1633,16 +2309,18 @@ impl<'a> CircuitLowerer<'a> {
                             .cell_type()
                             .expect("sema validated CellRead target");
                         let alignment = AlignmentAtom::alignment_of(self.program, cell_ty);
-                        let count = wire_count(self.program, cell_ty);
-                        let mut results = Vec::with_capacity(count);
-                        for _ in 0..count {
+                        let wtypes = wire_types(self.program, cell_ty);
+                        let mut results = Vec::with_capacity(wtypes.len());
+                        for wt in wtypes {
                             let out = self.fresh_var(&ledger_field.name);
                             self.instructions.push(CircuitInstr::PublicInput {
                                 guard: pi_guard.clone(),
+                                val_t: wt,
                                 output: out,
                             });
                             results.push(CircuitVal::Var(out));
                         }
+                        let popeq_results = self.encode_to_native_wires(cell_ty, results.clone());
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
                         self.emit_impact(
                             guard,
@@ -1657,7 +2335,7 @@ impl<'a> CircuitLowerer<'a> {
                             ImpactVmOp::Popeq {
                                 cached: false,
                                 alignment,
-                                results: results.clone(),
+                                results: popeq_results,
                             },
                         );
                         results
@@ -1667,7 +2345,8 @@ impl<'a> CircuitLowerer<'a> {
                             .cell_type()
                             .expect("sema validated CellWrite target");
                         let alignment = AlignmentAtom::alignment_of(self.program, cell_ty);
-                        let values = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_values = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let values = self.encode_to_native_wires(cell_ty, raw_values);
                         self.emit_write_at_path(
                             full_path,
                             ImpactStateValue::Cell { alignment, values },
@@ -1746,6 +2425,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var(&ledger_field.name);
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -1771,6 +2451,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -1805,6 +2486,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -1834,10 +2516,12 @@ impl<'a> CircuitLowerer<'a> {
                             _ => unreachable!("sema validated member target"),
                         };
                         let key_align = AlignmentAtom::alignment_of(self.program, key_ty);
-                        let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let elem_vals = self.encode_to_native_wires(key_ty, raw_vals);
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -1875,7 +2559,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated SetInsert target");
                         };
                         let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let elem_vals = self.encode_to_native_wires(elem_ty, raw_vals);
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -1924,7 +2609,8 @@ impl<'a> CircuitLowerer<'a> {
                             _ => unreachable!("sema validated remove target"),
                         };
                         let key_align = AlignmentAtom::alignment_of(self.program, key_ty);
-                        let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let elem_vals = self.encode_to_native_wires(key_ty, raw_vals);
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -1961,18 +2647,21 @@ impl<'a> CircuitLowerer<'a> {
                             .cell_type()
                             .expect("sema validated MapLookup value is Cell");
                         let key_align = AlignmentAtom::alignment_of(self.program, key);
-                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let key_vals = self.encode_to_native_wires(key, raw_key_vals);
                         let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
-                        let count = wire_count(self.program, val_ty);
-                        let mut results = Vec::with_capacity(count);
-                        for _ in 0..count {
+                        let wtypes = wire_types(self.program, val_ty);
+                        let mut results = Vec::with_capacity(wtypes.len());
+                        for wt in wtypes {
                             let out = self.fresh_var("t");
                             self.instructions.push(CircuitInstr::PublicInput {
                                 guard: pi_guard.clone(),
+                                val_t: wt,
                                 output: out,
                             });
                             results.push(CircuitVal::Var(out));
                         }
+                        let popeq_results = self.encode_to_native_wires(val_ty, results.clone());
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
                         self.emit_impact(
                             guard,
@@ -1998,7 +2687,7 @@ impl<'a> CircuitLowerer<'a> {
                             ImpactVmOp::Popeq {
                                 cached: false,
                                 alignment: val_align,
-                                results: results.clone(),
+                                results: popeq_results,
                             },
                         );
                         results
@@ -2008,7 +2697,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated MapInsert target");
                         };
                         let key_align = AlignmentAtom::alignment_of(self.program, key);
-                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let key_vals = self.encode_to_native_wires(key, raw_key_vals);
                         let val_state = match &args[1].kind {
                             ExprKind::DefaultAdt(val_adt) => {
                                 adt_initial_state_value(self.program, val_adt)
@@ -2018,8 +2708,9 @@ impl<'a> CircuitLowerer<'a> {
                                     .cell_type()
                                     .expect("sema validated MapInsert value type");
                                 let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
-                                let val_wires =
+                                let raw_val_wires =
                                     self.lower_expr(&args[1], param_vals, locals, guard);
+                                let val_wires = self.encode_to_native_wires(val_ty, raw_val_wires);
                                 ImpactStateValue::Cell {
                                     alignment: val_align,
                                     values: val_wires,
@@ -2072,7 +2763,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated MapInsertDefault target");
                         };
                         let key_align = AlignmentAtom::alignment_of(self.program, key);
-                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let key_vals = self.encode_to_native_wires(key, raw_key_vals);
                         let val_state = adt_initial_state_value(self.program, value);
                         self.emit_impact(
                             guard,
@@ -2119,6 +2811,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -2161,6 +2854,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -2194,20 +2888,22 @@ impl<'a> CircuitLowerer<'a> {
                         let LedgerAdt::List(elem_ty) = target_adt else {
                             unreachable!("sema validated ListHead target");
                         };
+                        let maybe_ty = Type::Maybe(elem_ty.clone());
                         let elem_align = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let elem_wires = wire_count(self.program, elem_ty);
                         let mut maybe_align = vec![AlignmentAtom::Bytes(1)];
                         maybe_align.extend(elem_align.iter().copied());
-                        let total_wires = 1 + elem_wires;
-                        let mut results = Vec::with_capacity(total_wires);
-                        for _ in 0..total_wires {
+                        let wtypes = wire_types(self.program, &maybe_ty);
+                        let mut results = Vec::with_capacity(wtypes.len());
+                        for wt in wtypes {
                             let out = self.fresh_var("t");
                             self.instructions.push(CircuitInstr::PublicInput {
                                 guard: pi_guard.clone(),
+                                val_t: wt,
                                 output: out,
                             });
                             results.push(CircuitVal::Var(out));
                         }
+                        let popeq_results = self.encode_to_native_wires(&maybe_ty, results.clone());
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
                         self.emit_impact(
                             guard,
@@ -2259,7 +2955,7 @@ impl<'a> CircuitLowerer<'a> {
                                 storage: false,
                                 value: ImpactStateValue::Cell {
                                     alignment: maybe_align.clone(),
-                                    values: vec![CircuitVal::Imm(0); total_wires],
+                                    values: default_encoded_native_values(self.program, &maybe_ty),
                                 },
                             },
                         );
@@ -2268,7 +2964,7 @@ impl<'a> CircuitLowerer<'a> {
                             ImpactVmOp::Popeq {
                                 cached: true,
                                 alignment: maybe_align,
-                                results: results.clone(),
+                                results: popeq_results,
                             },
                         );
                         results
@@ -2304,7 +3000,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated ListPushFront target");
                         };
                         let val_align = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let val_wires = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_val_wires = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let val_wires = self.encode_to_native_wires(elem_ty, raw_val_wires);
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -2375,7 +3072,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated MerkleTreeInsert target");
                         };
                         let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
                         let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
                         leaf_align.extend(alignment);
                         let mut hash_inputs = bytes_to_wires(b"mdn:lh");
@@ -2465,6 +3163,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -2512,7 +3211,8 @@ impl<'a> CircuitLowerer<'a> {
                             unreachable!("sema validated HistoricMerkleTreeInsert target");
                         };
                         let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let raw_item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
                         let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
                         leaf_align.extend(alignment);
                         let mut hash_inputs = bytes_to_wires(b"mdn:lh");
@@ -2635,6 +3335,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -2680,6 +3381,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
@@ -2720,6 +3422,7 @@ impl<'a> CircuitLowerer<'a> {
                             let out = self.fresh_var("self");
                             self.instructions.push(CircuitInstr::PublicInput {
                                 guard: pi_guard.clone(),
+                                val_t: WireType::Native,
                                 output: out,
                             });
                             results.push(CircuitVal::Var(out));
@@ -2752,6 +3455,7 @@ impl<'a> CircuitLowerer<'a> {
                             let out = self.fresh_var("caller");
                             self.instructions.push(CircuitInstr::PublicInput {
                                 guard: pi_guard.clone(),
+                                val_t: WireType::Native,
                                 output: out,
                             });
                             results.push(CircuitVal::Var(out));
@@ -2945,6 +3649,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("balance");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
@@ -3009,6 +3714,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
@@ -3084,6 +3790,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(
@@ -3157,6 +3864,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
@@ -3194,6 +3902,7 @@ impl<'a> CircuitLowerer<'a> {
                         let out = self.fresh_var("t");
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
+                            val_t: WireType::Native,
                             output: out,
                         });
                         self.emit_impact(
@@ -3422,13 +4131,28 @@ fn expr_has_effects(expr: &Expr, program: &Program) -> bool {
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::Keccak256 { arg: operand, .. }
+        | ExprKind::Sha512 { arg: operand, .. }
         | ExprKind::TransientHash { arg: operand, .. }
         | ExprKind::DegradeToTransient(operand)
         | ExprKind::UpgradeFromTransient(operand)
+        | ExprKind::FieldInv(operand)
+        | ExprKind::EcNeg(operand)
+        | ExprKind::EcMulGenerator(operand)
+        | ExprKind::HashToCurve { arg: operand, .. }
+        | ExprKind::PointCoord { point: operand, .. }
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_has_effects(operand, program),
+        ExprKind::EcAdd { lhs: a, rhs: b }
+        | ExprKind::EcMul {
+            point: a,
+            scalar: b,
+        }
+        | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+            expr_has_effects(a, program) || expr_has_effects(b, program)
+        }
         ExprKind::PersistentCommit { value, rand, .. }
         | ExprKind::TransientCommit { value, rand, .. } => {
             expr_has_effects(value, program) || expr_has_effects(rand, program)

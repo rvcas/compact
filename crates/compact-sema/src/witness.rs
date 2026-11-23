@@ -236,14 +236,31 @@ impl<'a> WitnessChecker<'a> {
             ExprKind::Unary { operand, .. }
             | ExprKind::Cast { expr: operand, .. }
             | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::Keccak256 { arg: operand, .. }
+            | ExprKind::Sha512 { arg: operand, .. }
             | ExprKind::TransientHash { arg: operand, .. }
             | ExprKind::DegradeToTransient(operand)
             | ExprKind::UpgradeFromTransient(operand)
+            | ExprKind::FieldInv(operand)
+            | ExprKind::EcNeg(operand)
+            | ExprKind::EcMulGenerator(operand)
+            | ExprKind::HashToCurve { arg: operand, .. }
+            | ExprKind::PointCoord { point: operand, .. }
             | ExprKind::MerkleTreePathRoot { path: operand, .. }
             | ExprKind::FieldAccess { base: operand, .. }
             | ExprKind::Slice { base: operand, .. }
             | ExprKind::MaybeSome(operand) => {
                 self.check_expr(operand, param_taints, locals, guard_taint)
+            }
+            ExprKind::EcAdd { lhs: a, rhs: b }
+            | ExprKind::EcMul {
+                point: a,
+                scalar: b,
+            }
+            | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+                let ta = self.check_expr(a, param_taints, locals, guard_taint);
+                let tb = self.check_expr(b, param_taints, locals, guard_taint);
+                ta.merge(&tb)
             }
             ExprKind::PersistentCommit { value, rand, .. }
             | ExprKind::TransientCommit { value, rand, .. } => {
@@ -483,13 +500,29 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::Keccak256 { arg: operand, .. }
+        | ExprKind::Sha512 { arg: operand, .. }
         | ExprKind::TransientHash { arg: operand, .. }
         | ExprKind::DegradeToTransient(operand)
         | ExprKind::UpgradeFromTransient(operand)
+        | ExprKind::FieldInv(operand)
+        | ExprKind::EcNeg(operand)
+        | ExprKind::EcMulGenerator(operand)
+        | ExprKind::HashToCurve { arg: operand, .. }
+        | ExprKind::PointCoord { point: operand, .. }
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => collect_calls_expr(operand, out),
+        ExprKind::EcAdd { lhs: a, rhs: b }
+        | ExprKind::EcMul {
+            point: a,
+            scalar: b,
+        }
+        | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+            collect_calls_expr(a, out);
+            collect_calls_expr(b, out);
+        }
         ExprKind::PersistentCommit { value, rand, .. }
         | ExprKind::TransientCommit { value, rand, .. } => {
             collect_calls_expr(value, out);

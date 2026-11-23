@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 
-use compact_circuit::{AlignmentAtom, CircuitInstr, CircuitVal, CircuitVar, ProofCircuit};
+use compact_circuit::{
+    AlignmentAtom, CircuitInstr, CircuitVal, CircuitVar, ProofCircuit, WireType,
+};
 use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use midnight_base_crypto::fab::{Alignment, AlignmentAtom as FabAlignmentAtom, AlignmentSegment};
 use midnight_serialize::tagged_serialize;
@@ -66,12 +68,16 @@ pub fn generate_zkir(circuit: &ProofCircuit) -> Result<GeneratedZkir, ZkirError>
     let inputs: Vec<ZkirInput> = circuit
         .inputs
         .iter()
-        .map(|&v| ZkirInput {
+        .map(|&(v, wt)| ZkirInput {
             name: ident(circuit, v),
-            val_t: IrType::Native,
+            val_t: to_ir_type(wt),
         })
         .collect();
-    let outputs = vec![IrType::Native; circuit.output_count];
+    let outputs: Vec<IrType> = circuit
+        .output_types
+        .iter()
+        .map(|&wt| to_ir_type(wt))
+        .collect();
     let instructions = lower_instructions(circuit)?;
 
     let json = render_zkir_json(&inputs, &outputs, &instructions).map_err(|e| {
@@ -213,18 +219,43 @@ fn to_alignment(alignment: &[AlignmentAtom]) -> Alignment {
     )
 }
 
+fn to_ir_type(wt: WireType) -> IrType {
+    match wt {
+        WireType::Native => IrType::Native,
+        WireType::JubjubPoint => IrType::JubjubPoint,
+        WireType::JubjubScalar => IrType::JubjubScalar,
+        WireType::Secp256k1Point => IrType::Secp256k1Point,
+        WireType::Secp256k1Base => IrType::Secp256k1Base,
+        WireType::Secp256k1Scalar => IrType::Secp256k1Scalar,
+        WireType::Secp256r1Point => IrType::Secp256r1Point,
+        WireType::Secp256r1Base => IrType::Secp256r1Base,
+        WireType::Secp256r1Scalar => IrType::Secp256r1Scalar,
+        WireType::Curve25519Point => IrType::Curve25519Point,
+        WireType::Curve25519Base => IrType::Curve25519Base,
+        WireType::Curve25519Scalar => IrType::Curve25519Scalar,
+    }
+}
+
 fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirError> {
     let mut out = Vec::with_capacity(circuit.instructions.len());
     for instr in &circuit.instructions {
         let zkir_instr = match instr {
-            CircuitInstr::PublicInput { guard, output } => Instruction::PublicInput {
+            CircuitInstr::PublicInput {
+                guard,
+                val_t,
+                output,
+            } => Instruction::PublicInput {
                 guard: guard.as_ref().map(|g| operand(circuit, g)).transpose()?,
-                val_t: IrType::Native,
+                val_t: to_ir_type(*val_t),
                 output: ident(circuit, *output),
             },
-            CircuitInstr::PrivateInput { guard, output } => Instruction::PrivateInput {
+            CircuitInstr::PrivateInput {
+                guard,
+                val_t,
+                output,
+            } => Instruction::PrivateInput {
                 guard: guard.as_ref().map(|g| operand(circuit, g)).transpose()?,
-                val_t: IrType::Native,
+                val_t: to_ir_type(*val_t),
                 output: ident(circuit, *output),
             },
             CircuitInstr::ConstrainToBoolean { val } => Instruction::ConstrainToBoolean {
@@ -248,6 +279,10 @@ fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirEr
                 val: operand(circuit, val)?,
                 output: ident(circuit, *output),
             },
+            CircuitInstr::Encode { input, outputs } => Instruction::Encode {
+                input: operand(circuit, input)?,
+                outputs: outputs.iter().map(|v| ident(circuit, *v)).collect(),
+            },
             CircuitInstr::Impact { guard, op } => Instruction::Impact {
                 guard: operand(circuit, guard)?,
                 inputs: operands(circuit, &op.assemble())?,
@@ -261,6 +296,24 @@ fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirEr
                 inputs: operands(circuit, inputs)?,
                 output: ident(circuit, *output),
             },
+            CircuitInstr::Keccak256 {
+                alignment,
+                inputs,
+                output,
+            } => Instruction::Keccak256 {
+                alignment: to_alignment(alignment),
+                inputs: operands(circuit, inputs)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Sha512 {
+                alignment,
+                inputs,
+                output,
+            } => Instruction::Sha512 {
+                alignment: to_alignment(alignment),
+                inputs: operands(circuit, inputs)?,
+                output: ident(circuit, *output),
+            },
             CircuitInstr::TransientHash { inputs, output } => Instruction::TransientHash {
                 inputs: operands(circuit, inputs)?,
                 output: ident(circuit, *output),
@@ -269,6 +322,45 @@ fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirEr
                 bytes: Operand::Variable(ident(circuit, *bytes)),
                 outputs: outputs.iter().map(|v| ident(circuit, *v)).collect(),
             },
+            CircuitInstr::BytesFromNatives {
+                inputs,
+                len,
+                output,
+            } => Instruction::BytesFromNatives {
+                inputs: operands(circuit, inputs)?,
+                len: *len,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::ToBytes { input, output } => Instruction::ToBytes {
+                input: operand(circuit, input)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::FromBytes {
+                bytes,
+                val_t,
+                output,
+            } => Instruction::FromBytes {
+                bytes: Operand::Variable(ident(circuit, *bytes)),
+                val_t: to_ir_type(*val_t),
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Slice {
+                bytes,
+                start,
+                len,
+                output,
+            } => Instruction::Slice {
+                bytes: Operand::Variable(ident(circuit, *bytes)),
+                start: *start,
+                len: *len,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::JubjubScalarFromNative { native, output } => {
+                Instruction::JubjubScalarFromNative {
+                    native: operand(circuit, native)?,
+                    output: ident(circuit, *output),
+                }
+            }
             CircuitInstr::DivModPowerOfTwo {
                 val,
                 bits,
@@ -300,6 +392,31 @@ fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirEr
             },
             CircuitInstr::Neg { a, output } => Instruction::Neg {
                 a: operand(circuit, a)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Inv { a, output } => Instruction::Inv {
+                a: operand(circuit, a)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::EcMul { a, scalar, output } => Instruction::EcMul {
+                a: operand(circuit, a)?,
+                scalar: operand(circuit, scalar)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::EcMulGenerator { scalar, output } => Instruction::EcMulGenerator {
+                scalar: operand(circuit, scalar)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::HashToCurve { inputs, output } => Instruction::HashToCurve {
+                inputs: operands(circuit, inputs)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::IntoCoordinates { point, x, y } => Instruction::IntoCoordinates {
+                point: operand(circuit, point)?,
+                outputs: (ident(circuit, *x), ident(circuit, *y)),
+            },
+            CircuitInstr::FromCoordinates { x, y, output } => Instruction::FromCoordinates {
+                inputs: (operand(circuit, x)?, operand(circuit, y)?),
                 output: ident(circuit, *output),
             },
             CircuitInstr::CondSelect { bit, a, b, output } => Instruction::CondSelect {
@@ -810,6 +927,14 @@ mod tests {
     fn zkir_kernel_block_time_and_tokens() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/token_vault.compact"),
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_crypto_curves_and_signatures() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/crypto_curves.compact"),
             compile_all_zkir
         );
     }

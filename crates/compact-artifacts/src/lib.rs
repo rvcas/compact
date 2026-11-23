@@ -107,6 +107,15 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             map.insert("type-name".into(), Value::String("Bytes".into()));
             map.insert("length".into(), Value::Number((*len as u64).into()));
         }
+        Type::CurveField(f) => {
+            map.insert("type-name".into(), Value::String(f.type_name().into()));
+        }
+        Type::CurvePoint(c) => {
+            map.insert(
+                "type-name".into(),
+                Value::String(c.point_type_name().into()),
+            );
+        }
         Type::Opaque(ts_ty) => {
             map.insert("type-name".into(), Value::String("Opaque".into()));
             map.insert("tsType".into(), Value::String(ts_ty.clone()));

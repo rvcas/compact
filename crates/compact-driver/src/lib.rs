@@ -861,4 +861,63 @@ mod tests {
         // `Kernel` is not a public contract state slot in `contract-info.json`.
         assert_eq!(info["ledger"].as_array().unwrap().len(), 2);
     }
+
+    #[test]
+    fn end_to_end_build_and_check_crypto_curves() {
+        let src_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/crypto_curves.compact");
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+
+        let check_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let hir = check_with_reporter(
+            &CheckOptions {
+                source: src_path.clone(),
+            },
+            &check_reporter,
+        )
+        .unwrap();
+        // 8 user ledger fields (`kernel` is only added when referenced)
+        assert_eq!(hir.ledger_fields.len(), 8);
+
+        let build_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let report = build_with_reporter(
+            &BuildOptions {
+                source: src_path.clone(),
+                target: out_dir.clone(),
+                skip_zk: true,
+            },
+            &build_reporter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.proof_circuits,
+            vec![
+                "verify_jubjub_schnorr",
+                "verify_secp256k1_and_eth",
+                "verify_secp256r1",
+                "verify_ed25519",
+                "foreign_field_and_hashes",
+            ]
+        );
+        for name in &report.proof_circuits {
+            assert!(out_dir.join(format!("zkir/{name}.zkir")).is_file());
+            assert!(out_dir.join(format!("zkir/{name}.bzkir")).is_file());
+        }
+        // `secp256k1EthereumAddress` is pure (exported via `export { ... }`), so no proof ZKIR.
+        assert!(!out_dir.join("zkir/secp256k1EthereumAddress.zkir").exists());
+        assert!(out_dir.join("contract/index.js").is_file());
+        assert!(out_dir.join("contract/index.d.ts").is_file());
+        assert!(out_dir.join("contract/index.js.map").is_file());
+        assert!(out_dir.join("compiler/contract-info.json").is_file());
+        assert!(out_dir.join("compiler/contract-manifest.json").is_file());
+
+        let info: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("compiler/contract-info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["circuits"].as_array().unwrap().len(), 6);
+        assert_eq!(info["ledger"].as_array().unwrap().len(), 8);
+    }
 }

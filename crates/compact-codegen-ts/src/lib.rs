@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use compact_hir::{
-    BinaryOp, Circuit, CircuitId, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
-    NewTypeDecl, Param, Program as HirProgram, Stmt, StructDecl, Type, UnaryOp,
+    BinaryOp, Circuit, CircuitId, CurveFieldKind, CurveKind, EnumDecl, Expr, ExprKind, LedgerAdt,
+    LedgerOp, LocalId, NewTypeDecl, Param, Program as HirProgram, Stmt, StructDecl, Type, UnaryOp,
 };
 use compact_span::Span as CompactSpan;
 use oxc_allocator::{Allocator, ArenaVec, GetAllocator};
@@ -231,7 +231,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
 
     fn hir_type_to_ts(&self, ty: &Type) -> TSType<'a> {
         match ty {
-            Type::Field | Type::Uint(_) => TSType::new_ts_big_int_keyword(SPAN, self),
+            Type::Field | Type::Uint(_) | Type::CurveField(_) => {
+                TSType::new_ts_big_int_keyword(SPAN, self)
+            }
+            Type::CurvePoint(curve) => self.ts_runtime_type(curve.point_type_name(), None),
             Type::Boolean => TSType::new_ts_boolean_keyword(SPAN, self),
             Type::Bytes(_) => self.ts_type_ref("Uint8Array", None),
             Type::Opaque(ts_ty) => match ts_ty.as_str() {
@@ -307,13 +310,29 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 | ExprKind::Cast { expr: operand, .. }
                 | ExprKind::Disclose(operand)
                 | ExprKind::PersistentHash { arg: operand, .. }
+                | ExprKind::Keccak256 { arg: operand, .. }
+                | ExprKind::Sha512 { arg: operand, .. }
                 | ExprKind::TransientHash { arg: operand, .. }
                 | ExprKind::DegradeToTransient(operand)
                 | ExprKind::UpgradeFromTransient(operand)
+                | ExprKind::FieldInv(operand)
+                | ExprKind::EcNeg(operand)
+                | ExprKind::EcMulGenerator(operand)
+                | ExprKind::HashToCurve { arg: operand, .. }
+                | ExprKind::PointCoord { point: operand, .. }
                 | ExprKind::MerkleTreePathRoot { path: operand, .. }
                 | ExprKind::FieldAccess { base: operand, .. }
                 | ExprKind::Slice { base: operand, .. }
                 | ExprKind::MaybeSome(operand) => visit_expr(operand, out),
+                ExprKind::EcAdd { lhs: a, rhs: b }
+                | ExprKind::EcMul {
+                    point: a,
+                    scalar: b,
+                }
+                | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+                    visit_expr(a, out);
+                    visit_expr(b, out);
+                }
                 ExprKind::PersistentCommit { value, rand, .. }
                 | ExprKind::TransientCommit { value, rand, .. } => {
                     visit_expr(value, out);
@@ -1896,13 +1915,116 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
 
     fn default_expr_for_type(&self, span: Span, ty: &Type) -> Expression<'a> {
         match ty {
-            Type::Field | Type::Uint(_) => Expression::new_big_int_literal(
+            Type::Field | Type::Uint(_) | Type::CurveField(_) => Expression::new_big_int_literal(
                 span,
                 self.str_atom("0"),
                 None,
                 oxc_syntax::number::BigintBase::Decimal,
                 self,
             ),
+            Type::CurvePoint(curve) => {
+                let zero = Expression::new_big_int_literal(
+                    span,
+                    self.str_atom("0"),
+                    None,
+                    oxc_syntax::number::BigintBase::Decimal,
+                    self,
+                );
+                match curve {
+                    CurveKind::Jubjub | CurveKind::Curve25519 => {
+                        let one = Expression::new_big_int_literal(
+                            span,
+                            self.str_atom("1"),
+                            None,
+                            oxc_syntax::number::BigintBase::Decimal,
+                            self,
+                        );
+                        let mut props = ArenaVec::with_capacity_in(2, self);
+                        props.push(ObjectPropertyKind::new_object_property(
+                            span,
+                            PropertyKind::Init,
+                            PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                span,
+                                self.ident("x"),
+                                self,
+                            )),
+                            zero,
+                            false,
+                            false,
+                            false,
+                            self,
+                        ));
+                        props.push(ObjectPropertyKind::new_object_property(
+                            span,
+                            PropertyKind::Init,
+                            PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                span,
+                                self.ident("y"),
+                                self,
+                            )),
+                            one,
+                            false,
+                            false,
+                            false,
+                            self,
+                        ));
+                        Expression::new_object_expression(span, props, self)
+                    }
+                    CurveKind::Secp256k1 | CurveKind::Secp256r1 => {
+                        let zero2 = Expression::new_big_int_literal(
+                            span,
+                            self.str_atom("0"),
+                            None,
+                            oxc_syntax::number::BigintBase::Decimal,
+                            self,
+                        );
+                        let mut props = ArenaVec::with_capacity_in(3, self);
+                        props.push(ObjectPropertyKind::new_object_property(
+                            span,
+                            PropertyKind::Init,
+                            PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                span,
+                                self.ident("x"),
+                                self,
+                            )),
+                            zero,
+                            false,
+                            false,
+                            false,
+                            self,
+                        ));
+                        props.push(ObjectPropertyKind::new_object_property(
+                            span,
+                            PropertyKind::Init,
+                            PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                span,
+                                self.ident("y"),
+                                self,
+                            )),
+                            zero2,
+                            false,
+                            false,
+                            false,
+                            self,
+                        ));
+                        props.push(ObjectPropertyKind::new_object_property(
+                            span,
+                            PropertyKind::Init,
+                            PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                span,
+                                self.ident("identity"),
+                                self,
+                            )),
+                            self.expr_bool(span, true),
+                            false,
+                            false,
+                            false,
+                            self,
+                        ));
+                        Expression::new_object_expression(span, props, self)
+                    }
+                }
+            }
             Type::Boolean => self.expr_bool(span, false),
             Type::Opaque(ts_ty) => {
                 if ts_ty == "string" {
@@ -2055,6 +2177,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 Expression::new_array_expression(span, arr, self)
             }
             ExprKind::Unary { op, operand } => {
+                if matches!(op, UnaryOp::Neg)
+                    && let Type::CurveField(f) = self.input.program.underlying_type(&operand.ty)
+                {
+                    let mut args = ArenaVec::with_capacity_in(1, self);
+                    args.push(Argument::from(self.lower_expr(params, operand, locals)));
+                    let fn_name = format!("{}Neg", f.runtime_prefix());
+                    return self.expr_call(
+                        span,
+                        self.expr_member(span, self.expr_ident(span, "__compactRuntime"), &fn_name),
+                        args,
+                    );
+                }
                 let uop = match op {
                     UnaryOp::Not => UnaryOperator::LogicalNot,
                     UnaryOp::Neg => UnaryOperator::UnaryNegation,
@@ -2081,10 +2215,30 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         self,
                     );
                 }
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                    && let Type::CurveField(f) = self.input.program.underlying_type(&lhs.ty)
+                {
+                    let suffix = match op {
+                        BinaryOp::Add => "Add",
+                        BinaryOp::Sub => "Sub",
+                        BinaryOp::Mul => "Mul",
+                        _ => unreachable!(),
+                    };
+                    let fn_name = format!("{}{suffix}", f.runtime_prefix());
+                    let mut call_args = ArenaVec::with_capacity_in(2, self);
+                    call_args.push(Argument::from(self.lower_expr(params, lhs, locals)));
+                    call_args.push(Argument::from(self.lower_expr(params, rhs, locals)));
+                    return self.expr_call(
+                        span,
+                        self.expr_member(span, self.expr_ident(span, "__compactRuntime"), &fn_name),
+                        call_args,
+                    );
+                }
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
                     && matches!(
-                        lhs.ty,
+                        self.input.program.underlying_type(&lhs.ty),
                         Type::Bytes(_)
+                            | Type::CurvePoint(_)
                             | Type::Vector(_, _)
                             | Type::Tuple(_)
                             | Type::Struct(_)
@@ -2258,6 +2412,54 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             self,
                         )
                     }
+                    (
+                        Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_),
+                        Type::CurveField(CurveFieldKind::JubjubScalar),
+                    ) => {
+                        let mut call_args = ArenaVec::with_capacity_in(1, self);
+                        call_args.push(Argument::from(self.lower_expr(params, expr, locals)));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "convertNumericToJubjubScalar",
+                            ),
+                            call_args,
+                        )
+                    }
+                    (Type::CurveField(_) | Type::Field, Type::Bytes(n)) => {
+                        let mut call_args = ArenaVec::with_capacity_in(2, self);
+                        call_args.push(Argument::from(self.expr_num(span, *n as f64)));
+                        call_args.push(Argument::from(self.lower_expr(params, expr, locals)));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "convertBigintToBytes",
+                            ),
+                            call_args,
+                        )
+                    }
+                    (Type::Bytes(_), Type::CurveField(f)) => {
+                        let mut call_args = ArenaVec::with_capacity_in(2, self);
+                        call_args.push(Argument::from(self.lower_expr(params, expr, locals)));
+                        call_args.push(Argument::from(self.expr_member(
+                            span,
+                            self.expr_ident(span, "__compactRuntime"),
+                            f.runtime_max_const(),
+                        )));
+                        self.expr_call(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "convertBytesToField",
+                            ),
+                            call_args,
+                        )
+                    }
                     _ => self.lower_expr(params, expr, locals),
                 }
             }
@@ -2378,6 +2580,143 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         self.expr_ident(span, "__compactRuntime"),
                         "persistentHash",
                     ),
+                    call_args,
+                )
+            }
+            ExprKind::Keccak256 { arg, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "keccak256"),
+                    call_args,
+                )
+            }
+            ExprKind::Sha512 { arg, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "sha512"),
+                    call_args,
+                )
+            }
+            ExprKind::FieldInv(arg) => {
+                let fn_name = match self.input.program.underlying_type(&arg.ty) {
+                    Type::CurveField(f) => format!("{}Inv", f.runtime_prefix()),
+                    _ => "fieldInv".to_owned(),
+                };
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), &fn_name),
+                    call_args,
+                )
+            }
+            ExprKind::EcAdd { lhs, rhs } => {
+                let fn_name = match self.input.program.underlying_type(&lhs.ty) {
+                    Type::CurvePoint(CurveKind::Jubjub) => "ecAdd",
+                    Type::CurvePoint(CurveKind::Secp256k1) => "secp256k1Add",
+                    Type::CurvePoint(CurveKind::Secp256r1) => "secp256r1Add",
+                    Type::CurvePoint(CurveKind::Curve25519) => "curve25519Add",
+                    _ => "ecAdd",
+                };
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.lower_expr(params, lhs, locals)));
+                call_args.push(Argument::from(self.lower_expr(params, rhs, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), fn_name),
+                    call_args,
+                )
+            }
+            ExprKind::EcNeg(arg) => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "ecNeg"),
+                    call_args,
+                )
+            }
+            ExprKind::EcMul { point, scalar } => {
+                let fn_name = match self.input.program.underlying_type(&point.ty) {
+                    Type::CurvePoint(CurveKind::Jubjub) => "ecMul",
+                    Type::CurvePoint(CurveKind::Secp256k1) => "secp256k1Mul",
+                    Type::CurvePoint(CurveKind::Secp256r1) => "secp256r1Mul",
+                    Type::CurvePoint(CurveKind::Curve25519) => "curve25519Mul",
+                    _ => "ecMul",
+                };
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.lower_expr(params, point, locals)));
+                call_args.push(Argument::from(self.lower_expr(params, scalar, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), fn_name),
+                    call_args,
+                )
+            }
+            ExprKind::EcMulGenerator(scalar) => {
+                let fn_name = match self.input.program.underlying_type(&scalar.ty) {
+                    Type::CurveField(CurveFieldKind::JubjubScalar) => "ecMulGenerator",
+                    Type::CurveField(CurveFieldKind::Secp256k1Scalar) => "secp256k1MulGenerator",
+                    Type::CurveField(CurveFieldKind::Secp256r1Scalar) => "secp256r1MulGenerator",
+                    Type::CurveField(CurveFieldKind::Curve25519Scalar) => "curve25519MulGenerator",
+                    _ => "ecMulGenerator",
+                };
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, scalar, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), fn_name),
+                    call_args,
+                )
+            }
+            ExprKind::HashToCurve { arg, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "hashToCurve",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::ConstructJubjubPoint { x, y } => {
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.lower_expr(params, x, locals)));
+                call_args.push(Argument::from(self.lower_expr(params, y, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "constructJubjubPoint",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::PointCoord { point, is_y } => {
+                let fn_name = match (self.input.program.underlying_type(&point.ty), *is_y) {
+                    (Type::CurvePoint(CurveKind::Jubjub), false) => "jubjubPointX",
+                    (Type::CurvePoint(CurveKind::Jubjub), true) => "jubjubPointY",
+                    (Type::CurvePoint(CurveKind::Secp256k1), false) => "secp256k1PointX",
+                    (Type::CurvePoint(CurveKind::Secp256k1), true) => "secp256k1PointY",
+                    (Type::CurvePoint(CurveKind::Secp256r1), false) => "secp256r1PointX",
+                    (Type::CurvePoint(CurveKind::Secp256r1), true) => "secp256r1PointY",
+                    (Type::CurvePoint(CurveKind::Curve25519), false) => "curve25519PointX",
+                    (Type::CurvePoint(CurveKind::Curve25519), true) => "curve25519PointY",
+                    _ => "jubjubPointX",
+                };
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, point, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), fn_name),
                     call_args,
                 )
             }
@@ -3115,6 +3454,14 @@ mod tests {
     fn codegen_kernel_block_time_and_tokens() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/token_vault.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_crypto_curves_and_signatures() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/crypto_curves.compact"),
             compile_ts_bundle
         );
     }
