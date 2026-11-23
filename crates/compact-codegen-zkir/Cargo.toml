@@ -11,6 +11,7 @@ midnight-base-crypto.workspace = true
 midnight-serialize.workspace = true
 midnight-transient-crypto.workspace = true
 midnight-zkir.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

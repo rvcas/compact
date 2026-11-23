@@ -531,6 +531,7 @@ dependencies = [
  "midnight-serialize",
  "midnight-transient-crypto",
  "midnight-zkir",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror",

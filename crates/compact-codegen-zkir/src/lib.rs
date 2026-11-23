@@ -2,14 +2,23 @@ use std::fmt::Write as _;
 
 use compact_circuit::{AlignmentAtom, CircuitInstr, CircuitVal, CircuitVar, ProofCircuit};
 use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
+use midnight_base_crypto::fab::{Alignment, AlignmentAtom as FabAlignmentAtom, AlignmentSegment};
 use midnight_serialize::tagged_serialize;
+use midnight_transient_crypto::curve::Fr;
 use midnight_transient_crypto::proofs::Zkir;
-use midnight_zkir::IrSource;
+use midnight_zkir::ir::Operand;
+use midnight_zkir::ir_types::IrType;
+use midnight_zkir::{Identifier, Instruction, IrSource};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ZkirError {
+    #[error("invalid field immediate `{value}` in circuit `{circuit}`")]
+    InvalidImmediate { circuit: String, value: String },
+    #[error("failed to serialize ZKIR JSON for circuit `{circuit}`: {message}")]
+    SerializeJson { circuit: String, message: String },
     #[error("failed to load generated ZKIR for circuit `{circuit}`: {message}")]
     LoadIr { circuit: String, message: String },
     #[error("failed to serialize bzkir for circuit `{circuit}`: {message}")]
@@ -30,7 +39,7 @@ pub enum ZkirError {
 pub struct GeneratedZkir {
     pub name: String,
     pub ir: IrSource,
-    /// Pretty-formatted `.zkir` v3.1 JSON (matching upstream `print-zkir-v3.ss`).
+    /// Pretty-formatted `.zkir` v3.1 JSON (one instruction per line).
     pub json: String,
     /// Tagged binary `.bzkir` encoding produced by `midnight-serialize`.
     pub bzkir: Vec<u8>,
@@ -51,14 +60,32 @@ pub struct CircuitModelSummary {
     pub rows: usize,
 }
 
-/// Lower a flattened proof circuit into canonical `.zkir` v3.1 JSON, validate and
-/// hydrate Midnight's native [`IrSource`], and produce tagged `.bzkir` bytes.
+/// Lower a flattened proof circuit into typed `midnight-zkir` instructions, serialize
+/// canonical `.zkir` v3.1 JSON, hydrate [`IrSource`], and produce tagged `.bzkir` bytes.
 pub fn generate_zkir(circuit: &ProofCircuit) -> Result<GeneratedZkir, ZkirError> {
-    let json = format_circuit_zkir(circuit);
+    let inputs: Vec<ZkirInput> = circuit
+        .inputs
+        .iter()
+        .map(|&v| ZkirInput {
+            name: ident(circuit, v),
+            val_t: IrType::Native,
+        })
+        .collect();
+    let outputs = vec![IrType::Native; circuit.output_count];
+    let instructions = lower_instructions(circuit)?;
+
+    let json = render_zkir_json(&inputs, &outputs, &instructions).map_err(|e| {
+        ZkirError::SerializeJson {
+            circuit: circuit.name.clone(),
+            message: e.to_string(),
+        }
+    })?;
     let ir = IrSource::load(json.as_bytes()).map_err(|e| ZkirError::LoadIr {
         circuit: circuit.name.clone(),
         message: e.to_string(),
     })?;
+    debug_assert_eq!(ir.outputs, outputs);
+    debug_assert_eq!(ir.instructions.as_slice(), instructions.as_slice());
 
     let mut bzkir = Vec::new();
     tagged_serialize(&ir, &mut bzkir).map_err(|e| ZkirError::SerializeBzkir {
@@ -126,318 +153,206 @@ pub fn compile_keys_with_model(
     })
 }
 
-fn var_name(circuit: &ProofCircuit, var: CircuitVar) -> String {
-    let hint = &circuit.var_names[var.id as usize];
-    format!("%{hint}.{}", var.id)
+#[derive(Serialize)]
+struct ZkirVersion {
+    major: u8,
+    minor: u8,
 }
 
-/// Format a signed integer immediate into ZKIR v3 little-endian hex (`"0x00"`, `"-0x02"`, ...).
-fn format_imm(val: i128) -> String {
-    let mut s = String::new();
-    let mut n = if val < 0 {
-        s.push_str("-0x");
-        val.unsigned_abs()
-    } else {
-        s.push_str("0x");
-        val as u128
-    };
-    loop {
-        let byte = (n & 0xff) as u8;
-        write!(s, "{byte:02x}").unwrap();
-        n >>= 8;
-        if n == 0 {
-            break;
+#[derive(Serialize)]
+struct ZkirInput {
+    name: Identifier,
+    #[serde(rename = "type")]
+    val_t: IrType,
+}
+
+fn ident(circuit: &ProofCircuit, var: CircuitVar) -> Identifier {
+    let hint = &circuit.var_names[var.id as usize];
+    Identifier(format!("%{hint}.{}", var.id))
+}
+
+fn imm_to_fr(circuit: &ProofCircuit, val: i128) -> Result<Fr, ZkirError> {
+    let bytes = val.unsigned_abs().to_le_bytes();
+    let f = Fr::from_le_bytes(&bytes).ok_or_else(|| ZkirError::InvalidImmediate {
+        circuit: circuit.name.clone(),
+        value: val.to_string(),
+    })?;
+    Ok(if val < 0 { -f } else { f })
+}
+
+fn operand(circuit: &ProofCircuit, val: &CircuitVal) -> Result<Operand, ZkirError> {
+    match val {
+        CircuitVal::Var(v) => Ok(Operand::Variable(ident(circuit, *v))),
+        CircuitVal::Imm(n) => Ok(Operand::Immediate(imm_to_fr(circuit, *n)?)),
+        CircuitVal::ImmBytes(bytes) => {
+            let f = Fr::from_le_bytes(bytes).ok_or_else(|| ZkirError::InvalidImmediate {
+                circuit: circuit.name.clone(),
+                value: format!("0x{}", hex::encode(bytes)),
+            })?;
+            Ok(Operand::Immediate(f))
         }
     }
-    s
 }
 
-fn format_val(circuit: &ProofCircuit, val: &CircuitVal) -> String {
-    match val {
-        CircuitVal::Var(v) => format!("\"{}\"", var_name(circuit, *v)),
-        CircuitVal::Imm(n) => format!("\"{}\"", format_imm(*n)),
-        CircuitVal::ImmBytes(bytes) => format!("\"0x{}\"", hex::encode(bytes)),
-    }
+fn operands(circuit: &ProofCircuit, vals: &[CircuitVal]) -> Result<Vec<Operand>, ZkirError> {
+    vals.iter().map(|v| operand(circuit, v)).collect()
 }
 
-fn format_alignment(alignment: &[AlignmentAtom]) -> String {
-    let items: Vec<String> = alignment
-        .iter()
-        .map(|atom| match atom {
-            AlignmentAtom::Bytes(len) => {
-                format!("{{ \"tag\": \"atom\", \"value\": {{ \"length\": {len}, \"tag\": \"bytes\" }} }}")
-            }
-            AlignmentAtom::Field => {
-                "{ \"tag\": \"atom\", \"value\": { \"tag\": \"field\" } }".to_owned()
-            }
-            AlignmentAtom::Compress => {
-                "{ \"tag\": \"atom\", \"value\": { \"tag\": \"compress\" } }".to_owned()
-            }
-        })
-        .collect();
-    format!("[{}]", items.join(", "))
+fn to_alignment(alignment: &[AlignmentAtom]) -> Alignment {
+    Alignment(
+        alignment
+            .iter()
+            .map(|atom| {
+                AlignmentSegment::Atom(match atom {
+                    AlignmentAtom::Bytes(length) => FabAlignmentAtom::Bytes { length: *length },
+                    AlignmentAtom::Field => FabAlignmentAtom::Field,
+                    AlignmentAtom::Compress => FabAlignmentAtom::Compress,
+                })
+            })
+            .collect(),
+    )
 }
 
-/// Format a [`ProofCircuit`] into canonical upstream `.zkir` v3.1 JSON.
-fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
-    let mut out = String::new();
-    writeln!(out, "{{").unwrap();
-    writeln!(out, "  \"version\": {{ \"major\": 3, \"minor\": 1 }},").unwrap();
-    writeln!(out, "  \"do_communications_commitment\": true,").unwrap();
-
-    writeln!(out, "  \"inputs\": [").unwrap();
-    for (idx, &inp) in circuit.inputs.iter().enumerate() {
-        let comma = if idx + 1 < circuit.inputs.len() {
-            ","
-        } else {
-            ""
-        };
-        writeln!(
-            out,
-            "    {{ \"name\": \"{}\", \"type\": \"Scalar<BLS12-381>\" }}{comma}",
-            var_name(circuit, inp)
-        )
-        .unwrap();
-    }
-    writeln!(out, "  ],").unwrap();
-
-    writeln!(out, "  \"outputs\": [").unwrap();
-    for idx in 0..circuit.output_count {
-        let comma = if idx + 1 < circuit.output_count {
-            ","
-        } else {
-            ""
-        };
-        writeln!(out, "    \"Scalar<BLS12-381>\"{comma}").unwrap();
-    }
-    writeln!(out, "  ],").unwrap();
-
-    writeln!(out, "  \"instructions\": [").unwrap();
-    for (idx, instr) in circuit.instructions.iter().enumerate() {
-        let comma = if idx + 1 < circuit.instructions.len() {
-            ","
-        } else {
-            ""
-        };
-        match instr {
-            CircuitInstr::PublicInput { guard, output } => {
-                let guard_str = match guard {
-                    Some(g) => format_val(circuit, g),
-                    None => "null".to_owned(),
-                };
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"public_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"{}\", \"guard\": {guard_str} }}{comma}",
-                    var_name(circuit, *output)
-                )
-                .unwrap();
-            }
-            CircuitInstr::PrivateInput { guard, output } => {
-                let guard_str = match guard {
-                    Some(g) => format_val(circuit, g),
-                    None => "null".to_owned(),
-                };
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"private_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"{}\", \"guard\": {guard_str} }}{comma}",
-                    var_name(circuit, *output)
-                )
-                .unwrap();
-            }
-            CircuitInstr::ConstrainToBoolean { val } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"constrain_to_boolean\", \"val\": {} }}{comma}",
-                    format_val(circuit, val)
-                )
-                .unwrap();
-            }
-            CircuitInstr::ConstrainBits { val, bits } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"constrain_bits\", \"val\": {}, \"bits\": {bits} }}{comma}",
-                    format_val(circuit, val)
-                )
-                .unwrap();
-            }
-            CircuitInstr::ConstrainEq { a, b } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"constrain_eq\", \"a\": {}, \"b\": {} }}{comma}",
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::LessThan { a, b, bits, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"less_than\", \"output\": \"{}\", \"a\": {}, \"b\": {}, \"bits\": {bits} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Copy { val, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"copy\", \"output\": \"{}\", \"val\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, val)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Impact { guard, op } => {
-                let guard_str = format_val(circuit, guard);
-                let inputs: Vec<_> = op
-                    .assemble()
-                    .iter()
-                    .map(|v| format_val(circuit, v))
-                    .collect();
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"impact\", \"guard\": {guard_str}, \"inputs\": [{}] }}{comma}",
-                    inputs.join(", ")
-                )
-                .unwrap();
-            }
+fn lower_instructions(circuit: &ProofCircuit) -> Result<Vec<Instruction>, ZkirError> {
+    let mut out = Vec::with_capacity(circuit.instructions.len());
+    for instr in &circuit.instructions {
+        let zkir_instr = match instr {
+            CircuitInstr::PublicInput { guard, output } => Instruction::PublicInput {
+                guard: guard.as_ref().map(|g| operand(circuit, g)).transpose()?,
+                val_t: IrType::Native,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::PrivateInput { guard, output } => Instruction::PrivateInput {
+                guard: guard.as_ref().map(|g| operand(circuit, g)).transpose()?,
+                val_t: IrType::Native,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::ConstrainToBoolean { val } => Instruction::ConstrainToBoolean {
+                val: operand(circuit, val)?,
+            },
+            CircuitInstr::ConstrainBits { val, bits } => Instruction::ConstrainBits {
+                val: operand(circuit, val)?,
+                bits: *bits,
+            },
+            CircuitInstr::ConstrainEq { a, b } => Instruction::ConstrainEq {
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+            },
+            CircuitInstr::LessThan { a, b, bits, output } => Instruction::LessThan {
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+                bits: *bits,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Copy { val, output } => Instruction::Copy {
+                val: operand(circuit, val)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Impact { guard, op } => Instruction::Impact {
+                guard: operand(circuit, guard)?,
+                inputs: operands(circuit, &op.assemble())?,
+            },
             CircuitInstr::PersistentHash {
                 alignment,
                 inputs,
                 output,
-            } => {
-                let rendered_inputs: Vec<_> =
-                    inputs.iter().map(|v| format_val(circuit, v)).collect();
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"persistent_hash\", \"output\": \"{}\", \"alignment\": {}, \"inputs\": [{}] }}{comma}",
-                    var_name(circuit, *output),
-                    format_alignment(alignment),
-                    rendered_inputs.join(", ")
-                )
-                .unwrap();
-            }
-            CircuitInstr::TransientHash { inputs, output } => {
-                let rendered_inputs: Vec<_> =
-                    inputs.iter().map(|v| format_val(circuit, v)).collect();
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"transient_hash\", \"output\": \"{}\", \"inputs\": [{}] }}{comma}",
-                    var_name(circuit, *output),
-                    rendered_inputs.join(", ")
-                )
-                .unwrap();
-            }
-            CircuitInstr::BytesIntoNatives { bytes, outputs } => {
-                let rendered_outputs: Vec<_> = outputs
-                    .iter()
-                    .map(|v| format!("\"{}\"", var_name(circuit, *v)))
-                    .collect();
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"bytes_into_natives\", \"outputs\": [{}], \"bytes\": \"{}\" }}{comma}",
-                    rendered_outputs.join(", "),
-                    var_name(circuit, *bytes)
-                )
-                .unwrap();
-            }
+            } => Instruction::PersistentHash {
+                alignment: to_alignment(alignment),
+                inputs: operands(circuit, inputs)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::TransientHash { inputs, output } => Instruction::TransientHash {
+                inputs: operands(circuit, inputs)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::BytesIntoNatives { bytes, outputs } => Instruction::BytesIntoNatives {
+                bytes: Operand::Variable(ident(circuit, *bytes)),
+                outputs: outputs.iter().map(|v| ident(circuit, *v)).collect(),
+            },
             CircuitInstr::DivModPowerOfTwo {
                 val,
                 bits,
                 quotient,
                 remainder,
-            } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"div_mod_power_of_two\", \"outputs\": [\"{}\", \"{}\"], \"val\": {}, \"bits\": {bits} }}{comma}",
-                    var_name(circuit, *quotient),
-                    var_name(circuit, *remainder),
-                    format_val(circuit, val)
-                )
-                .unwrap();
-            }
-            CircuitInstr::TestEq { a, b, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"test_eq\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Not { a, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"not\", \"output\": \"{}\", \"a\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Add { a, b, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"add\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Mul { a, b, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"mul\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Neg { a, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"neg\", \"output\": \"{}\", \"a\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, a)
-                )
-                .unwrap();
-            }
-            CircuitInstr::CondSelect { bit, a, b, output } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"cond_select\", \"output\": \"{}\", \"bit\": {}, \"a\": {}, \"b\": {} }}{comma}",
-                    var_name(circuit, *output),
-                    format_val(circuit, bit),
-                    format_val(circuit, a),
-                    format_val(circuit, b)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Assert { cond } => {
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"assert\", \"cond\": {} }}{comma}",
-                    format_val(circuit, cond)
-                )
-                .unwrap();
-            }
-            CircuitInstr::Output { vals } => {
-                let rendered: Vec<_> = vals.iter().map(|v| format_val(circuit, v)).collect();
-                writeln!(
-                    out,
-                    "    {{ \"op\": \"output\", \"vals\": [{}] }}{comma}",
-                    rendered.join(", ")
-                )
-                .unwrap();
-            }
-        }
+            } => Instruction::DivModPowerOfTwo {
+                val: operand(circuit, val)?,
+                bits: *bits,
+                outputs: vec![ident(circuit, *quotient), ident(circuit, *remainder)],
+            },
+            CircuitInstr::TestEq { a, b, output } => Instruction::TestEq {
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Not { a, output } => Instruction::Not {
+                a: operand(circuit, a)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Add { a, b, output } => Instruction::Add {
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Mul { a, b, output } => Instruction::Mul {
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Neg { a, output } => Instruction::Neg {
+                a: operand(circuit, a)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::CondSelect { bit, a, b, output } => Instruction::CondSelect {
+                bit: operand(circuit, bit)?,
+                a: operand(circuit, a)?,
+                b: operand(circuit, b)?,
+                output: ident(circuit, *output),
+            },
+            CircuitInstr::Assert { cond } => Instruction::Assert {
+                cond: operand(circuit, cond)?,
+            },
+            CircuitInstr::Output { vals } => Instruction::Output {
+                vals: operands(circuit, vals)?,
+            },
+        };
+        out.push(zkir_instr);
     }
-    writeln!(out, "  ]").unwrap();
+    Ok(out)
+}
+
+fn write_json_array<T: Serialize>(
+    out: &mut String,
+    key: &str,
+    items: &[T],
+    trailing_comma: bool,
+) -> Result<(), serde_json::Error> {
+    writeln!(out, "  \"{key}\": [").unwrap();
+    for (idx, item) in items.iter().enumerate() {
+        let serialized = serde_json::to_string(item)?;
+        let comma = if idx + 1 < items.len() { "," } else { "" };
+        writeln!(out, "    {serialized}{comma}").unwrap();
+    }
+    let end_comma = if trailing_comma { "," } else { "" };
+    writeln!(out, "  ]{end_comma}").unwrap();
+    Ok(())
+}
+
+/// Render a `.zkir` v3.1 JSON document with one compact `serde_json`-serialized entry per line.
+fn render_zkir_json(
+    inputs: &[ZkirInput],
+    outputs: &[IrType],
+    instructions: &[Instruction],
+) -> Result<String, serde_json::Error> {
+    let version = serde_json::to_string(&ZkirVersion { major: 3, minor: 1 })?;
+    let mut out = String::new();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "  \"version\": {version},").unwrap();
+    writeln!(out, "  \"do_communications_commitment\": true,").unwrap();
+    write_json_array(&mut out, "inputs", inputs, true)?;
+    write_json_array(&mut out, "outputs", outputs, true)?;
+    write_json_array(&mut out, "instructions", instructions, false)?;
     writeln!(out, "}}").unwrap();
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

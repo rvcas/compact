@@ -24,32 +24,32 @@ export circuit get(): Field {
 ===
 === set.zkir ===
 {
-  "version": { "major": 3, "minor": 1 },
+  "version": {"major":3,"minor":1},
   "do_communications_commitment": true,
   "inputs": [
-    { "name": "%v.0", "type": "Scalar<BLS12-381>" }
+    {"name":"%v.0","type":"Scalar<BLS12-381>"}
   ],
   "outputs": [
   ],
   "instructions": [
-    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%state.1", "guard": null },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x01"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x01", "%state.1"] },
-    { "op": "test_eq", "output": "%t.2", "a": "%state.1", "b": "0x00" },
-    { "op": "assert", "cond": "%t.2" },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x00"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "-0x02", "%v.0"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x01", "0x01"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] }
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%state.1"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0c","0x01","0x01","%state.1"]},
+    {"op":"test_eq","a":"%state.1","b":"0x00","output":"%t.2"},
+    {"op":"assert","cond":"%t.2"},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%v.0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]}
   ]
 }
 
 === get.zkir ===
 {
-  "version": { "major": 3, "minor": 1 },
+  "version": {"major":3,"minor":1},
   "do_communications_commitment": true,
   "inputs": [
   ],
@@ -57,16 +57,16 @@ export circuit get(): Field {
     "Scalar<BLS12-381>"
   ],
   "instructions": [
-    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%state.0", "guard": null },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x01"] },
-    { "op": "impact", "guard": "0x01", "inputs": ["0x0c", "0x01", "0x01", "%state.0"] },
-    { "op": "test_eq", "output": "%t.1", "a": "%state.0", "b": "0x01" },
-    { "op": "public_input", "type": "Scalar<BLS12-381>", "output": "%value.2", "guard": "%t.1" },
-    { "op": "impact", "guard": "%t.1", "inputs": ["0x30"] },
-    { "op": "impact", "guard": "%t.1", "inputs": ["0x50", "0x01", "0x01", "0x00"] },
-    { "op": "impact", "guard": "%t.1", "inputs": ["0x0c", "0x01", "-0x02", "%value.2"] },
-    { "op": "cond_select", "output": "%t.3", "bit": "%t.1", "a": "%value.2", "b": "0x00" },
-    { "op": "output", "vals": ["%t.3"] }
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%state.0"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0c","0x01","0x01","%state.0"]},
+    {"op":"test_eq","a":"%state.0","b":"0x01","output":"%t.1"},
+    {"op":"public_input","guard":"%t.1","type":"Scalar<BLS12-381>","output":"%value.2"},
+    {"op":"impact","guard":"%t.1","inputs":["0x30"]},
+    {"op":"impact","guard":"%t.1","inputs":["0x50","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"%t.1","inputs":["0x0c","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%value.2"]},
+    {"op":"cond_select","bit":"%t.1","a":"%value.2","b":"0x00","output":"%t.3"},
+    {"op":"output","vals":["%t.3"]}
   ]
 }
