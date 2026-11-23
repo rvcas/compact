@@ -5,12 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: 1
   INSTA_UPDATE: no
 
 jobs:
@@ -19,15 +27,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-      - run: cargo fmt --all -- --check
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+      - name: Format check
+        run: cargo fmt --all -- --check
 
   check-and-test:
     name: Clippy & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+          echo "::add-matcher::.github/rust-matcher.json"
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

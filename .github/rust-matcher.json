@@ -1,0 +1,21 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "rust",
+      "pattern": [
+        {
+          "regexp": "^(error|warning)(?:\\[(E\\d+)\\])?:\\s+(.+)$",
+          "severity": 1,
+          "code": 2,
+          "message": 3
+        },
+        {
+          "regexp": "^\\s*-->\\s+(.+):(\\d+):(\\d+)$",
+          "file": 1,
+          "line": 2,
+          "column": 3
+        }
+      ]
+    }
+  ]
+}
