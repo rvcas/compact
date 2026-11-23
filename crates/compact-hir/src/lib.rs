@@ -24,26 +24,51 @@ pub struct ParamId(pub u32);
 pub struct LocalId(pub u32);
 
 /// Built-in ledger Abstract Data Types from Midnight's ledger specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LedgerAdt {
     /// Implicit single-value cell wrapping ordinary Compact types (e.g. `Field`, `Bytes<32>`, enums).
-    Cell,
+    Cell(Box<Type>),
     Counter,
-    Set,
+    Set(Box<Type>),
+    List(Box<Type>),
+    /// Unbounded map whose values can be plain `Cell` types or nested ledger ADTs.
+    Map {
+        key: Box<Type>,
+        value: Box<LedgerAdt>,
+    },
     /// Bounded Merkle tree of depth `nat` (`2 <= nat <= 32`).
-    MerkleTree(u32),
+    MerkleTree {
+        depth: u32,
+        value: Box<Type>,
+    },
     /// Bounded Merkle tree of depth `nat` (`2 <= nat <= 32`) with historic root set.
-    HistoricMerkleTree(u32),
+    HistoricMerkleTree {
+        depth: u32,
+        value: Box<Type>,
+    },
 }
 
 impl LedgerAdt {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
-            Self::Cell => "Cell",
+            Self::Cell(_) => "Cell",
             Self::Counter => "Counter",
-            Self::Set => "Set",
-            Self::MerkleTree(_) => "MerkleTree",
-            Self::HistoricMerkleTree(_) => "HistoricMerkleTree",
+            Self::Set(_) => "Set",
+            Self::List(_) => "List",
+            Self::Map { .. } => "Map",
+            Self::MerkleTree { .. } => "MerkleTree",
+            Self::HistoricMerkleTree { .. } => "HistoricMerkleTree",
+        }
+    }
+
+    pub fn is_cell(&self) -> bool {
+        matches!(self, Self::Cell(_))
+    }
+
+    pub fn cell_type(&self) -> Option<&Type> {
+        match self {
+            Self::Cell(ty) => Some(ty),
+            _ => None,
         }
     }
 }
@@ -53,31 +78,68 @@ impl LedgerAdt {
 pub enum LedgerOp {
     CellRead,
     CellWrite,
+    CellResetToDefault,
     CounterIncrement,
     CounterDecrement,
     CounterRead,
+    CounterResetToDefault,
     SetMember,
     SetInsert,
     SetRemove,
+    SetIsEmpty,
+    SetSize,
+    SetResetToDefault,
+    MapMember,
+    MapLookup,
+    MapInsert,
+    MapInsertDefault,
+    MapRemove,
+    MapIsEmpty,
+    MapSize,
+    MapResetToDefault,
+    ListPushFront,
+    ListPopFront,
+    ListHead,
+    ListLength,
+    ListIsEmpty,
+    ListResetToDefault,
     MerkleTreeInsert,
     MerkleTreeCheckRoot,
+    MerkleTreeResetToDefault,
     HistoricMerkleTreeInsert,
     HistoricMerkleTreeCheckRoot,
+    HistoricMerkleTreeResetToDefault,
 }
 
 impl LedgerOp {
     pub fn name(self) -> &'static str {
         match self {
-            Self::CellRead => "read",
+            Self::CellRead | Self::CounterRead => "read",
             Self::CellWrite => "write",
             Self::CounterIncrement => "increment",
             Self::CounterDecrement => "decrement",
-            Self::CounterRead => "read",
-            Self::SetMember => "member",
-            Self::SetInsert => "insert",
-            Self::SetRemove => "remove",
-            Self::MerkleTreeInsert | Self::HistoricMerkleTreeInsert => "insert",
+            Self::SetMember | Self::MapMember => "member",
+            Self::MapLookup => "lookup",
+            Self::SetInsert
+            | Self::MapInsert
+            | Self::MerkleTreeInsert
+            | Self::HistoricMerkleTreeInsert => "insert",
+            Self::MapInsertDefault => "insertDefault",
+            Self::SetRemove | Self::MapRemove => "remove",
+            Self::SetIsEmpty | Self::MapIsEmpty | Self::ListIsEmpty => "isEmpty",
+            Self::SetSize | Self::MapSize => "size",
+            Self::ListPushFront => "pushFront",
+            Self::ListPopFront => "popFront",
+            Self::ListHead => "head",
+            Self::ListLength => "length",
             Self::MerkleTreeCheckRoot | Self::HistoricMerkleTreeCheckRoot => "checkRoot",
+            Self::CellResetToDefault
+            | Self::CounterResetToDefault
+            | Self::SetResetToDefault
+            | Self::MapResetToDefault
+            | Self::ListResetToDefault
+            | Self::MerkleTreeResetToDefault
+            | Self::HistoricMerkleTreeResetToDefault => "resetToDefault",
         }
     }
 
@@ -85,12 +147,24 @@ impl LedgerOp {
         matches!(
             self,
             Self::CellWrite
+                | Self::CellResetToDefault
                 | Self::CounterIncrement
                 | Self::CounterDecrement
+                | Self::CounterResetToDefault
                 | Self::SetInsert
                 | Self::SetRemove
+                | Self::SetResetToDefault
+                | Self::MapInsert
+                | Self::MapInsertDefault
+                | Self::MapRemove
+                | Self::MapResetToDefault
+                | Self::ListPushFront
+                | Self::ListPopFront
+                | Self::ListResetToDefault
                 | Self::MerkleTreeInsert
+                | Self::MerkleTreeResetToDefault
                 | Self::HistoricMerkleTreeInsert
+                | Self::HistoricMerkleTreeResetToDefault
         )
     }
 }
@@ -157,8 +231,6 @@ pub struct LedgerField {
     pub id: LedgerFieldId,
     pub name: String,
     pub adt: LedgerAdt,
-    /// Underlying value type (`Field`/`Bytes<32>`/`Enum` for `Cell`; `Uint(64)` for `Counter`).
-    pub value_type: Type,
     pub path: Vec<u32>,
     pub exported: bool,
     pub sealed: bool,
@@ -200,8 +272,13 @@ pub enum UnaryOp {
 pub enum BinaryOp {
     Add,
     Sub,
+    Mul,
     Eq,
     Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     And,
     Or,
 }
@@ -214,6 +291,8 @@ pub enum ExprKind {
     BytesLit(Vec<u8>),
     /// Zero/default value of a Compact type (`default<T>`).
     Default(Type),
+    /// Default initial state value of a ledger ADT (e.g. `default<Counter>`, `default<Map<Field, Counter>>`).
+    DefaultAdt(LedgerAdt),
     ParamRef(ParamId),
     LocalRef(LocalId),
     EnumVariant {
@@ -255,6 +334,10 @@ pub enum ExprKind {
     },
     LedgerCall {
         field: LedgerFieldId,
+        /// Runtime map lookup keys chained before invoking `op` on `target_adt`.
+        key_path: Vec<Expr>,
+        /// Resolved ADT at `field` followed by `key_path`.
+        target_adt: LedgerAdt,
         op: LedgerOp,
         args: Vec<Expr>,
     },
@@ -300,6 +383,23 @@ pub enum Stmt {
         cond: Expr,
         then_branch: Vec<Stmt>,
         else_branch: Vec<Stmt>,
+        span: Span,
+    },
+    ForRange {
+        local: LocalId,
+        name: String,
+        start: u64,
+        end: u64,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    ForEach {
+        local: LocalId,
+        name: String,
+        elem_ty: Type,
+        iter: Expr,
+        len: u32,
+        body: Vec<Stmt>,
         span: Span,
     },
     Expr(Expr),
@@ -414,6 +514,24 @@ impl Program {
         }
     }
 
+    pub fn format_adt(&self, adt: &LedgerAdt) -> String {
+        match adt {
+            LedgerAdt::Cell(ty) => format!("Cell<{}>", self.format_type(ty)),
+            LedgerAdt::Counter => "Counter<Uint<64>>".into(),
+            LedgerAdt::Set(ty) => format!("Set<{}>", self.format_type(ty)),
+            LedgerAdt::List(ty) => format!("List<{}>", self.format_type(ty)),
+            LedgerAdt::Map { key, value } => {
+                format!("Map<{}, {}>", self.format_type(key), self.format_adt(value))
+            }
+            LedgerAdt::MerkleTree { depth, value } => {
+                format!("MerkleTree<{depth}, {}>", self.format_type(value))
+            }
+            LedgerAdt::HistoricMerkleTree { depth, value } => {
+                format!("HistoricMerkleTree<{depth}, {}>", self.format_type(value))
+            }
+        }
+    }
+
     pub fn dump(&self) -> String {
         let mut out = String::new();
         writeln!(out, "HirProgram").unwrap();
@@ -450,13 +568,12 @@ impl Program {
         for field in &self.ledger_fields {
             writeln!(
                 out,
-                "  LedgerField #{} {}{}{}: {}<{}> @ path={:?}",
+                "  LedgerField #{} {}{}{}: {} @ path={:?}",
                 field.id.0,
                 if field.exported { "export " } else { "" },
                 if field.sealed { "sealed " } else { "" },
                 field.name,
-                field.adt.name(),
-                self.format_type(&field.value_type),
+                self.format_adt(&field.adt),
                 field.path
             )
             .unwrap();
@@ -525,6 +642,37 @@ impl Program {
                         cond.kind,
                         then_branch.len(),
                         else_branch.len()
+                    )
+                    .unwrap(),
+                    Stmt::ForRange {
+                        local,
+                        name,
+                        start,
+                        end,
+                        body,
+                        ..
+                    } => writeln!(
+                        out,
+                        "    ForRange #{} {} in {}..{} ({} stmts)",
+                        local.0,
+                        name,
+                        start,
+                        end,
+                        body.len()
+                    )
+                    .unwrap(),
+                    Stmt::ForEach {
+                        local,
+                        name,
+                        len,
+                        body,
+                        ..
+                    } => writeln!(
+                        out,
+                        "    ForEach #{} {} (len={len}, {} stmts)",
+                        local.0,
+                        name,
+                        body.len()
                     )
                     .unwrap(),
                     Stmt::Expr(e) => writeln!(out, "    ExprStmt {:?}", e.kind).unwrap(),

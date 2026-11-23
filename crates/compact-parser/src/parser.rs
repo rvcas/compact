@@ -450,6 +450,7 @@ impl<'a> Parser<'a> {
     fn parse_stmt(&mut self) -> Option<NodeIndex> {
         match self.peek() {
             TokenTag::If => self.parse_if_stmt(),
+            TokenTag::For => self.parse_for_stmt(),
             TokenTag::Return => {
                 let ret_tok = self.advance();
                 let expr = if self.peek() == TokenTag::Semi {
@@ -539,6 +540,64 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn parse_for_stmt(&mut self) -> Option<NodeIndex> {
+        let for_tok = self.expect(TokenTag::For)?;
+        self.expect(TokenTag::LParen)?;
+        self.expect(TokenTag::Const)?;
+        let name_tok = self.expect(TokenTag::Ident)?;
+        // Contextual `of` keyword
+        if self.peek() == TokenTag::Ident
+            && self.ast.token_text(self.current_tok(), self.file.text()) == "of"
+        {
+            self.advance();
+        } else {
+            let tok = self.current_tok();
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.file,
+                self.ast.token_span(tok),
+                format!(
+                    "expected `of` in `for` loop, found `{}`",
+                    self.ast.token_tag(tok).as_str()
+                ),
+            ));
+            return None;
+        }
+        let first_expr = self.parse_expr()?;
+        if self.peek() == TokenTag::DotDot {
+            self.advance();
+            let end_expr = self.parse_expr()?;
+            self.expect(TokenTag::RParen)?;
+            let body = if self.peek() == TokenTag::LBrace {
+                self.parse_block()?
+            } else {
+                self.parse_stmt()?
+            };
+            let (extra_start, _) =
+                self.ast
+                    .push_extra_slice(&[name_tok.0, first_expr.0, end_expr.0, body.0]);
+            Some(self.ast.push_node(
+                NodeTag::ForRangeStmt,
+                for_tok,
+                NodeData::new(extra_start, 0),
+            ))
+        } else {
+            self.expect(TokenTag::RParen)?;
+            let body = if self.peek() == TokenTag::LBrace {
+                self.parse_block()?
+            } else {
+                self.parse_stmt()?
+            };
+            let (extra_start, _) =
+                self.ast
+                    .push_extra_slice(&[name_tok.0, first_expr.0, body.0]);
+            Some(self.ast.push_node(
+                NodeTag::ForEachStmt,
+                for_tok,
+                NodeData::new(extra_start, 0),
+            ))
+        }
+    }
+
     fn parse_expr(&mut self) -> Option<NodeIndex> {
         self.parse_ternary_expr()
     }
@@ -592,8 +651,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_equality_expr(&mut self) -> Option<NodeIndex> {
-        let mut lhs = self.parse_additive_expr()?;
+        let mut lhs = self.parse_relational_expr()?;
         while matches!(self.peek(), TokenTag::EqEq | TokenTag::BangEq) {
+            let op_tok = self.advance();
+            let rhs = self.parse_relational_expr()?;
+            lhs = self.ast.push_node(
+                NodeTag::BinaryExpr,
+                op_tok,
+                NodeData::new(lhs.0, rhs.0),
+            );
+        }
+        Some(lhs)
+    }
+
+    fn parse_relational_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_additive_expr()?;
+        while matches!(
+            self.peek(),
+            TokenTag::LAngle | TokenTag::RAngle | TokenTag::LtEq | TokenTag::GtEq
+        ) {
             let op_tok = self.advance();
             let rhs = self.parse_additive_expr()?;
             lhs = self.ast.push_node(
@@ -606,8 +682,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_additive_expr(&mut self) -> Option<NodeIndex> {
-        let mut lhs = self.parse_cast_expr()?;
+        let mut lhs = self.parse_multiplicative_expr()?;
         while matches!(self.peek(), TokenTag::Plus | TokenTag::Minus) {
+            let op_tok = self.advance();
+            let rhs = self.parse_multiplicative_expr()?;
+            lhs = self.ast.push_node(
+                NodeTag::BinaryExpr,
+                op_tok,
+                NodeData::new(lhs.0, rhs.0),
+            );
+        }
+        Some(lhs)
+    }
+
+    fn parse_multiplicative_expr(&mut self) -> Option<NodeIndex> {
+        let mut lhs = self.parse_cast_expr()?;
+        while self.peek() == TokenTag::Star {
             let op_tok = self.advance();
             let rhs = self.parse_cast_expr()?;
             lhs = self.ast.push_node(

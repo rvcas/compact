@@ -142,6 +142,52 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
     Value::Object(map)
 }
 
+fn insert_adt_fields(program: &Program, adt: &LedgerAdt, tag_key: &str, map: &mut Map<String, Value>) {
+    match adt {
+        LedgerAdt::Counter => {
+            map.insert(tag_key.into(), Value::String("Counter".into()));
+        }
+        LedgerAdt::Cell(ty) => {
+            map.insert(tag_key.into(), Value::String("Cell".into()));
+            map.insert("type".into(), type_to_json(program, ty));
+        }
+        LedgerAdt::Set(ty) => {
+            map.insert(tag_key.into(), Value::String("Set".into()));
+            map.insert("type".into(), type_to_json(program, ty));
+        }
+        LedgerAdt::List(ty) => {
+            map.insert(tag_key.into(), Value::String("List".into()));
+            map.insert("type".into(), type_to_json(program, ty));
+        }
+        LedgerAdt::Map { key, value } => {
+            map.insert(tag_key.into(), Value::String("Map".into()));
+            map.insert("key".into(), type_to_json(program, key));
+            map.insert("value".into(), map_value_adt_to_json(program, value));
+        }
+        LedgerAdt::MerkleTree { depth, value } => {
+            map.insert(tag_key.into(), Value::String("MerkleTree".into()));
+            map.insert("depth".into(), Value::Number((*depth as u64).into()));
+            map.insert("type".into(), type_to_json(program, value));
+        }
+        LedgerAdt::HistoricMerkleTree { depth, value } => {
+            map.insert(tag_key.into(), Value::String("HistoricMerkleTree".into()));
+            map.insert("depth".into(), Value::Number((*depth as u64).into()));
+            map.insert("type".into(), type_to_json(program, value));
+        }
+    }
+}
+
+fn map_value_adt_to_json(program: &Program, adt: &LedgerAdt) -> Value {
+    match adt {
+        LedgerAdt::Cell(ty) => type_to_json(program, ty),
+        nested => {
+            let mut map = Map::new();
+            insert_adt_fields(program, nested, "type-name", &mut map);
+            Value::Object(map)
+        }
+    }
+}
+
 fn ledger_field_to_json(program: &Program, field: &LedgerField) -> Value {
     let mut map = Map::new();
     map.insert("name".into(), Value::String(field.name.clone()));
@@ -158,29 +204,7 @@ fn ledger_field_to_json(program: &Program, field: &LedgerField) -> Value {
     };
     map.insert("index".into(), index);
     map.insert("exported".into(), Value::Bool(field.exported));
-    match field.adt {
-        LedgerAdt::Counter => {
-            map.insert("storage".into(), Value::String("Counter".into()));
-        }
-        LedgerAdt::Cell => {
-            map.insert("storage".into(), Value::String("Cell".into()));
-            map.insert("type".into(), type_to_json(program, &field.value_type));
-        }
-        LedgerAdt::Set => {
-            map.insert("storage".into(), Value::String("Set".into()));
-            map.insert("type".into(), type_to_json(program, &field.value_type));
-        }
-        LedgerAdt::MerkleTree(depth) => {
-            map.insert("storage".into(), Value::String("MerkleTree".into()));
-            map.insert("depth".into(), Value::Number((depth as u64).into()));
-            map.insert("type".into(), type_to_json(program, &field.value_type));
-        }
-        LedgerAdt::HistoricMerkleTree(depth) => {
-            map.insert("storage".into(), Value::String("HistoricMerkleTree".into()));
-            map.insert("depth".into(), Value::Number((depth as u64).into()));
-            map.insert("type".into(), type_to_json(program, &field.value_type));
-        }
-    }
+    insert_adt_fields(program, &field.adt, "storage", &mut map);
     Value::Object(map)
 }
 
@@ -408,6 +432,23 @@ mod tests {
     fn contract_info_zerocash() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/zerocash.compact"),
+            contract_info_for
+        );
+    }
+
+    #[test]
+    fn contract_info_nested_adts() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+            export ledger c: Counter;
+            ledger m: Map<Field, Boolean>;
+            ledger s: Set<Bytes<32>>;
+            ledger l: List<Field>;
+            ledger mt: MerkleTree<10, Field>;
+            ledger hmt: HistoricMerkleTree<10, Bytes<32>>;
+            export ledger nested: Map<Field, Map<Field, Counter>>;
+            "#,
             contract_info_for
         );
     }

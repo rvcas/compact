@@ -1,0 +1,107 @@
+---
+source: crates/compact-codegen-zkir/src/lib.rs
+---
+import CompactStandardLibrary;
+
+export ledger totals: Map<Field, Counter>;
+export ledger items: List<Field>;
+
+export circuit seed_and_check(batch: Vector<3, Field>, a: Uint<32>, b: Uint<32>, limit: Uint<64>): Boolean {
+  for (const i of 0..3) {
+    totals.insertDefault(i as Field);
+  }
+  for (const x of batch) {
+    items.pushFront(disclose(x));
+  }
+  const prod = a * b;
+  return a < b && a <= b && b > a && b >= a && prod <= limit;
+}
+===
+{
+  "version": { "major": 3, "minor": 1 },
+  "do_communications_commitment": true,
+  "inputs": [
+    { "name": "%batch.0", "type": "Scalar<BLS12-381>" },
+    { "name": "%batch.1", "type": "Scalar<BLS12-381>" },
+    { "name": "%batch.2", "type": "Scalar<BLS12-381>" },
+    { "name": "%a.3", "type": "Scalar<BLS12-381>" },
+    { "name": "%b.4", "type": "Scalar<BLS12-381>" },
+    { "name": "%limit.5", "type": "Scalar<BLS12-381>" }
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    { "op": "constrain_bits", "val": "%a.3", "bits": 32 },
+    { "op": "constrain_bits", "val": "%b.4", "bits": 32 },
+    { "op": "constrain_bits", "val": "%limit.5", "bits": 64 },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "-0x02", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x08", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "-0x02", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x08", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "-0x02", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x01", "0x01", "0x08", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x91"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0e", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x33", "0x01", "0x01", "-0x02", "%batch.0", "0x00", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa2"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0e", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x33", "0x01", "0x01", "-0x02", "%batch.1", "0x00", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa2"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x70", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x30"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x50", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x0e", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x11", "0x33", "0x01", "0x01", "-0x02", "%batch.2", "0x00", "0x00"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x02"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa1"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x10", "0x01", "0x01", "0x01", "0x01"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0x40"] },
+    { "op": "impact", "guard": "0x01", "inputs": ["0xa2"] },
+    { "op": "mul", "output": "%t.6", "a": "%a.3", "b": "%b.4" },
+    { "op": "less_than", "output": "%t.7", "a": "%a.3", "b": "%b.4", "bits": 32 },
+    { "op": "less_than", "output": "%t.8", "a": "%b.4", "b": "%a.3", "bits": 32 },
+    { "op": "cond_select", "output": "%t.9", "bit": "%t.8", "a": "0x00", "b": "0x01" },
+    { "op": "cond_select", "output": "%t.10", "bit": "%t.7", "a": "%t.9", "b": "0x00" },
+    { "op": "less_than", "output": "%t.11", "a": "%a.3", "b": "%b.4", "bits": 32 },
+    { "op": "cond_select", "output": "%t.12", "bit": "%t.10", "a": "%t.11", "b": "0x00" },
+    { "op": "less_than", "output": "%t.13", "a": "%b.4", "b": "%a.3", "bits": 32 },
+    { "op": "cond_select", "output": "%t.14", "bit": "%t.13", "a": "0x00", "b": "0x01" },
+    { "op": "cond_select", "output": "%t.15", "bit": "%t.12", "a": "%t.14", "b": "0x00" },
+    { "op": "less_than", "output": "%t.16", "a": "%limit.5", "b": "%t.6", "bits": 64 },
+    { "op": "cond_select", "output": "%t.17", "bit": "%t.16", "a": "0x00", "b": "0x01" },
+    { "op": "cond_select", "output": "%t.18", "bit": "%t.15", "a": "%t.17", "b": "0x00" },
+    { "op": "output", "vals": ["%t.18"] }
+  ]
+}

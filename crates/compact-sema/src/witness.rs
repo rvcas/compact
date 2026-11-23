@@ -163,6 +163,23 @@ impl<'a> WitnessChecker<'a> {
                     );
                     ret_taint = ret_taint.merge(&tt).merge(&et);
                 }
+                Stmt::ForRange { local, body, .. } => {
+                    let mut loop_locals = locals.clone();
+                    loop_locals.insert(*local, Taint::clean());
+                    let bt =
+                        self.check_stmts_in_scope(body, param_taints, &mut loop_locals, guard_taint);
+                    ret_taint = ret_taint.merge(&bt);
+                }
+                Stmt::ForEach {
+                    local, iter, body, ..
+                } => {
+                    let it = self.check_expr(iter, param_taints, locals, guard_taint);
+                    let mut loop_locals = locals.clone();
+                    loop_locals.insert(*local, it);
+                    let bt =
+                        self.check_stmts_in_scope(body, param_taints, &mut loop_locals, guard_taint);
+                    ret_taint = ret_taint.merge(&bt);
+                }
                 Stmt::Expr(expr) => {
                     let _ = self.check_expr(expr, param_taints, locals, guard_taint);
                 }
@@ -189,6 +206,7 @@ impl<'a> WitnessChecker<'a> {
             | ExprKind::BoolLit(_)
             | ExprKind::BytesLit(_)
             | ExprKind::Default(_)
+            | ExprKind::DefaultAdt(_)
             | ExprKind::EnumVariant { .. }
             | ExprKind::MaybeNone(_) => Taint::clean(),
             ExprKind::ParamRef(pid) => param_taints[pid.0 as usize].clone(),
@@ -253,7 +271,13 @@ impl<'a> WitnessChecker<'a> {
                 let callee = self.program.circuit(*circuit);
                 self.check_stmts(&callee.body, &arg_taints, guard_taint)
             }
-            ExprKind::LedgerCall { field, op, args } => {
+            ExprKind::LedgerCall {
+                field,
+                key_path,
+                op,
+                args,
+                ..
+            } => {
                 let field_name = &self.program.ledger_field(*field).name;
                 if guard_taint.is_tainted() {
                     self.report_disclosure(
@@ -261,6 +285,16 @@ impl<'a> WitnessChecker<'a> {
                         guard_taint,
                         &format!("ledger operation on `{field_name}` guarded by witness condition"),
                     );
+                }
+                for key in key_path {
+                    let key_taint = self.check_expr(key, param_taints, locals, guard_taint);
+                    if key_taint.is_tainted() {
+                        self.report_disclosure(
+                            key.span,
+                            &key_taint,
+                            &format!("ledger `{field_name}.lookup`"),
+                        );
+                    }
                 }
                 for arg in args {
                     let arg_taint = self.check_expr(arg, param_taints, locals, guard_taint);
@@ -340,6 +374,11 @@ fn collect_calls_stmts(stmts: &[Stmt], out: &mut Vec<(CircuitId, Span)>) {
                 collect_calls_stmts(then_branch, out);
                 collect_calls_stmts(else_branch, out);
             }
+            Stmt::ForRange { body, .. } => collect_calls_stmts(body, out),
+            Stmt::ForEach { iter, body, .. } => {
+                collect_calls_expr(iter, out);
+                collect_calls_stmts(body, out);
+            }
             Stmt::Expr(e) => collect_calls_expr(e, out),
             Stmt::Return { value: Some(e), .. } => collect_calls_expr(e, out),
             Stmt::Return { value: None, .. } => {}
@@ -355,9 +394,16 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
                 collect_calls_expr(a, out);
             }
         }
+        ExprKind::LedgerCall { key_path, args, .. } => {
+            for k in key_path {
+                collect_calls_expr(k, out);
+            }
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
         ExprKind::Tuple(elems)
         | ExprKind::Vector(elems)
-        | ExprKind::LedgerCall { args: elems, .. }
         | ExprKind::WitnessCall { args: elems, .. } => {
             for e in elems {
                 collect_calls_expr(e, out);
@@ -393,6 +439,7 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         | ExprKind::BoolLit(_)
         | ExprKind::BytesLit(_)
         | ExprKind::Default(_)
+        | ExprKind::DefaultAdt(_)
         | ExprKind::ParamRef(_)
         | ExprKind::LocalRef(_)
         | ExprKind::EnumVariant { .. }

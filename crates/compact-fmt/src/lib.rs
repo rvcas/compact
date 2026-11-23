@@ -343,6 +343,40 @@ impl<'a> Formatter<'a> {
                     }
                 }
             }
+            NodeTag::ForRangeStmt => {
+                let stmt = self.ast.for_range_stmt(node);
+                write!(
+                    self.out,
+                    "for (const {} of ",
+                    self.ast.token_text(stmt.name_token, self.source)
+                )
+                .unwrap();
+                self.format_expr(stmt.start);
+                self.out.push_str("..");
+                self.format_expr(stmt.end);
+                self.out.push_str(") ");
+                if self.ast.node_tag(stmt.body) == NodeTag::Block {
+                    self.format_block(stmt.body, indent);
+                } else {
+                    self.format_stmt(stmt.body, indent);
+                }
+            }
+            NodeTag::ForEachStmt => {
+                let stmt = self.ast.for_each_stmt(node);
+                write!(
+                    self.out,
+                    "for (const {} of ",
+                    self.ast.token_text(stmt.name_token, self.source)
+                )
+                .unwrap();
+                self.format_expr(stmt.iter);
+                self.out.push_str(") ");
+                if self.ast.node_tag(stmt.body) == NodeTag::Block {
+                    self.format_block(stmt.body, indent);
+                } else {
+                    self.format_stmt(stmt.body, indent);
+                }
+            }
             NodeTag::ConstStmt => {
                 let stmt = self.ast.const_stmt(node);
                 write!(
@@ -600,6 +634,19 @@ mod tests {
             ledger t:Maybe<Opaque<"string">>;
             circuit next(x:State):State{if(x==State.a&&true){return State.b;}else if(x==State.b||false){return State.c;}else{return State.a;}}
             circuit set_t(v:Opaque<"string">):[]{t.write(Maybe<Opaque<"string">>{is_some:true,value:disclose(v)});}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_for_loops_and_adts() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+            export ledger nested:Map<Boolean,Map<Field,Counter>>;
+            export ledger queue:List<Field>;
+            export circuit run(xs:Vector<3,Field>,a:Uint<32>,b:Uint<32>):Boolean{for(const i of 0..3){nested.lookup(true).insert(i as Field,default<Counter>);}for(const x of xs){queue.pushFront(disclose(x));}return a*b<=100&&a<b&&b>=a&&b>0;}
             "#,
             fmt
         );

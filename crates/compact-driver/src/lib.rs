@@ -577,4 +577,72 @@ mod tests {
         assert_eq!(info["witnesses"].as_array().unwrap().len(), 7);
         assert_eq!(info["ledger"].as_array().unwrap().len(), 3);
     }
+
+    #[test]
+    fn end_to_end_build_and_check_adt_showcase() {
+        let src_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/adt_showcase.compact");
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+
+        let check_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let hir = check_with_reporter(
+            &CheckOptions {
+                source: src_path.clone(),
+            },
+            &check_reporter,
+        )
+        .unwrap();
+        assert_eq!(hir.ledger_fields.len(), 5);
+        assert_eq!(hir.circuits.len(), 6);
+
+        let build_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let report = build_with_reporter(
+            &BuildOptions {
+                source: src_path.clone(),
+                target: out_dir.clone(),
+                skip_zk: true,
+            },
+            &build_reporter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.proof_circuits,
+            vec![
+                "init_nested",
+                "enqueue_batch",
+                "seed_range",
+                "manage_queue",
+                "reset_all",
+            ]
+        );
+        for name in [
+            "init_nested",
+            "enqueue_batch",
+            "seed_range",
+            "manage_queue",
+            "reset_all",
+        ] {
+            assert!(out_dir.join(format!("zkir/{name}.zkir")).is_file());
+            assert!(out_dir.join(format!("zkir/{name}.bzkir")).is_file());
+        }
+        // `check_bounds` is pure -> no proof circuit generated.
+        assert!(!out_dir.join("zkir/check_bounds.zkir").exists());
+        assert!(out_dir.join("contract/index.js").is_file());
+        assert!(out_dir.join("contract/index.d.ts").is_file());
+        assert!(out_dir.join("contract/index.js.map").is_file());
+        assert!(out_dir.join("compiler/contract-info.json").is_file());
+        assert!(out_dir.join("compiler/contract-manifest.json").is_file());
+
+        let info: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("compiler/contract-info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["circuits"].as_array().unwrap().len(), 6);
+        assert_eq!(info["ledger"].as_array().unwrap().len(), 5);
+        assert_eq!(info["ledger"][1]["storage"], "Map");
+        assert_eq!(info["ledger"][1]["value"]["type-name"], "Map");
+        assert_eq!(info["ledger"][1]["value"]["value"]["type-name"], "Counter");
+    }
 }

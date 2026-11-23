@@ -1,0 +1,99 @@
+---
+source: crates/compact-artifacts/src/lib.rs
+---
+import CompactStandardLibrary;
+export ledger c: Counter;
+ledger m: Map<Field, Boolean>;
+ledger s: Set<Bytes<32>>;
+ledger l: List<Field>;
+ledger mt: MerkleTree<10, Field>;
+ledger hmt: HistoricMerkleTree<10, Bytes<32>>;
+export ledger nested: Map<Field, Map<Field, Counter>>;
+===
+{
+  "compiler-version": "0.36.108-dev",
+  "compiler-commit": "",
+  "language-version": "0.28.0",
+  "runtime-version": "0.15.0",
+  "circuits": [],
+  "witnesses": [],
+  "contracts": [],
+  "ledger": [
+    {
+      "exported": true,
+      "index": 0,
+      "name": "c",
+      "storage": "Counter"
+    },
+    {
+      "exported": false,
+      "index": 1,
+      "key": {
+        "type-name": "Field"
+      },
+      "name": "m",
+      "storage": "Map",
+      "value": {
+        "type-name": "Boolean"
+      }
+    },
+    {
+      "exported": false,
+      "index": 2,
+      "name": "s",
+      "storage": "Set",
+      "type": {
+        "length": 32,
+        "type-name": "Bytes"
+      }
+    },
+    {
+      "exported": false,
+      "index": 3,
+      "name": "l",
+      "storage": "List",
+      "type": {
+        "type-name": "Field"
+      }
+    },
+    {
+      "depth": 10,
+      "exported": false,
+      "index": 4,
+      "name": "mt",
+      "storage": "MerkleTree",
+      "type": {
+        "type-name": "Field"
+      }
+    },
+    {
+      "depth": 10,
+      "exported": false,
+      "index": 5,
+      "name": "hmt",
+      "storage": "HistoricMerkleTree",
+      "type": {
+        "length": 32,
+        "type-name": "Bytes"
+      }
+    },
+    {
+      "exported": true,
+      "index": 6,
+      "key": {
+        "type-name": "Field"
+      },
+      "name": "nested",
+      "storage": "Map",
+      "value": {
+        "key": {
+          "type-name": "Field"
+        },
+        "type-name": "Map",
+        "value": {
+          "type-name": "Counter"
+        }
+      }
+    }
+  ]
+}

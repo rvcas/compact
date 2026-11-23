@@ -1,0 +1,23 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+import CompactStandardLibrary;
+export ledger nested:Map<Boolean,Map<Field,Counter>>;
+export ledger queue:List<Field>;
+export circuit run(xs:Vector<3,Field>,a:Uint<32>,b:Uint<32>):Boolean{for(const i of 0..3){nested.lookup(true).insert(i as Field,default<Counter>);}for(const x of xs){queue.pushFront(disclose(x));}return a*b<=100&&a<b&&b>=a&&b>0;}
+===
+import CompactStandardLibrary;
+
+export ledger nested: Map<Boolean, Map<Field, Counter>>;
+
+export ledger queue: List<Field>;
+
+export circuit run(xs: Vector<3, Field>, a: Uint<32>, b: Uint<32>): Boolean {
+  for (const i of 0..3) {
+    nested.lookup(true).insert(i as Field, default<Counter>);
+  }
+  for (const x of xs) {
+    queue.pushFront(disclose(x));
+  }
+  return a * b <= 100 && a < b && b >= a && b > 0;
+}

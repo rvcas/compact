@@ -171,12 +171,22 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                 TokenTag::RBracket
             }
             b'<' => {
-                pos += 1;
-                TokenTag::LAngle
+                if pos + 1 < len && bytes[pos + 1] == b'=' {
+                    pos += 2;
+                    TokenTag::LtEq
+                } else {
+                    pos += 1;
+                    TokenTag::LAngle
+                }
             }
             b'>' => {
-                pos += 1;
-                TokenTag::RAngle
+                if pos + 1 < len && bytes[pos + 1] == b'=' {
+                    pos += 2;
+                    TokenTag::GtEq
+                } else {
+                    pos += 1;
+                    TokenTag::RAngle
+                }
             }
             b':' => {
                 pos += 1;

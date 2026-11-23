@@ -363,6 +363,16 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 )
                 .unwrap();
             }
+            CircuitInstr::Mul { a, b, output } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"mul\", \"output\": \"{}\", \"a\": {}, \"b\": {} }}{comma}",
+                    var_name(circuit, *output),
+                    format_val(circuit, a),
+                    format_val(circuit, b)
+                )
+                .unwrap();
+            }
             CircuitInstr::Neg { a, output } => {
                 writeln!(
                     out,
@@ -685,6 +695,122 @@ mod tests {
     fn zkir_zerocash_contract() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/zerocash.compact"),
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_map_nested_counter() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            export ledger c: Map<Boolean, Map<Field, Counter>>;
+
+            export circuit test(): [] {
+              c.insert(true, default<Map<Field, Counter>>);
+              c.insert(false, default<Map<Field, Counter>>);
+              c.lookup(true).insert(1 as Field, default<Counter>);
+              c.lookup(false).insert(2 as Field, default<Counter>);
+              c.lookup(true).insert(3 as Field, default<Counter>);
+              c.lookup(false).lookup(2 as Field).increment(5);
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_list_field() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            export ledger c: List<Field>;
+
+            export circuit test(): [] {
+              assert(c.isEmpty() == true, "Structure should be empty");
+              assert(c.length() == 0, "Size should be 0");
+              assert(c.head().is_some == false, "Head should not exist");
+
+              c.pushFront(0 as Field);
+              assert(c.length() == 1, "Size should be 1");
+              assert(c.head().is_some == true, "Head should exist");
+              assert(c.head().value == 0 as Field, "Head should have value 0");
+
+              c.pushFront(1 as Field);
+              assert(c.length() == 2, "Size should be 2");
+              assert(c.head().value == 1 as Field, "Head should have value 1");
+
+              c.popFront();
+              assert(c.length() == 1, "Size should be 1");
+              assert(c.head().value == 0 as Field, "Head should have value 0");
+
+              c.popFront();
+              assert(c.head().is_some == false, "Head should not exist");
+
+              c.resetToDefault();
+              assert(c.length() == 0, "Size should be 0");
+              assert(c.isEmpty() == true, "Structure should be empty");
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_map_field_list_field() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            export ledger c: Map<Field, List<Field>>;
+
+            export circuit test(): [] {
+              assert(c.isEmpty() == true, "Structure should be empty");
+              assert(c.size() == 0, "Size should be 0");
+
+              c.insert(0 as Field, default<List<Field>>);
+              assert(c.size() == 1, "Size should be 1");
+              assert(c.lookup(0 as Field).length() == 0, "Key 0 should have value 1");
+
+              c.insertDefault(1 as Field);
+              assert(c.size() == 2, "Size should be 2");
+              assert(c.lookup(1 as Field).length() == 0, "Key 1 should have value 0");
+              assert(c.member(1 as Field) == true, "Key 1 should be member");
+
+              c.remove(0 as Field);
+              assert(c.size() == 1, "Size should be 1");
+
+              c.resetToDefault();
+              assert(c.size() == 0, "Size should be 0");
+              assert(c.isEmpty() == true, "Structure should be empty");
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_for_loops_and_arithmetic() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+
+            export ledger totals: Map<Field, Counter>;
+            export ledger items: List<Field>;
+
+            export circuit seed_and_check(batch: Vector<3, Field>, a: Uint<32>, b: Uint<32>, limit: Uint<64>): Boolean {
+              for (const i of 0..3) {
+                totals.insertDefault(i as Field);
+              }
+              for (const x of batch) {
+                items.pushFront(disclose(x));
+              }
+              const prod = a * b;
+              return a < b && a <= b && b > a && b >= a && prod <= limit;
+            }
+            "#,
             compile_all_zkir
         );
     }

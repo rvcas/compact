@@ -29,12 +29,12 @@ HirProgram
   LedgerField #1 state: Cell<STATE> @ path=[1]
   Circuit #0 in_state (exported=false, pure=false, proof=false) -> Boolean
     Param #0 s: STATE
-    Return Some(Binary { op: Eq, lhs: Expr { kind: LedgerCall { field: LedgerFieldId(1), op: CellRead, args: [] }, ty: Enum(EnumId(0)), span: Span { start: 156, end: 161 } }, rhs: Expr { kind: ParamRef(ParamId(0)), ty: Enum(EnumId(0)), span: Span { start: 165, end: 166 } } })
+    Return Some(Binary { op: Eq, lhs: Expr { kind: LedgerCall { field: LedgerFieldId(1), key_path: [], target_adt: Cell(Enum(EnumId(0))), op: CellRead, args: [] }, ty: Enum(EnumId(0)), span: Span { start: 156, end: 161 } }, rhs: Expr { kind: ParamRef(ParamId(0)), ty: Enum(EnumId(0)), span: Span { start: 165, end: 166 } } })
   Circuit #1 set (exported=true, pure=false, proof=true) -> []
     Param #0 v: Field
     ExprStmt Assert { cond: Expr { kind: CircuitCall { circuit: CircuitId(0), args: [Expr { kind: EnumVariant { enum_id: EnumId(0), variant_idx: 0 }, ty: Enum(EnumId(0)), span: Span { start: 224, end: 235 } }] }, ty: Boolean, span: Span { start: 215, end: 236 } }, message: "already set" }
-    ExprStmt LedgerCall { field: LedgerFieldId(0), op: CellWrite, args: [Expr { kind: Disclose(Expr { kind: ParamRef(ParamId(0)), ty: Field, span: Span { start: 273, end: 274 } }), ty: Field, span: Span { start: 264, end: 275 } }] }
-    ExprStmt LedgerCall { field: LedgerFieldId(1), op: CellWrite, args: [Expr { kind: EnumVariant { enum_id: EnumId(0), variant_idx: 1 }, ty: Enum(EnumId(0)), span: Span { start: 287, end: 296 } }] }
+    ExprStmt LedgerCall { field: LedgerFieldId(0), key_path: [], target_adt: Cell(Field), op: CellWrite, args: [Expr { kind: Disclose(Expr { kind: ParamRef(ParamId(0)), ty: Field, span: Span { start: 273, end: 274 } }), ty: Field, span: Span { start: 264, end: 275 } }] }
+    ExprStmt LedgerCall { field: LedgerFieldId(1), key_path: [], target_adt: Cell(Enum(EnumId(0))), op: CellWrite, args: [Expr { kind: EnumVariant { enum_id: EnumId(0), variant_idx: 1 }, ty: Enum(EnumId(0)), span: Span { start: 287, end: 296 } }] }
   Circuit #2 get (exported=true, pure=false, proof=true) -> Field
     Const #0 is_set: Boolean = CircuitCall { circuit: CircuitId(0), args: [Expr { kind: EnumVariant { enum_id: EnumId(0), variant_idx: 1 }, ty: Enum(EnumId(0)), span: Span { start: 357, end: 366 } }] }
-    Return Some(Ternary { cond: Expr { kind: LocalRef(LocalId(0)), ty: Boolean, span: Span { start: 378, end: 384 } }, then_branch: Expr { kind: LedgerCall { field: LedgerFieldId(0), op: CellRead, args: [] }, ty: Field, span: Span { start: 387, end: 392 } }, else_branch: Expr { kind: Cast { expr: Expr { kind: IntLit(0), ty: Uint(64), span: Span { start: 395, end: 396 } }, target: Field }, ty: Field, span: Span { start: 395, end: 405 } } })
+    Return Some(Ternary { cond: Expr { kind: LocalRef(LocalId(0)), ty: Boolean, span: Span { start: 378, end: 384 } }, then_branch: Expr { kind: LedgerCall { field: LedgerFieldId(0), key_path: [], target_adt: Cell(Field), op: CellRead, args: [] }, ty: Field, span: Span { start: 387, end: 392 } }, else_branch: Expr { kind: Cast { expr: Expr { kind: IntLit(0), ty: Uint(64), span: Span { start: 395, end: 396 } }, target: Field }, ty: Field, span: Span { start: 395, end: 405 } } })

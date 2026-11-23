@@ -1,0 +1,517 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+import CompactStandardLibrary;
+
+export ledger balances: Map<Field, Counter>;
+export ledger nested: Map<Boolean, Map<Field, Counter>>;
+export ledger queue: List<Field>;
+export ledger queues_by_key: Map<Field, List<Field>>;
+export ledger members: Set<Field>;
+
+export circuit init_nested(): [] {
+  nested.insert(true, default<Map<Field, Counter>>);
+  nested.insert(false, default<Map<Field, Counter>>);
+  nested.lookup(true).insert(1 as Field, default<Counter>);
+  nested.lookup(false).insert(2 as Field, default<Counter>);
+  nested.lookup(false).lookup(2 as Field).increment(2 * 3);
+}
+
+export circuit enqueue_batch(items: Vector<3, Field>): Uint<64> {
+  for (const x of items) {
+    queue.pushFront(disclose(x));
+  }
+  return queue.length();
+}
+
+export circuit seed_range(): [] {
+  for (const i of 0..4) {
+    balances.insertDefault(i as Field);
+    members.insert(i as Field);
+  }
+}
+
+export circuit check_bounds(a: Uint<32>, b: Uint<32>, limit: Uint<64>): Boolean {
+  const prod = a * b;
+  return a < b && a <= b && b > a && b >= a && prod <= limit;
+}
+
+export circuit manage_queue(key: Field, item: Field): Maybe<Field> {
+  const dk = disclose(key);
+  if (!queues_by_key.member(dk)) {
+    queues_by_key.insertDefault(dk);
+  }
+  queues_by_key.lookup(dk).pushFront(disclose(item));
+  const h = queues_by_key.lookup(dk).head();
+  if (!queue.isEmpty()) {
+    queue.popFront();
+  }
+  return h;
+}
+
+export circuit reset_all(): [] {
+  balances.resetToDefault();
+  nested.resetToDefault();
+  queue.resetToDefault();
+  queues_by_key.resetToDefault();
+  members.resetToDefault();
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	init_nested(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	enqueue_batch(context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint>;
+	seed_range(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	manage_queue(context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	reset_all(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {
+	check_bounds(a: bigint, b: bigint, limit: bigint): boolean;
+};
+export type Circuits<T> = {
+	init_nested(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	enqueue_batch(context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint>;
+	seed_range(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	check_bounds(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, limit: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	manage_queue(context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	reset_all(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {
+	readonly balances: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: bigint): boolean;
+		lookup(key: bigint): bigint;
+	};
+	readonly nested: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: boolean): boolean;
+		lookup(key: boolean): {
+			isEmpty(): boolean;
+			size(): bigint;
+			member(key: bigint): boolean;
+			lookup(key: bigint): bigint;
+		};
+	};
+	readonly queue: {
+		isEmpty(): boolean;
+		length(): bigint;
+		head(): Maybe<bigint>;
+	};
+	readonly queues_by_key: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: bigint): boolean;
+		lookup(key: bigint): {
+			isEmpty(): boolean;
+			length(): bigint;
+			head(): Maybe<bigint>;
+		};
+	};
+	readonly members: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(elem: bigint): boolean;
+	};
+};
+export const pureCircuits: PureCircuits = { check_bounds: (a: bigint, b: bigint, limit: bigint): boolean => {
+	const prod: bigint = a * b;
+	return a < b && a <= b && b > a && b >= a && prod <= limit;
+} };
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {
+		balances: __compactRuntime.decodeMap(state, 0),
+		nested: __compactRuntime.decodeMap(state, 1),
+		queue: __compactRuntime.decodeList(state, 2),
+		queues_by_key: __compactRuntime.decodeMap(state, 3),
+		members: __compactRuntime.decodeSet(state, 4)
+	};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			init_nested: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.mapInsert(context, 1, true, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, 1, false, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, [1, true], 1n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.mapInsert(context, [1, false], 2n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.counterIncrement(context, [
+					1,
+					false,
+					2n
+				], 2n * 3n);
+				return {
+					result: [],
+					context
+				};
+			},
+			enqueue_batch: (context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint> => {
+				for (const x of items) {
+					__compactRuntime.listPushFront(context, 2, x);
+				}
+				return {
+					result: __compactRuntime.listLength(context, 2),
+					context
+				};
+			},
+			seed_range: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				for (let i: bigint = 0n; i < 4n; i = i + 1n) {
+					__compactRuntime.mapInsertDefault(context, 0, i);
+					__compactRuntime.setInsert(context, 4, i);
+				}
+				return {
+					result: [],
+					context
+				};
+			},
+			manage_queue: (context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>> => {
+				const dk: bigint = key;
+				if (!__compactRuntime.mapMember(context, 3, dk)) {
+					__compactRuntime.mapInsertDefault(context, 3, dk);
+				}
+				__compactRuntime.listPushFront(context, [3, dk], item);
+				const h: Maybe<bigint> = __compactRuntime.listHead(context, [3, dk]);
+				if (!__compactRuntime.listIsEmpty(context, 2)) {
+					__compactRuntime.listPopFront(context, 2);
+				}
+				return {
+					result: h,
+					context
+				};
+			},
+			reset_all: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.resetToDefault(context, 0);
+				__compactRuntime.resetToDefault(context, 1);
+				__compactRuntime.resetToDefault(context, 2);
+				__compactRuntime.resetToDefault(context, 3);
+				__compactRuntime.resetToDefault(context, 4);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			init_nested: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.mapInsert(context, 1, true, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, 1, false, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, [1, true], 1n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.mapInsert(context, [1, false], 2n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.counterIncrement(context, [
+					1,
+					false,
+					2n
+				], 2n * 3n);
+				return {
+					result: [],
+					context
+				};
+			},
+			enqueue_batch: (context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint> => {
+				for (const x of items) {
+					__compactRuntime.listPushFront(context, 2, x);
+				}
+				return {
+					result: __compactRuntime.listLength(context, 2),
+					context
+				};
+			},
+			seed_range: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				for (let i: bigint = 0n; i < 4n; i = i + 1n) {
+					__compactRuntime.mapInsertDefault(context, 0, i);
+					__compactRuntime.setInsert(context, 4, i);
+				}
+				return {
+					result: [],
+					context
+				};
+			},
+			check_bounds: (context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, limit: bigint): __compactRuntime.CircuitResults<T, boolean> => {
+				const prod: bigint = a * b;
+				return {
+					result: a < b && a <= b && b > a && b >= a && prod <= limit,
+					context
+				};
+			},
+			manage_queue: (context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>> => {
+				const dk: bigint = key;
+				if (!__compactRuntime.mapMember(context, 3, dk)) {
+					__compactRuntime.mapInsertDefault(context, 3, dk);
+				}
+				__compactRuntime.listPushFront(context, [3, dk], item);
+				const h: Maybe<bigint> = __compactRuntime.listHead(context, [3, dk]);
+				if (!__compactRuntime.listIsEmpty(context, 2)) {
+					__compactRuntime.listPopFront(context, 2);
+				}
+				return {
+					result: h,
+					context
+				};
+			},
+			reset_all: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []> => {
+				__compactRuntime.resetToDefault(context, 0);
+				__compactRuntime.resetToDefault(context, 1);
+				__compactRuntime.resetToDefault(context, 2);
+				__compactRuntime.resetToDefault(context, 3);
+				__compactRuntime.resetToDefault(context, 4);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export const pureCircuits = { check_bounds: (a, b, limit) => {
+	const prod = a * b;
+	return a < b && a <= b && b > a && b >= a && prod <= limit;
+} };
+export const ledger = (state) => {
+	return {
+		balances: __compactRuntime.decodeMap(state, 0),
+		nested: __compactRuntime.decodeMap(state, 1),
+		queue: __compactRuntime.decodeList(state, 2),
+		queues_by_key: __compactRuntime.decodeMap(state, 3),
+		members: __compactRuntime.decodeSet(state, 4)
+	};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			init_nested: (context) => {
+				__compactRuntime.mapInsert(context, 1, true, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, 1, false, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, [1, true], 1n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.mapInsert(context, [1, false], 2n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.counterIncrement(context, [
+					1,
+					false,
+					2n
+				], 2n * 3n);
+				return {
+					result: [],
+					context
+				};
+			},
+			enqueue_batch: (context, items) => {
+				for (const x of items) {
+					__compactRuntime.listPushFront(context, 2, x);
+				}
+				return {
+					result: __compactRuntime.listLength(context, 2),
+					context
+				};
+			},
+			seed_range: (context) => {
+				for (let i = 0n; i < 4n; i = i + 1n) {
+					__compactRuntime.mapInsertDefault(context, 0, i);
+					__compactRuntime.setInsert(context, 4, i);
+				}
+				return {
+					result: [],
+					context
+				};
+			},
+			manage_queue: (context, key, item) => {
+				const dk = key;
+				if (!__compactRuntime.mapMember(context, 3, dk)) {
+					__compactRuntime.mapInsertDefault(context, 3, dk);
+				}
+				__compactRuntime.listPushFront(context, [3, dk], item);
+				const h = __compactRuntime.listHead(context, [3, dk]);
+				if (!__compactRuntime.listIsEmpty(context, 2)) {
+					__compactRuntime.listPopFront(context, 2);
+				}
+				return {
+					result: h,
+					context
+				};
+			},
+			reset_all: (context) => {
+				__compactRuntime.resetToDefault(context, 0);
+				__compactRuntime.resetToDefault(context, 1);
+				__compactRuntime.resetToDefault(context, 2);
+				__compactRuntime.resetToDefault(context, 3);
+				__compactRuntime.resetToDefault(context, 4);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+		this.circuits = {
+			init_nested: (context) => {
+				__compactRuntime.mapInsert(context, 1, true, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, 1, false, __compactRuntime.defaultAdt("Map"));
+				__compactRuntime.mapInsert(context, [1, true], 1n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.mapInsert(context, [1, false], 2n, __compactRuntime.defaultAdt("Counter"));
+				__compactRuntime.counterIncrement(context, [
+					1,
+					false,
+					2n
+				], 2n * 3n);
+				return {
+					result: [],
+					context
+				};
+			},
+			enqueue_batch: (context, items) => {
+				for (const x of items) {
+					__compactRuntime.listPushFront(context, 2, x);
+				}
+				return {
+					result: __compactRuntime.listLength(context, 2),
+					context
+				};
+			},
+			seed_range: (context) => {
+				for (let i = 0n; i < 4n; i = i + 1n) {
+					__compactRuntime.mapInsertDefault(context, 0, i);
+					__compactRuntime.setInsert(context, 4, i);
+				}
+				return {
+					result: [],
+					context
+				};
+			},
+			check_bounds: (context, a, b, limit) => {
+				const prod = a * b;
+				return {
+					result: a < b && a <= b && b > a && b >= a && prod <= limit,
+					context
+				};
+			},
+			manage_queue: (context, key, item) => {
+				const dk = key;
+				if (!__compactRuntime.mapMember(context, 3, dk)) {
+					__compactRuntime.mapInsertDefault(context, 3, dk);
+				}
+				__compactRuntime.listPushFront(context, [3, dk], item);
+				const h = __compactRuntime.listHead(context, [3, dk]);
+				if (!__compactRuntime.listIsEmpty(context, 2)) {
+					__compactRuntime.listPopFront(context, 2);
+				}
+				return {
+					result: h,
+					context
+				};
+			},
+			reset_all: (context) => {
+				__compactRuntime.resetToDefault(context, 0);
+				__compactRuntime.resetToDefault(context, 1);
+				__compactRuntime.resetToDefault(context, 2);
+				__compactRuntime.resetToDefault(context, 3);
+				__compactRuntime.resetToDefault(context, 4);
+				return {
+					result: [],
+					context
+				};
+			}
+		};
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	init_nested(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	enqueue_batch(context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint>;
+	seed_range(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	manage_queue(context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	reset_all(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type PureCircuits = {
+	check_bounds(a: bigint, b: bigint, limit: bigint): boolean;
+};
+export type Circuits<T> = {
+	init_nested(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	enqueue_batch(context: __compactRuntime.CircuitContext<T>, items: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, bigint>;
+	seed_range(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+	check_bounds(context: __compactRuntime.CircuitContext<T>, a: bigint, b: bigint, limit: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	manage_queue(context: __compactRuntime.CircuitContext<T>, key: bigint, item: bigint): __compactRuntime.CircuitResults<T, Maybe<bigint>>;
+	reset_all(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
+};
+export type Ledger = {
+	readonly balances: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: bigint): boolean;
+		lookup(key: bigint): bigint;
+	};
+	readonly nested: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: boolean): boolean;
+		lookup(key: boolean): {
+			isEmpty(): boolean;
+			size(): bigint;
+			member(key: bigint): boolean;
+			lookup(key: bigint): bigint;
+		};
+	};
+	readonly queue: {
+		isEmpty(): boolean;
+		length(): bigint;
+		head(): Maybe<bigint>;
+	};
+	readonly queues_by_key: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(key: bigint): boolean;
+		lookup(key: bigint): {
+			isEmpty(): boolean;
+			length(): bigint;
+			head(): Maybe<bigint>;
+		};
+	};
+	readonly members: {
+		isEmpty(): boolean;
+		size(): bigint;
+		member(elem: bigint): boolean;
+	};
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}
+export {};

@@ -89,6 +89,8 @@ pub enum TokenTag {
     RBracket,
     LAngle,
     RAngle,
+    LtEq,
+    GtEq,
     Colon,
     Semi,
     Comma,
@@ -148,6 +150,8 @@ impl TokenTag {
             Self::RBracket => "]",
             Self::LAngle => "<",
             Self::RAngle => ">",
+            Self::LtEq => "<=",
+            Self::GtEq => ">=",
             Self::Colon => ":",
             Self::Semi => ";",
             Self::Comma => ",",
@@ -256,6 +260,14 @@ pub enum NodeTag {
     /// `main_token = if`, `data = (extra_start, 0)`,
     /// `extra_data[extra_start..+3] = [cond_expr, then_node, opt_else_node]`.
     IfStmt,
+    /// `for (const <name> of <start>..<end>) <body>`
+    /// `main_token = for`, `data = (extra_start, 0)`,
+    /// `extra_data[extra_start..+4] = [name_tok, start_expr, end_expr, body_node]`.
+    ForRangeStmt,
+    /// `for (const <name> of <iter_expr>) <body>`
+    /// `main_token = for`, `data = (extra_start, 0)`,
+    /// `extra_data[extra_start..+3] = [name_tok, iter_expr, body_node]`.
+    ForEachStmt,
     /// `const <name>[: <type>] = <expr>;`
     /// `main_token = const`, `data = (extra_start, semi_tok)`,
     /// `extra_data[extra_start..+3] = [name_tok, opt_type_node, init_expr]`.
@@ -379,6 +391,23 @@ pub struct IfStmt {
     pub cond: NodeIndex,
     pub then_branch: NodeIndex,
     pub else_branch: Option<NodeIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForRangeStmt {
+    pub for_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub start: NodeIndex,
+    pub end: NodeIndex,
+    pub body: NodeIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForEachStmt {
+    pub for_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub iter: NodeIndex,
+    pub body: NodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -652,6 +681,31 @@ impl Ast {
         }
     }
 
+    pub fn for_range_stmt(&self, node: NodeIndex) -> ForRangeStmt {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ForRangeStmt);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ForRangeStmt {
+            for_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            start: NodeIndex(self.extra_data[base + 1]),
+            end: NodeIndex(self.extra_data[base + 2]),
+            body: NodeIndex(self.extra_data[base + 3]),
+        }
+    }
+
+    pub fn for_each_stmt(&self, node: NodeIndex) -> ForEachStmt {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ForEachStmt);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ForEachStmt {
+            for_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            iter: NodeIndex(self.extra_data[base + 1]),
+            body: NodeIndex(self.extra_data[base + 2]),
+        }
+    }
+
     pub fn struct_lit_expr(&self, node: NodeIndex) -> StructLitExpr {
         debug_assert_eq!(self.node_tag(node), NodeTag::StructLitExpr);
         let data = self.node_data(node);
@@ -893,6 +947,14 @@ impl Ast {
                 let stmt = self.if_stmt(node);
                 let end = stmt.else_branch.unwrap_or(stmt.then_branch);
                 main.merge(self.node_span(end))
+            }
+            NodeTag::ForRangeStmt => {
+                let stmt = self.for_range_stmt(node);
+                main.merge(self.node_span(stmt.body))
+            }
+            NodeTag::ForEachStmt => {
+                let stmt = self.for_each_stmt(node);
+                main.merge(self.node_span(stmt.body))
             }
             NodeTag::ConstStmt => {
                 let stmt = self.const_stmt(node);
@@ -1179,6 +1241,29 @@ impl Ast {
                 if let Some(else_branch) = stmt.else_branch {
                     self.dump_node(else_branch, source, indent + 1, out);
                 }
+            }
+            NodeTag::ForRangeStmt => {
+                let stmt = self.for_range_stmt(node);
+                writeln!(
+                    out,
+                    "{pad}ForRangeStmt {}",
+                    self.token_text(stmt.name_token, source)
+                )
+                .unwrap();
+                self.dump_node(stmt.start, source, indent + 1, out);
+                self.dump_node(stmt.end, source, indent + 1, out);
+                self.dump_node(stmt.body, source, indent + 1, out);
+            }
+            NodeTag::ForEachStmt => {
+                let stmt = self.for_each_stmt(node);
+                writeln!(
+                    out,
+                    "{pad}ForEachStmt {}",
+                    self.token_text(stmt.name_token, source)
+                )
+                .unwrap();
+                self.dump_node(stmt.iter, source, indent + 1, out);
+                self.dump_node(stmt.body, source, indent + 1, out);
             }
             NodeTag::ConstStmt => {
                 let stmt = self.const_stmt(node);

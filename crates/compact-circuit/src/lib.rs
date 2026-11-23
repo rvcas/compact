@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use compact_hir::{
-    BinaryOp, Circuit, Expr, ExprKind, LedgerOp, LocalId, Program, Stmt, Type, UnaryOp,
+    BinaryOp, Circuit, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId, Program, Stmt, Type, UnaryOp,
 };
 
 /// Number of bytes packed per native BLS12-381 scalar wire in ZKIR v3 (248 bits).
@@ -203,16 +203,180 @@ fn bytes_to_wires(bytes: &[u8]) -> Vec<CircuitVal> {
         .collect()
 }
 
+/// Conservative upper bound on serialized cell byte size (matching upstream `VMmax-sizeof`).
+fn max_sizeof(alignment: &[AlignmentAtom]) -> u64 {
+    fn ceil_bytes(n: u64) -> u64 {
+        let bits = (u64::BITS - n.leading_zeros()) as u64;
+        bits.div_ceil(8)
+    }
+    if alignment.is_empty() {
+        return 2;
+    }
+    let header = 1 + ceil_bytes(alignment.len() as u64);
+    let body: u64 = alignment
+        .iter()
+        .map(|atom| match atom {
+            AlignmentAtom::Bytes(0) => 3,
+            AlignmentAtom::Bytes(n) => 2 + (*n as u64) + ceil_bytes(*n as u64),
+            AlignmentAtom::Field | AlignmentAtom::Compress => 34,
+        })
+        .sum();
+    header + body
+}
+
+/// Evaluate a constant integer expression (supporting `+`, `-`, `*` on integer literals)
+/// for Impact VM immediate operands such as `Counter.increment(16 * 16 * 16)`.
+fn eval_const_u128(expr: &Expr) -> Option<u128> {
+    match &expr.kind {
+        ExprKind::IntLit(v) => Some(*v),
+        ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => eval_const_u128(expr),
+        ExprKind::Binary { op, lhs, rhs } => {
+            let l = eval_const_u128(lhs)?;
+            let r = eval_const_u128(rhs)?;
+            match op {
+                BinaryOp::Add => l.checked_add(r),
+                BinaryOp::Sub => l.checked_sub(r),
+                BinaryOp::Mul => l.checked_mul(r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A single segment in an Impact VM ledger state path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    /// Static ledger tree slot index (1-byte aligned cell).
+    Static(u32),
+    /// Runtime dynamic key value (e.g. a `Map` key lookup).
+    Dynamic {
+        alignment: Vec<AlignmentAtom>,
+        values: Vec<CircuitVal>,
+    },
+}
+
+impl PathSegment {
+    fn encode_path(&self, out: &mut Vec<CircuitVal>) {
+        match self {
+            Self::Static(seg) => {
+                out.push(CircuitVal::Imm(0x01));
+                out.push(CircuitVal::Imm(0x01));
+                out.push(CircuitVal::Imm(*seg as i128));
+            }
+            Self::Dynamic { alignment, values } => {
+                out.push(CircuitVal::Imm(alignment.len() as i128));
+                for atom in alignment {
+                    out.push(CircuitVal::Imm(atom.as_imm()));
+                }
+                out.extend(values.iter().cloned());
+            }
+        }
+    }
+
+    fn into_cell_state_value(self) -> ImpactStateValue {
+        match self {
+            Self::Static(seg) => ImpactStateValue::Cell {
+                alignment: vec![AlignmentAtom::Bytes(1)],
+                values: vec![CircuitVal::Imm(seg as i128)],
+            },
+            Self::Dynamic { alignment, values } => ImpactStateValue::Cell { alignment, values },
+        }
+    }
+}
+
+/// Structured Impact VM `StateValue` payload for `push` / `pushs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImpactStateValue {
+    Null,
+    Cell {
+        alignment: Vec<AlignmentAtom>,
+        values: Vec<CircuitVal>,
+    },
+    EmptyMap,
+    MerkleTree {
+        depth: u32,
+    },
+    Array(Vec<ImpactStateValue>),
+}
+
+impl ImpactStateValue {
+    fn cell_u8(val: u8) -> Self {
+        Self::Cell {
+            alignment: vec![AlignmentAtom::Bytes(1)],
+            values: vec![CircuitVal::Imm(val as i128)],
+        }
+    }
+
+    fn cell_u64(val: u64) -> Self {
+        Self::Cell {
+            alignment: vec![AlignmentAtom::Bytes(8)],
+            values: vec![CircuitVal::Imm(val as i128)],
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<CircuitVal>) {
+        match self {
+            Self::Null => out.push(CircuitVal::Imm(0x00)),
+            Self::Cell { alignment, values } => {
+                out.push(CircuitVal::Imm(0x01));
+                out.push(CircuitVal::Imm(alignment.len() as i128));
+                for atom in alignment {
+                    out.push(CircuitVal::Imm(atom.as_imm()));
+                }
+                out.extend(values.iter().cloned());
+            }
+            Self::EmptyMap => out.push(CircuitVal::Imm(0x02)),
+            Self::MerkleTree { depth } => {
+                out.push(CircuitVal::Imm((4u32 | (*depth << 4)) as i128));
+            }
+            Self::Array(elems) => {
+                out.push(CircuitVal::Imm((((elems.len() as u32) << 4) | 3) as i128));
+                for elem in elems {
+                    elem.encode(out);
+                }
+            }
+        }
+    }
+}
+
+fn adt_initial_state_value(program: &Program, adt: &LedgerAdt) -> ImpactStateValue {
+    match adt {
+        LedgerAdt::Cell(ty) => ImpactStateValue::Cell {
+            alignment: AlignmentAtom::alignment_of(program, ty),
+            values: vec![CircuitVal::Imm(0); wire_count(program, ty)],
+        },
+        LedgerAdt::Counter => ImpactStateValue::cell_u64(0),
+        LedgerAdt::Set(_) | LedgerAdt::Map { .. } => ImpactStateValue::EmptyMap,
+        LedgerAdt::List(_) => ImpactStateValue::Array(vec![
+            ImpactStateValue::Null,
+            ImpactStateValue::Null,
+            ImpactStateValue::cell_u64(0),
+        ]),
+        LedgerAdt::MerkleTree { depth, .. } => ImpactStateValue::Array(vec![
+            ImpactStateValue::MerkleTree { depth: *depth },
+            ImpactStateValue::cell_u64(0),
+        ]),
+        LedgerAdt::HistoricMerkleTree { depth, .. } => ImpactStateValue::Array(vec![
+            ImpactStateValue::MerkleTree { depth: *depth },
+            ImpactStateValue::cell_u64(0),
+            ImpactStateValue::EmptyMap,
+        ]),
+    }
+}
+
 /// A single Impact VM instruction lowered for a ledger operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImpactVmOp {
-    /// `dup n` — duplicate stack item at depth `n`.
+    /// `dup n` (`0x3n`) — duplicate stack item at depth `n`.
     Dup { n: u8 },
+    /// `swap n` (`0x4n`) — swap top of stack with item at depth `n + 1`.
+    Swap { n: u8 },
     /// `idx` / `idxc` / `idxp` / `idxpc` — index into public ledger state along `path`.
     Idx {
         cached: bool,
         push_path: bool,
-        path: Vec<u32>,
+        path: Vec<PathSegment>,
     },
     /// `popeq` / `popeqc` — pop state value from VM stack and constrain equal to `results`.
     Popeq {
@@ -220,27 +384,40 @@ pub enum ImpactVmOp {
         alignment: Vec<AlignmentAtom>,
         results: Vec<CircuitVal>,
     },
-    /// `push` / `pushs` — push a cell-encoded value onto the VM stack.
+    /// `push` / `pushs` — push a `StateValue` onto the VM stack.
     Push {
         storage: bool,
-        alignment: Vec<AlignmentAtom>,
-        values: Vec<CircuitVal>,
+        value: ImpactStateValue,
     },
-    /// `push` / `pushs` with a `StateValue::Null` payload (`0x00`).
-    PushNull { storage: bool },
+    /// `lt` (`0x01`) — pop two stack items and push less-than boolean.
+    Lt,
     /// `eq` (`0x02`) — pop two stack items and push equality boolean.
     Eq,
+    /// `type` (`0x03`) — pop a state value and push its type tag (`0` = Cell, `1` = Null, ...).
+    Type,
+    /// `size` (`0x04`) — pop a map/set/array and push its `Uint<64>` size.
+    Size,
+    /// `neg` (`0x08`) — negate boolean on top of stack.
+    Neg,
     /// `root` (`0x0a`) — pop a Merkle tree and push its root digest cell.
     Root,
+    /// `pop` (`0x0b`) — discard top of stack.
+    Pop,
+    /// `branch` (`0x12`) — pop boolean and skip `skip` VM instructions if true.
+    Branch { skip: u32 },
+    /// `jmp` (`0x13`) — unconditionally skip `skip` VM instructions.
+    Jmp { skip: u32 },
+    /// `concat` / `concatc` (`0x16` / `0x17`) — concatenate two cells up to `n` bytes.
+    Concat { cached: bool, n: u64 },
     /// `member` (`0x18`) — pop key & set/map and push membership boolean.
     Member,
-    /// `rem` (`0x1a` / `0x1b`) — remove key from set/map.
+    /// `rem` / `remc` (`0x19` / `0x1a`) — remove key from set/map.
     Rem { cached: bool },
-    /// `addi` — add immediate `Uint<16>` to counter cell on stack.
-    Addi { immediate: u16 },
-    /// `subi` — subtract immediate `Uint<16>` from counter cell on stack.
-    Subi { immediate: u16 },
-    /// `ins` / `insc` — write updated value back up `n` path levels.
+    /// `addi` (`0x0e`) — add `Uint<16>` to counter cell on stack.
+    Addi { immediate: CircuitVal },
+    /// `subi` (`0x0f`) — subtract `Uint<16>` from counter cell on stack.
+    Subi { immediate: CircuitVal },
+    /// `ins` / `insc` (`0x9n` / `0xan`) — write updated value back up `n` path levels.
     Ins { cached: bool, n: u8 },
 }
 
@@ -250,6 +427,7 @@ impl ImpactVmOp {
     pub fn assemble(&self) -> Vec<CircuitVal> {
         match self {
             Self::Dup { n } => vec![CircuitVal::Imm(0x30 | (*n as i128))],
+            Self::Swap { n } => vec![CircuitVal::Imm(0x40 | (*n as i128))],
             Self::Idx {
                 cached,
                 push_path,
@@ -264,10 +442,8 @@ impl ImpactVmOp {
                 };
                 let lo = (path.len() - 1) as i128;
                 let mut words = vec![CircuitVal::Imm((hi << 4) | lo)];
-                for &seg in path {
-                    words.push(CircuitVal::Imm(0x01));
-                    words.push(CircuitVal::Imm(0x01));
-                    words.push(CircuitVal::Imm(seg as i128));
+                for seg in path {
+                    seg.encode_path(&mut words);
                 }
                 words
             }
@@ -287,37 +463,29 @@ impl ImpactVmOp {
                 words.extend(results.iter().cloned());
                 words
             }
-            Self::Push {
-                storage,
-                alignment,
-                values,
-            } => {
+            Self::Push { storage, value } => {
                 let op = if *storage { 0x11 } else { 0x10 };
-                let mut words = vec![
-                    CircuitVal::Imm(op),
-                    CircuitVal::Imm(0x01), // StateValue::Cell tag
-                    CircuitVal::Imm(alignment.len() as i128),
-                ];
-                for atom in alignment {
-                    words.push(CircuitVal::Imm(atom.as_imm()));
-                }
-                words.extend(values.iter().cloned());
+                let mut words = vec![CircuitVal::Imm(op)];
+                value.encode(&mut words);
                 words
             }
-            Self::PushNull { storage } => {
-                let op = if *storage { 0x11 } else { 0x10 };
-                vec![CircuitVal::Imm(op), CircuitVal::Imm(0x00)]
-            }
+            Self::Lt => vec![CircuitVal::Imm(0x01)],
             Self::Eq => vec![CircuitVal::Imm(0x02)],
+            Self::Type => vec![CircuitVal::Imm(0x03)],
+            Self::Size => vec![CircuitVal::Imm(0x04)],
+            Self::Neg => vec![CircuitVal::Imm(0x08)],
             Self::Root => vec![CircuitVal::Imm(0x0a)],
+            Self::Pop => vec![CircuitVal::Imm(0x0b)],
+            Self::Branch { skip } => vec![CircuitVal::Imm(0x12), CircuitVal::Imm(*skip as i128)],
+            Self::Jmp { skip } => vec![CircuitVal::Imm(0x13), CircuitVal::Imm(*skip as i128)],
+            Self::Concat { cached, n } => vec![
+                CircuitVal::Imm(if *cached { 0x17 } else { 0x16 }),
+                CircuitVal::Imm(*n as i128),
+            ],
             Self::Member => vec![CircuitVal::Imm(0x18)],
-            Self::Rem { cached } => vec![CircuitVal::Imm(if *cached { 0x1b } else { 0x1a })],
-            Self::Addi { immediate } => {
-                vec![CircuitVal::Imm(0x0e), CircuitVal::Imm(*immediate as i128)]
-            }
-            Self::Subi { immediate } => {
-                vec![CircuitVal::Imm(0x0f), CircuitVal::Imm(*immediate as i128)]
-            }
+            Self::Rem { cached } => vec![CircuitVal::Imm(if *cached { 0x1a } else { 0x19 })],
+            Self::Addi { immediate } => vec![CircuitVal::Imm(0x0e), immediate.clone()],
+            Self::Subi { immediate } => vec![CircuitVal::Imm(0x0f), immediate.clone()],
             Self::Ins { cached, n } => {
                 let hi: i128 = if *cached { 0xa } else { 0x9 };
                 vec![CircuitVal::Imm((hi << 4) | (*n as i128))]
@@ -385,6 +553,11 @@ pub enum CircuitInstr {
         output: CircuitVar,
     },
     Add {
+        a: CircuitVal,
+        b: CircuitVal,
+        output: CircuitVar,
+    },
+    Mul {
         a: CircuitVal,
         b: CircuitVal,
         output: CircuitVar,
@@ -633,6 +806,40 @@ impl<'a> CircuitLowerer<'a> {
                         (None, None) => {}
                     }
                 }
+                Stmt::ForRange {
+                    local,
+                    start,
+                    end,
+                    body,
+                    ..
+                } => {
+                    for i in *start..*end {
+                        let mut iter_locals = locals.clone();
+                        iter_locals.insert(*local, vec![CircuitVal::Imm(i as i128)]);
+                        if let Some(r) = self.lower_stmts(body, param_vals, &mut iter_locals, guard)
+                        {
+                            ret_vals = Some(r);
+                        }
+                    }
+                }
+                Stmt::ForEach {
+                    local, iter, body, ..
+                } => {
+                    let iter_vals = self.lower_expr(iter, param_vals, locals, guard);
+                    if let Type::Vector(len, elem_ty) = &iter.ty {
+                        let elem_width = wire_count(self.program, elem_ty);
+                        for i in 0..(*len as usize) {
+                            let mut iter_locals = locals.clone();
+                            let slice = iter_vals[i * elem_width..(i + 1) * elem_width].to_vec();
+                            iter_locals.insert(*local, slice);
+                            if let Some(r) =
+                                self.lower_stmts(body, param_vals, &mut iter_locals, guard)
+                            {
+                                ret_vals = Some(r);
+                            }
+                        }
+                    }
+                }
                 Stmt::Expr(expr) => {
                     let _ = self.lower_expr(expr, param_vals, locals, guard);
                 }
@@ -687,6 +894,7 @@ impl<'a> CircuitLowerer<'a> {
             ExprKind::BoolLit(b) => vec![CircuitVal::Imm(i128::from(*b))],
             ExprKind::BytesLit(bytes) => bytes_to_wires(bytes),
             ExprKind::Default(ty) => vec![CircuitVal::Imm(0); wire_count(self.program, ty)],
+            ExprKind::DefaultAdt(_) => Vec::new(),
             ExprKind::EnumVariant { variant_idx, .. } => {
                 vec![CircuitVal::Imm(*variant_idx as i128)]
             }
@@ -845,6 +1053,43 @@ impl<'a> CircuitLowerer<'a> {
                             output: out,
                         });
                         vec![CircuitVal::Var(out)]
+                    }
+                    BinaryOp::Mul => {
+                        let out = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::Mul {
+                            a: lvals[0].clone(),
+                            b: rvals[0].clone(),
+                            output: out,
+                        });
+                        vec![CircuitVal::Var(out)]
+                    }
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                        let max_bits = match (&lhs.ty, &rhs.ty) {
+                            (Type::Uint(a), Type::Uint(b)) => (*a).max(*b),
+                            (Type::Uint(a), _) | (_, Type::Uint(a)) => *a,
+                            _ => 248,
+                        };
+                        let bits = (2 * max_bits.div_ceil(2)).max(2);
+                        let (a, b, invert) = match op {
+                            BinaryOp::Lt => (lvals[0].clone(), rvals[0].clone(), false),
+                            BinaryOp::Gt => (rvals[0].clone(), lvals[0].clone(), false),
+                            BinaryOp::Le => (rvals[0].clone(), lvals[0].clone(), true),
+                            BinaryOp::Ge => (lvals[0].clone(), rvals[0].clone(), true),
+                            _ => unreachable!(),
+                        };
+                        let lt = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::LessThan {
+                            a,
+                            b,
+                            bits,
+                            output: lt,
+                        });
+                        let res = if invert {
+                            self.emit_not(&CircuitVal::Var(lt))
+                        } else {
+                            CircuitVal::Var(lt)
+                        };
+                        vec![res]
                     }
                     BinaryOp::And | BinaryOp::Or => unreachable!(),
                 }
@@ -1017,19 +1262,40 @@ impl<'a> CircuitLowerer<'a> {
                 let callee = self.program.circuit(*circuit);
                 self.lower_circuit_body(callee, &lowered_args, guard)
             }
-            ExprKind::LedgerCall { field, op, args } => {
+            ExprKind::LedgerCall {
+                field,
+                key_path,
+                target_adt,
+                op,
+                args,
+            } => {
                 let ledger_field = self.program.ledger_field(*field);
-                let path = ledger_field.path.clone();
-                let depth = path.len() as u8;
-                let alignment = AlignmentAtom::alignment_of(self.program, &ledger_field.value_type);
+                let mut full_path: Vec<PathSegment> = ledger_field
+                    .path
+                    .iter()
+                    .map(|&s| PathSegment::Static(s))
+                    .collect();
+                for key_expr in key_path {
+                    let vals = self.lower_expr(key_expr, param_vals, locals, guard);
+                    let align = AlignmentAtom::alignment_of(self.program, &key_expr.ty);
+                    full_path.push(PathSegment::Dynamic {
+                        alignment: align,
+                        values: vals,
+                    });
+                }
+                let depth = full_path.len() as u8;
+                let pi_guard = if guard.is_const_true() {
+                    None
+                } else {
+                    Some(guard.clone())
+                };
                 match op {
                     LedgerOp::CellRead => {
-                        let count = wire_count(self.program, &ledger_field.value_type);
-                        let pi_guard = if guard.is_const_true() {
-                            None
-                        } else {
-                            Some(guard.clone())
-                        };
+                        let cell_ty = target_adt
+                            .cell_type()
+                            .expect("sema validated CellRead target");
+                        let alignment = AlignmentAtom::alignment_of(self.program, cell_ty);
+                        let count = wire_count(self.program, cell_ty);
                         let mut results = Vec::with_capacity(count);
                         for _ in 0..count {
                             let out = self.fresh_var(&ledger_field.name);
@@ -1039,258 +1305,721 @@ impl<'a> CircuitLowerer<'a> {
                             });
                             results.push(CircuitVal::Var(out));
                         }
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 0 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Popeq {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
                                 cached: false,
                                 alignment,
                                 results: results.clone(),
                             },
-                        });
+                        );
                         results
                     }
                     LedgerOp::CellWrite => {
+                        let cell_ty = target_adt
+                            .cell_type()
+                            .expect("sema validated CellWrite target");
+                        let alignment = AlignmentAtom::alignment_of(self.program, cell_ty);
                         let values = self.lower_expr(&args[0], param_vals, locals, guard);
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
-                                storage: false,
-                                alignment: vec![AlignmentAtom::Bytes(1)],
-                                values: vec![CircuitVal::Imm(path[0] as i128)],
-                            },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
-                                storage: true,
-                                alignment,
-                                values,
-                            },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: false,
-                                n: depth,
-                            },
-                        });
+                        self.emit_write_at_path(
+                            full_path,
+                            ImpactStateValue::Cell { alignment, values },
+                            false,
+                            guard,
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::CellResetToDefault
+                    | LedgerOp::CounterResetToDefault
+                    | LedgerOp::SetResetToDefault
+                    | LedgerOp::MapResetToDefault
+                    | LedgerOp::ListResetToDefault
+                    | LedgerOp::MerkleTreeResetToDefault
+                    | LedgerOp::HistoricMerkleTreeResetToDefault => {
+                        let init_val = adt_initial_state_value(self.program, target_adt);
+                        let is_hmt = matches!(target_adt, LedgerAdt::HistoricMerkleTree { .. });
+                        self.emit_write_at_path(full_path, init_val, is_hmt, guard);
                         Vec::new()
                     }
                     LedgerOp::CounterIncrement => {
-                        let immediate = match args.first().map(|a| &a.kind) {
-                            Some(ExprKind::IntLit(v)) => *v as u16,
-                            _ => unreachable!("sema validated Counter.increment immediate"),
+                        let immediate = if let Some(v) = eval_const_u128(&args[0]) {
+                            CircuitVal::Imm(v as i128)
+                        } else {
+                            self.lower_expr(&args[0], param_vals, locals, guard)
+                                .into_iter()
+                                .next()
+                                .unwrap_or(CircuitVal::Imm(0))
                         };
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Addi { immediate },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Addi { immediate });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth,
                             },
-                        });
+                        );
                         Vec::new()
                     }
                     LedgerOp::CounterDecrement => {
-                        let immediate = match args.first().map(|a| &a.kind) {
-                            Some(ExprKind::IntLit(v)) => *v as u16,
-                            _ => unreachable!("sema validated Counter.decrement immediate"),
+                        let immediate = if let Some(v) = eval_const_u128(&args[0]) {
+                            CircuitVal::Imm(v as i128)
+                        } else {
+                            self.lower_expr(&args[0], param_vals, locals, guard)
+                                .into_iter()
+                                .next()
+                                .unwrap_or(CircuitVal::Imm(0))
                         };
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Subi { immediate },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Subi { immediate });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth,
                             },
-                        });
+                        );
                         Vec::new()
                     }
                     LedgerOp::CounterRead => {
                         let out = self.fresh_var(&ledger_field.name);
-                        let pi_guard = if guard.is_const_true() {
-                            None
-                        } else {
-                            Some(guard.clone())
-                        };
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
                             output: out,
                         });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 0 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Popeq {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
                                 cached: true,
                                 alignment: vec![AlignmentAtom::Bytes(8)],
                                 results: vec![CircuitVal::Var(out)],
                             },
-                        });
+                        );
                         vec![CircuitVal::Var(out)]
                     }
-                    LedgerOp::SetMember => {
-                        let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                    LedgerOp::SetIsEmpty | LedgerOp::MapIsEmpty => {
                         let out = self.fresh_var("t");
-                        let pi_guard = if guard.is_const_true() {
-                            None
-                        } else {
-                            Some(guard.clone())
-                        };
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
                             output: out,
                         });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 0 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Size);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: false,
-                                alignment,
-                                values: elem_vals,
+                                value: ImpactStateValue::cell_u64(0),
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Member,
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Popeq {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Eq);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
                                 cached: true,
                                 alignment: vec![AlignmentAtom::Bytes(1)],
                                 results: vec![CircuitVal::Var(out)],
                             },
+                        );
+                        vec![CircuitVal::Var(out)]
+                    }
+                    LedgerOp::SetSize | LedgerOp::MapSize => {
+                        let out = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::PublicInput {
+                            guard: pi_guard,
+                            output: out,
                         });
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Size);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: true,
+                                alignment: vec![AlignmentAtom::Bytes(8)],
+                                results: vec![CircuitVal::Var(out)],
+                            },
+                        );
+                        vec![CircuitVal::Var(out)]
+                    }
+                    LedgerOp::SetMember | LedgerOp::MapMember => {
+                        let key_ty = match target_adt {
+                            LedgerAdt::Set(t) => t.as_ref(),
+                            LedgerAdt::Map { key, .. } => key.as_ref(),
+                            _ => unreachable!("sema validated member target"),
+                        };
+                        let key_align = AlignmentAtom::alignment_of(self.program, key_ty);
+                        let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let out = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::PublicInput {
+                            guard: pi_guard,
+                            output: out,
+                        });
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::Cell {
+                                    alignment: key_align,
+                                    values: elem_vals,
+                                },
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Member);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: true,
+                                alignment: vec![AlignmentAtom::Bytes(1)],
+                                results: vec![CircuitVal::Var(out)],
+                            },
+                        );
                         vec![CircuitVal::Var(out)]
                     }
                     LedgerOp::SetInsert => {
+                        let LedgerAdt::Set(elem_ty) = target_adt else {
+                            unreachable!("sema validated SetInsert target");
+                        };
+                        let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
                         let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: false,
-                                alignment,
-                                values: elem_vals,
+                                value: ImpactStateValue::Cell {
+                                    alignment,
+                                    values: elem_vals,
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::PushNull { storage: true },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: false,
-                                n: 1,
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: true,
+                                value: ImpactStateValue::Null,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth,
                             },
-                        });
+                        );
                         Vec::new()
                     }
-                    LedgerOp::SetRemove => {
+                    LedgerOp::SetRemove | LedgerOp::MapRemove => {
+                        let key_ty = match target_adt {
+                            LedgerAdt::Set(t) => t.as_ref(),
+                            LedgerAdt::Map { key, .. } => key.as_ref(),
+                            _ => unreachable!("sema validated remove target"),
+                        };
+                        let key_align = AlignmentAtom::alignment_of(self.program, key_ty);
                         let elem_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: false,
-                                alignment,
-                                values: elem_vals,
+                                value: ImpactStateValue::Cell {
+                                    alignment: key_align,
+                                    values: elem_vals,
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Rem { cached: false },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Rem { cached: false });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth,
                             },
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::MapLookup => {
+                        let LedgerAdt::Map { key, value } = target_adt else {
+                            unreachable!("sema validated MapLookup target");
+                        };
+                        let val_ty = value
+                            .cell_type()
+                            .expect("sema validated MapLookup value is Cell");
+                        let key_align = AlignmentAtom::alignment_of(self.program, key);
+                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
+                        let count = wire_count(self.program, val_ty);
+                        let mut results = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let out = self.fresh_var("t");
+                            self.instructions.push(CircuitInstr::PublicInput {
+                                guard: pi_guard.clone(),
+                                output: out,
+                            });
+                            results.push(CircuitVal::Var(out));
+                        }
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Dynamic {
+                                    alignment: key_align,
+                                    values: key_vals,
+                                }],
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: false,
+                                alignment: val_align,
+                                results: results.clone(),
+                            },
+                        );
+                        results
+                    }
+                    LedgerOp::MapInsert => {
+                        let LedgerAdt::Map { key, value } = target_adt else {
+                            unreachable!("sema validated MapInsert target");
+                        };
+                        let key_align = AlignmentAtom::alignment_of(self.program, key);
+                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let val_state = match &args[1].kind {
+                            ExprKind::DefaultAdt(val_adt) => {
+                                adt_initial_state_value(self.program, val_adt)
+                            }
+                            _ => {
+                                let val_ty = value
+                                    .cell_type()
+                                    .expect("sema validated MapInsert value type");
+                                let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
+                                let val_wires =
+                                    self.lower_expr(&args[1], param_vals, locals, guard);
+                                ImpactStateValue::Cell {
+                                    alignment: val_align,
+                                    values: val_wires,
+                                }
+                            }
+                        };
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: true,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::Cell {
+                                    alignment: key_align,
+                                    values: key_vals,
+                                },
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: true,
+                                value: val_state,
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: true,
+                                n: depth,
+                            },
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::MapInsertDefault => {
+                        let LedgerAdt::Map { key, value } = target_adt else {
+                            unreachable!("sema validated MapInsertDefault target");
+                        };
+                        let key_align = AlignmentAtom::alignment_of(self.program, key);
+                        let key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                        let val_state = adt_initial_state_value(self.program, value);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: true,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::Cell {
+                                    alignment: key_align,
+                                    values: key_vals,
+                                },
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: true,
+                                value: val_state,
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: true,
+                                n: depth,
+                            },
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::ListIsEmpty => {
+                        let out = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::PublicInput {
+                            guard: pi_guard,
+                            output: out,
                         });
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Static(1)],
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Type);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::cell_u8(1),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Eq);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: true,
+                                alignment: vec![AlignmentAtom::Bytes(1)],
+                                results: vec![CircuitVal::Var(out)],
+                            },
+                        );
+                        vec![CircuitVal::Var(out)]
+                    }
+                    LedgerOp::ListLength => {
+                        let out = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::PublicInput {
+                            guard: pi_guard,
+                            output: out,
+                        });
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Static(2)],
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: true,
+                                alignment: vec![AlignmentAtom::Bytes(8)],
+                                results: vec![CircuitVal::Var(out)],
+                            },
+                        );
+                        vec![CircuitVal::Var(out)]
+                    }
+                    LedgerOp::ListHead => {
+                        let LedgerAdt::List(elem_ty) = target_adt else {
+                            unreachable!("sema validated ListHead target");
+                        };
+                        let elem_align = AlignmentAtom::alignment_of(self.program, elem_ty);
+                        let elem_wires = wire_count(self.program, elem_ty);
+                        let mut maybe_align = vec![AlignmentAtom::Bytes(1)];
+                        maybe_align.extend(elem_align.iter().copied());
+                        let total_wires = 1 + elem_wires;
+                        let mut results = Vec::with_capacity(total_wires);
+                        for _ in 0..total_wires {
+                            let out = self.fresh_var("t");
+                            self.instructions.push(CircuitInstr::PublicInput {
+                                guard: pi_guard.clone(),
+                                output: out,
+                            });
+                            results.push(CircuitVal::Var(out));
+                        }
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Static(0)],
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(guard, ImpactVmOp::Type);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::cell_u8(1),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Eq);
+                        self.emit_impact(guard, ImpactVmOp::Branch { skip: 4 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::cell_u8(1),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Swap { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Concat {
+                                cached: false,
+                                n: 2 + max_sizeof(&elem_align),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Jmp { skip: 2 });
+                        self.emit_impact(guard, ImpactVmOp::Pop);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::Cell {
+                                    alignment: maybe_align.clone(),
+                                    values: vec![CircuitVal::Imm(0); total_wires],
+                                },
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
+                                cached: true,
+                                alignment: maybe_align,
+                                results: results.clone(),
+                            },
+                        );
+                        results
+                    }
+                    LedgerOp::ListPopFront => {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: true,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Static(1)],
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: true,
+                                n: depth,
+                            },
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::ListPushFront => {
+                        let LedgerAdt::List(elem_ty) = target_adt else {
+                            unreachable!("sema validated ListPushFront target");
+                        };
+                        let val_align = AlignmentAtom::alignment_of(self.program, elem_ty);
+                        let val_wires = self.lower_expr(&args[0], param_vals, locals, guard);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: true,
+                                path: full_path,
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
+                                cached: false,
+                                push_path: false,
+                                path: vec![PathSegment::Static(2)],
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Addi {
+                                immediate: CircuitVal::Imm(1),
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: true,
+                                value: ImpactStateValue::Array(vec![
+                                    ImpactStateValue::Cell {
+                                        alignment: val_align,
+                                        values: val_wires,
+                                    },
+                                    ImpactStateValue::Null,
+                                    ImpactStateValue::Null,
+                                ]),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Swap { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::cell_u8(2),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Swap { n: 0 });
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        self.emit_impact(guard, ImpactVmOp::Swap { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: false,
+                                value: ImpactStateValue::cell_u8(1),
+                            },
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Swap { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: true,
+                                n: depth + 1,
+                            },
+                        );
                         Vec::new()
                     }
                     LedgerOp::MerkleTreeInsert => {
+                        let LedgerAdt::MerkleTree { value: elem_ty, .. } = target_adt else {
+                            unreachable!("sema validated MerkleTreeInsert target");
+                        };
+                        let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
                         let item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        // Compute leaf hash: `persistentHash(LeafPreimage { "mdn:lh", item })`
                         let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
                         leaf_align.extend(alignment);
                         let mut hash_inputs = bytes_to_wires(b"mdn:lh");
@@ -1309,136 +2038,118 @@ impl<'a> CircuitLowerer<'a> {
                             outputs: vec![lo, hi],
                         });
 
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path: vec![0],
+                                path: vec![PathSegment::Static(0)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 2 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path: vec![1],
+                                path: vec![PathSegment::Static(1)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: true,
-                                alignment: vec![AlignmentAtom::Bytes(32)],
-                                values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                value: ImpactStateValue::Cell {
+                                    alignment: vec![AlignmentAtom::Bytes(32)],
+                                    values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: false,
-                                n: 1,
-                            },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: true,
-                                n: 1,
-                            },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path: vec![1],
+                                path: vec![PathSegment::Static(1)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Addi { immediate: 1 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Addi {
+                                immediate: CircuitVal::Imm(1),
+                            },
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth + 1,
                             },
-                        });
+                        );
                         Vec::new()
                     }
                     LedgerOp::MerkleTreeCheckRoot => {
                         let rt_vals = self.lower_expr(&args[0], param_vals, locals, guard);
                         let out = self.fresh_var("t");
-                        let pi_guard = if guard.is_const_true() {
-                            None
-                        } else {
-                            Some(guard.clone())
-                        };
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
                             output: out,
                         });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 0 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path: vec![0],
+                                path: vec![PathSegment::Static(0)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Root,
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Root);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: false,
-                                alignment: vec![AlignmentAtom::Field],
-                                values: rt_vals,
+                                value: ImpactStateValue::Cell {
+                                    alignment: vec![AlignmentAtom::Field],
+                                    values: rt_vals,
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Eq,
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Popeq {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Eq);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
                                 cached: true,
                                 alignment: vec![AlignmentAtom::Bytes(1)],
                                 results: vec![CircuitVal::Var(out)],
                             },
-                        });
+                        );
                         vec![CircuitVal::Var(out)]
                     }
                     LedgerOp::HistoricMerkleTreeInsert => {
+                        let LedgerAdt::HistoricMerkleTree { value: elem_ty, .. } = target_adt
+                        else {
+                            unreachable!("sema validated HistoricMerkleTreeInsert target");
+                        };
+                        let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
                         let item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
                         let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
                         leaf_align.extend(alignment);
@@ -1458,178 +2169,222 @@ impl<'a> CircuitLowerer<'a> {
                             outputs: vec![lo, hi],
                         });
 
-                        // Insert leaf into tree (slot 0)
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path: vec![0],
+                                path: vec![PathSegment::Static(0)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 2 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path: vec![1],
+                                path: vec![PathSegment::Static(1)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: true,
-                                alignment: vec![AlignmentAtom::Bytes(32)],
-                                values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                value: ImpactStateValue::Cell {
+                                    alignment: vec![AlignmentAtom::Bytes(32)],
+                                    values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: false,
-                                n: 1,
-                            },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: true,
-                                n: 1,
-                            },
-                        });
-                        // Increment first_free index (slot 1)
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path: vec![1],
+                                path: vec![PathSegment::Static(1)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Addi { immediate: 1 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: true,
-                                n: 1,
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Addi {
+                                immediate: CircuitVal::Imm(1),
                             },
-                        });
-                        // Record new root in historic roots set (slot 2)
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: true,
-                                path: vec![2],
+                                path: vec![PathSegment::Static(2)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 2 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path: vec![0],
+                                path: vec![PathSegment::Static(0)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Root,
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::PushNull { storage: true },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
-                                cached: false,
-                                n: 1,
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Root);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
+                                storage: true,
+                                value: ImpactStateValue::Null,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Ins {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
                                 cached: true,
                                 n: depth + 1,
                             },
-                        });
+                        );
                         Vec::new()
                     }
                     LedgerOp::HistoricMerkleTreeCheckRoot => {
                         let rt_vals = self.lower_expr(&args[0], param_vals, locals, guard);
                         let out = self.fresh_var("t");
-                        let pi_guard = if guard.is_const_true() {
-                            None
-                        } else {
-                            Some(guard.clone())
-                        };
                         self.instructions.push(CircuitInstr::PublicInput {
                             guard: pi_guard,
                             output: out,
                         });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Dup { n: 0 },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        self.emit_impact(guard, ImpactVmOp::Dup { n: 0 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path,
+                                path: full_path,
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Idx {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Idx {
                                 cached: false,
                                 push_path: false,
-                                path: vec![2],
+                                path: vec![PathSegment::Static(2)],
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Push {
+                        );
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Push {
                                 storage: false,
-                                alignment: vec![AlignmentAtom::Field],
-                                values: rt_vals,
+                                value: ImpactStateValue::Cell {
+                                    alignment: vec![AlignmentAtom::Field],
+                                    values: rt_vals,
+                                },
                             },
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Member,
-                        });
-                        self.instructions.push(CircuitInstr::Impact {
-                            guard: guard.clone(),
-                            op: ImpactVmOp::Popeq {
+                        );
+                        self.emit_impact(guard, ImpactVmOp::Member);
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Popeq {
                                 cached: true,
                                 alignment: vec![AlignmentAtom::Bytes(1)],
                                 results: vec![CircuitVal::Var(out)],
                             },
-                        });
+                        );
                         vec![CircuitVal::Var(out)]
                     }
                 }
             }
+        }
+    }
+
+    fn emit_impact(&mut self, guard: &CircuitVal, op: ImpactVmOp) {
+        self.instructions.push(CircuitInstr::Impact {
+            guard: guard.clone(),
+            op,
+        });
+    }
+
+    /// Emit the standard Impact VM overwrite pattern for `Cell.write` and `<ADT>.resetToDefault`
+    /// along an arbitrary static/dynamic path `full_path`.
+    fn emit_write_at_path(
+        &mut self,
+        mut full_path: Vec<PathSegment>,
+        value: ImpactStateValue,
+        init_historic_root: bool,
+        guard: &CircuitVal,
+    ) {
+        let len = full_path.len();
+        let last = full_path.pop().expect("non-empty ledger path");
+        if len > 1 {
+            self.emit_impact(
+                guard,
+                ImpactVmOp::Idx {
+                    cached: false,
+                    push_path: true,
+                    path: full_path,
+                },
+            );
+        }
+        self.emit_impact(
+            guard,
+            ImpactVmOp::Push {
+                storage: false,
+                value: last.into_cell_state_value(),
+            },
+        );
+        self.emit_impact(
+            guard,
+            ImpactVmOp::Push {
+                storage: true,
+                value,
+            },
+        );
+        if init_historic_root {
+            self.emit_impact(
+                guard,
+                ImpactVmOp::Idx {
+                    cached: false,
+                    push_path: true,
+                    path: vec![PathSegment::Static(2)],
+                },
+            );
+            self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+            self.emit_impact(
+                guard,
+                ImpactVmOp::Idx {
+                    cached: false,
+                    push_path: false,
+                    path: vec![PathSegment::Static(0)],
+                },
+            );
+            self.emit_impact(guard, ImpactVmOp::Root);
+            self.emit_impact(
+                guard,
+                ImpactVmOp::Push {
+                    storage: true,
+                    value: ImpactStateValue::Null,
+                },
+            );
+            self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 2 });
+        }
+        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+        if len > 1 {
+            self.emit_impact(
+                guard,
+                ImpactVmOp::Ins {
+                    cached: true,
+                    n: (len - 1) as u8,
+                },
+            );
         }
     }
 }
@@ -1646,6 +2401,10 @@ fn stmts_have_effects(stmts: &[Stmt], program: &Program) -> bool {
             expr_has_effects(cond, program)
                 || stmts_have_effects(then_branch, program)
                 || stmts_have_effects(else_branch, program)
+        }
+        Stmt::ForRange { body, .. } => stmts_have_effects(body, program),
+        Stmt::ForEach { iter, body, .. } => {
+            expr_has_effects(iter, program) || stmts_have_effects(body, program)
         }
         Stmt::Expr(e) => expr_has_effects(e, program),
         Stmt::Return { value: Some(e), .. } => expr_has_effects(e, program),
@@ -1689,6 +2448,7 @@ fn expr_has_effects(expr: &Expr, program: &Program) -> bool {
         | ExprKind::BoolLit(_)
         | ExprKind::BytesLit(_)
         | ExprKind::Default(_)
+        | ExprKind::DefaultAdt(_)
         | ExprKind::ParamRef(_)
         | ExprKind::LocalRef(_)
         | ExprKind::EnumVariant { .. }

@@ -12,4 +12,4 @@ export circuit increment(): [] {
 HirProgram
   LedgerField #0 export round: Counter<Uint<64>> @ path=[0]
   Circuit #0 increment (exported=true, pure=false, proof=true) -> []
-    ExprStmt LedgerCall { field: LedgerFieldId(0), op: CounterIncrement, args: [Expr { kind: IntLit(1), ty: Uint(16), span: Span { start: 114, end: 115 } }] }
+    ExprStmt LedgerCall { field: LedgerFieldId(0), key_path: [], target_adt: Counter, op: CounterIncrement, args: [Expr { kind: IntLit(1), ty: Uint(16), span: Span { start: 114, end: 115 } }] }

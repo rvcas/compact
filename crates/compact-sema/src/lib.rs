@@ -310,6 +310,103 @@ impl<'a> Analyzer<'a> {
         self.structs[sid.0 as usize].fields = fields;
     }
 
+    fn resolve_ledger_adt(&mut self, node: NodeIndex) -> Option<LedgerAdt> {
+        match self.ast.node_tag(node) {
+            NodeTag::TypeNamed if self.text(self.ast.node_main_token(node)) == "Counter" => {
+                Some(LedgerAdt::Counter)
+            }
+            NodeTag::TypeGeneric => {
+                let adt_name = self.text(self.ast.node_main_token(node));
+                let data = self.ast.node_data(node);
+                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                match adt_name {
+                    "Set" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!("`Set` expects 1 type argument, found {}", arg_nodes.len()),
+                            ));
+                            return None;
+                        }
+                        let elem_ty = self.resolve_type(arg_nodes[0])?;
+                        Some(LedgerAdt::Set(Box::new(elem_ty)))
+                    }
+                    "List" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!("`List` expects 1 type argument, found {}", arg_nodes.len()),
+                            ));
+                            return None;
+                        }
+                        let elem_ty = self.resolve_type(arg_nodes[0])?;
+                        Some(LedgerAdt::List(Box::new(elem_ty)))
+                    }
+                    "Map" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!(
+                                    "`Map` expects 2 type arguments (key, value), found {}",
+                                    arg_nodes.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        let key_ty = self.resolve_type(arg_nodes[0])?;
+                        let val_adt = self.resolve_ledger_adt(arg_nodes[1])?;
+                        Some(LedgerAdt::Map {
+                            key: Box::new(key_ty),
+                            value: Box::new(val_adt),
+                        })
+                    }
+                    "MerkleTree" | "HistoricMerkleTree" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(node),
+                                format!(
+                                    "`{adt_name}` expects 2 type arguments (depth, element type), found {}",
+                                    arg_nodes.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        let depth = self.expect_type_nat(
+                            &arg_nodes,
+                            0,
+                            adt_name,
+                            self.ast.node_span(node),
+                        )?;
+                        let elem_ty = self.resolve_type(arg_nodes[1])?;
+                        if adt_name == "HistoricMerkleTree" {
+                            Some(LedgerAdt::HistoricMerkleTree {
+                                depth,
+                                value: Box::new(elem_ty),
+                            })
+                        } else {
+                            Some(LedgerAdt::MerkleTree {
+                                depth,
+                                value: Box::new(elem_ty),
+                            })
+                        }
+                    }
+                    _ => {
+                        let ty = self.resolve_type(node)?;
+                        Some(LedgerAdt::Cell(Box::new(ty)))
+                    }
+                }
+            }
+            _ => {
+                let ty = self.resolve_type(node)?;
+                Some(LedgerAdt::Cell(Box::new(ty)))
+            }
+        }
+    }
+
     fn register_ledger(&mut self, node: NodeIndex) {
         let decl = self.ast.ledger_decl(node);
         let name = self.text(decl.name_token).to_owned();
@@ -324,74 +421,8 @@ impl<'a> Analyzer<'a> {
             return;
         }
 
-        let (adt, value_type) = match self.ast.node_tag(decl.type_node) {
-            NodeTag::TypeNamed
-                if self.text(self.ast.node_main_token(decl.type_node)) == "Counter" =>
-            {
-                (LedgerAdt::Counter, Type::Uint(64))
-            }
-            NodeTag::TypeGeneric
-                if self.text(self.ast.node_main_token(decl.type_node)) == "Set" =>
-            {
-                let data = self.ast.node_data(decl.type_node);
-                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
-                if arg_nodes.len() != 1 {
-                    self.diagnostics.push(CompactDiagnostic::error(
-                        self.file,
-                        self.ast.node_span(decl.type_node),
-                        format!("`Set` expects 1 type argument, found {}", arg_nodes.len()),
-                    ));
-                    return;
-                }
-                let Some(elem_ty) = self.resolve_type(arg_nodes[0]) else {
-                    return;
-                };
-                (LedgerAdt::Set, elem_ty)
-            }
-            NodeTag::TypeGeneric
-                if matches!(
-                    self.text(self.ast.node_main_token(decl.type_node)),
-                    "MerkleTree" | "HistoricMerkleTree"
-                ) =>
-            {
-                let adt_name = self.text(self.ast.node_main_token(decl.type_node));
-                let data = self.ast.node_data(decl.type_node);
-                let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
-                if arg_nodes.len() != 2 {
-                    self.diagnostics.push(CompactDiagnostic::error(
-                        self.file,
-                        self.ast.node_span(decl.type_node),
-                        format!(
-                            "`{adt_name}` expects 2 type arguments (depth, element type), found {}",
-                            arg_nodes.len()
-                        ),
-                    ));
-                    return;
-                }
-                let Some(depth) = self.expect_type_nat(
-                    &arg_nodes,
-                    0,
-                    adt_name,
-                    self.ast.node_span(decl.type_node),
-                ) else {
-                    return;
-                };
-                let Some(elem_ty) = self.resolve_type(arg_nodes[1]) else {
-                    return;
-                };
-                let adt = if adt_name == "HistoricMerkleTree" {
-                    LedgerAdt::HistoricMerkleTree(depth)
-                } else {
-                    LedgerAdt::MerkleTree(depth)
-                };
-                (adt, elem_ty)
-            }
-            _ => {
-                let Some(ty) = self.resolve_type(decl.type_node) else {
-                    return;
-                };
-                (LedgerAdt::Cell, ty)
-            }
+        let Some(adt) = self.resolve_ledger_adt(decl.type_node) else {
+            return;
         };
 
         let id = LedgerFieldId(self.ledger_fields.len() as u32);
@@ -400,7 +431,6 @@ impl<'a> Analyzer<'a> {
             id,
             name: name.clone(),
             adt,
-            value_type,
             path,
             exported: decl.exported,
             sealed: decl.sealed,
@@ -852,6 +882,87 @@ impl<'a> Analyzer<'a> {
                     span: self.ast.node_span(node),
                 })
             }
+            NodeTag::ForRangeStmt => {
+                let stmt = self.ast.for_range_stmt(node);
+                let var_name = self.text(stmt.name_token).to_owned();
+                let start_expr = self.check_expr(stmt.start, scope, Some(&Type::Uint(64)))?;
+                let end_expr = self.check_expr(stmt.end, scope, Some(&Type::Uint(64)))?;
+                let Some(start) = eval_const_u128(&start_expr) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        start_expr.span,
+                        "`for` range lower bound must be a compile-time integer constant",
+                    ));
+                    return None;
+                };
+                let Some(end) = eval_const_u128(&end_expr) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        end_expr.span,
+                        "`for` range upper bound must be a compile-time integer constant",
+                    ));
+                    return None;
+                };
+                if start > end {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.node_span(node),
+                        format!("invalid `for` range `{start}..{end}`: start exceeds end"),
+                    ));
+                    return None;
+                }
+                let local = LocalId(*next_local);
+                *next_local += 1;
+                let mut loop_scope = scope.clone();
+                loop_scope.insert(var_name.clone(), ValueBinding::Local(local, Type::Uint(64)));
+                let body =
+                    self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
+                Some(Stmt::ForRange {
+                    local,
+                    name: var_name,
+                    start: start as u64,
+                    end: end as u64,
+                    body,
+                    span: self.ast.node_span(node),
+                })
+            }
+            NodeTag::ForEachStmt => {
+                let stmt = self.ast.for_each_stmt(node);
+                let var_name = self.text(stmt.name_token).to_owned();
+                let iter = self.check_expr(stmt.iter, scope, None)?;
+                let (len, elem_ty) = match &iter.ty {
+                    Type::Vector(len, elem) => (*len, (**elem).clone()),
+                    Type::Tuple(elems) if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) => {
+                        (elems.len() as u32, elems[0].clone())
+                    }
+                    other => {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            iter.span,
+                            format!(
+                                "`for` loop iterable must be a `Vector`, found `{}`",
+                                self.format_type(other)
+                            ),
+                        ));
+                        return None;
+                    }
+                };
+                let local = LocalId(*next_local);
+                *next_local += 1;
+                let mut loop_scope = scope.clone();
+                loop_scope.insert(var_name.clone(), ValueBinding::Local(local, elem_ty.clone()));
+                let body =
+                    self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
+                Some(Stmt::ForEach {
+                    local,
+                    name: var_name,
+                    elem_ty,
+                    iter,
+                    len,
+                    body,
+                    span: self.ast.node_span(node),
+                })
+            }
             NodeTag::ConstStmt => {
                 let stmt = self.ast.const_stmt(node);
                 let name = self.text(stmt.name_token).to_owned();
@@ -909,7 +1020,7 @@ impl<'a> Analyzer<'a> {
                     return None;
                 };
                 let field = &self.ledger_fields[field_id.0 as usize];
-                if field.adt != LedgerAdt::Cell {
+                let Some(expected_val_ty) = field.adt.cell_type().cloned() else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.file,
                         assign_span,
@@ -919,8 +1030,8 @@ impl<'a> Analyzer<'a> {
                         ),
                     ));
                     return None;
-                }
-                let expected_val_ty = field.value_type.clone();
+                };
+                let target_adt = field.adt.clone();
                 let mut rhs = self.check_expr(stmt.rhs, scope, Some(&expected_val_ty))?;
                 if !self.coerce_or_check(&mut rhs, &expected_val_ty) {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -937,6 +1048,8 @@ impl<'a> Analyzer<'a> {
                 Some(Stmt::Expr(Expr {
                     kind: ExprKind::LedgerCall {
                         field: field_id,
+                        key_path: Vec::new(),
+                        target_adt,
                         op: LedgerOp::CellWrite,
                         args: vec![rhs],
                     },
@@ -987,12 +1100,18 @@ impl<'a> Analyzer<'a> {
         if expr.ty == *expected {
             return true;
         }
-        if let (ExprKind::IntLit(v), Type::Uint(bits)) = (&expr.kind, expected)
-            && *bits < 128
-            && *v < (1u128 << bits)
-        {
-            expr.ty = expected.clone();
-            return true;
+        if let ExprKind::IntLit(v) = &expr.kind {
+            match expected {
+                Type::Field => {
+                    expr.ty = Type::Field;
+                    return true;
+                }
+                Type::Uint(bits) if *bits < 128 && *v < (1u128 << bits) => {
+                    expr.ty = expected.clone();
+                    return true;
+                }
+                _ => {}
+            }
         }
         false
     }
@@ -1068,14 +1187,16 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(&field_id) = self.ledger_by_name.get(name) {
                     let field = &self.ledger_fields[field_id.0 as usize];
-                    if field.adt == LedgerAdt::Cell {
+                    if let Some(val_ty) = field.adt.cell_type().cloned() {
                         return Some(Expr {
                             kind: ExprKind::LedgerCall {
                                 field: field_id,
+                                key_path: Vec::new(),
+                                target_adt: field.adt.clone(),
                                 op: LedgerOp::CellRead,
                                 args: Vec::new(),
                             },
-                            ty: field.value_type.clone(),
+                            ty: val_ty,
                             span,
                         });
                     }
@@ -1332,8 +1453,13 @@ impl<'a> Analyzer<'a> {
                 let op = match self.ast.token_tag(op_tok) {
                     TokenTag::Plus => BinaryOp::Add,
                     TokenTag::Minus => BinaryOp::Sub,
+                    TokenTag::Star => BinaryOp::Mul,
                     TokenTag::EqEq => BinaryOp::Eq,
                     TokenTag::BangEq => BinaryOp::Neq,
+                    TokenTag::LAngle => BinaryOp::Lt,
+                    TokenTag::LtEq => BinaryOp::Le,
+                    TokenTag::RAngle => BinaryOp::Gt,
+                    TokenTag::GtEq => BinaryOp::Ge,
                     TokenTag::AmpAmp => BinaryOp::And,
                     TokenTag::PipePipe => BinaryOp::Or,
                     other => {
@@ -1372,23 +1498,52 @@ impl<'a> Analyzer<'a> {
                         span,
                     });
                 }
-                let lhs = self.check_expr(NodeIndex(data.lhs), scope, None)?;
+                let mut lhs = self.check_expr(NodeIndex(data.lhs), scope, None)?;
                 let mut rhs = self.check_expr(NodeIndex(data.rhs), scope, Some(&lhs.ty))?;
-                if !self.coerce_or_check(&mut rhs, &lhs.ty) {
+                if !self.coerce_or_check(&mut rhs, &lhs.ty)
+                    && !self.coerce_or_check(&mut lhs, &rhs.ty)
+                {
+                    if let (Type::Uint(a), Type::Uint(b)) = (&lhs.ty, &rhs.ty) {
+                        let widened = Type::Uint((*a).max(*b));
+                        lhs.ty = widened.clone();
+                        rhs.ty = widened;
+                    } else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            span,
+                            format!(
+                                "incompatible operand types `{}` and `{}`",
+                                self.format_type(&lhs.ty),
+                                self.format_type(&rhs.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                }
+                if matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
+                    && !matches!(lhs.ty, Type::Uint(_))
+                {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.file,
                         span,
                         format!(
-                            "incompatible operand types `{}` and `{}`",
-                            self.format_type(&lhs.ty),
-                            self.format_type(&rhs.ty)
+                            "comparison `{}` requires `Uint` operands, found `{}`",
+                            self.ast.token_tag(op_tok).as_str(),
+                            self.format_type(&lhs.ty)
                         ),
                     ));
                     return None;
                 }
                 let ty = match op {
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::And | BinaryOp::Or => Type::Boolean,
-                    BinaryOp::Add | BinaryOp::Sub => lhs.ty.clone(),
+                    BinaryOp::Eq
+                    | BinaryOp::Neq
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or => Type::Boolean,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => lhs.ty.clone(),
                 };
                 Some(Expr {
                     kind: ExprKind::Binary {
@@ -1572,24 +1727,25 @@ impl<'a> Analyzer<'a> {
                     return None;
                 }
 
-                // 2. Ledger ADT method call.
+                // 2. Ledger ADT method call (supporting arbitrary nested `map.lookup(k)...method(...)`).
                 if self.ast.node_tag(call.callee) == NodeTag::MemberExpr {
                     let mdata = self.ast.node_data(call.callee);
                     let recv = NodeIndex(mdata.lhs);
                     let method_tok = TokenIndex(mdata.rhs);
-                    if self.ast.node_tag(recv) == NodeTag::IdentExpr {
-                        let recv_name = self.text(self.ast.node_main_token(recv));
-                        if let Some(&field_id) = self.ledger_by_name.get(recv_name) {
-                            let method_name = self.text(method_tok);
-                            return self.check_ledger_call(
-                                field_id,
-                                method_name,
-                                self.ast.token_span(method_tok),
-                                &arg_nodes,
-                                span,
-                                scope,
-                            );
-                        }
+                    if let Some((field_id, key_path, target_adt)) =
+                        self.try_extract_ledger_chain(recv, scope)
+                    {
+                        let method_name = self.text(method_tok);
+                        return self.check_ledger_call(
+                            field_id,
+                            key_path,
+                            target_adt,
+                            method_name,
+                            self.ast.token_span(method_tok),
+                            &arg_nodes,
+                            span,
+                            scope,
+                        );
                     }
                 }
 
@@ -1909,24 +2065,105 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn try_extract_ledger_chain(
+        &mut self,
+        node: NodeIndex,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<(LedgerFieldId, Vec<Expr>, LedgerAdt)> {
+        match self.ast.node_tag(node) {
+            NodeTag::IdentExpr => {
+                let name = self.text(self.ast.node_main_token(node));
+                let &field_id = self.ledger_by_name.get(name)?;
+                Some((
+                    field_id,
+                    Vec::new(),
+                    self.ledger_fields[field_id.0 as usize].adt.clone(),
+                ))
+            }
+            NodeTag::CallExpr => {
+                let call = self.ast.call_expr(node);
+                if self.ast.node_tag(call.callee) != NodeTag::MemberExpr {
+                    return None;
+                }
+                let mdata = self.ast.node_data(call.callee);
+                let inner_recv = NodeIndex(mdata.lhs);
+                let method_name = self.text(TokenIndex(mdata.rhs));
+                if method_name != "lookup" {
+                    return None;
+                }
+                let (field_id, mut key_path, outer_adt) =
+                    self.try_extract_ledger_chain(inner_recv, scope)?;
+                let LedgerAdt::Map { key, value } = outer_adt else {
+                    return None;
+                };
+                if value.is_cell() {
+                    return None;
+                }
+                let arg_nodes: Vec<_> = self
+                    .ast
+                    .extra_nodes(call.args_start, call.args_end)
+                    .collect();
+                if arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        self.ast.node_span(node),
+                        "`Map.lookup` takes 1 argument",
+                    ));
+                    return None;
+                }
+                let mut key_expr = self.check_expr(arg_nodes[0], scope, Some(&key))?;
+                if !self.coerce_or_check(&mut key_expr, &key) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        key_expr.span,
+                        format!(
+                            "`Map.lookup` key mismatch: expected `{}`, found `{}`",
+                            self.format_type(&key),
+                            self.format_type(&key_expr.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                key_path.push(key_expr);
+                Some((field_id, key_path, *value))
+            }
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn check_ledger_call(
         &mut self,
         field_id: LedgerFieldId,
+        key_path: Vec<Expr>,
+        target_adt: LedgerAdt,
         method_name: &str,
         method_span: Span,
         arg_nodes: &[NodeIndex],
         call_span: Span,
         scope: &HashMap<String, ValueBinding>,
     ) -> Option<Expr> {
-        let adt = self.ledger_fields[field_id.0 as usize].adt;
-        let value_type = self.ledger_fields[field_id.0 as usize].value_type.clone();
+        let make_call = |op: LedgerOp, args: Vec<Expr>, ty: Type, target_adt: LedgerAdt| {
+            Some(Expr {
+                kind: ExprKind::LedgerCall {
+                    field: field_id,
+                    key_path,
+                    target_adt,
+                    op,
+                    args,
+                },
+                ty,
+                span: call_span,
+            })
+        };
 
-        match adt {
+        match target_adt.clone() {
             LedgerAdt::Counter => {
                 let (op, expected_args, ret_ty) = match method_name {
                     "increment" => (LedgerOp::CounterIncrement, 1usize, Type::unit()),
                     "decrement" => (LedgerOp::CounterDecrement, 1usize, Type::unit()),
                     "read" => (LedgerOp::CounterRead, 0usize, Type::Uint(64)),
+                    "resetToDefault" => (LedgerOp::CounterResetToDefault, 0usize, Type::unit()),
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
@@ -1936,7 +2173,6 @@ impl<'a> Analyzer<'a> {
                         return None;
                     }
                 };
-
                 if arg_nodes.len() != expected_args {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.file,
@@ -1948,12 +2184,11 @@ impl<'a> Analyzer<'a> {
                     ));
                     return None;
                 }
-
                 let mut args = Vec::with_capacity(arg_nodes.len());
                 for &anode in arg_nodes {
                     let mut arg = self.check_expr(anode, scope, Some(&Type::Uint(16)))?;
                     if matches!(op, LedgerOp::CounterIncrement | LedgerOp::CounterDecrement)
-                        && let ExprKind::IntLit(v) = arg.kind
+                        && let Some(v) = eval_const_u128(&arg)
                     {
                         if v > u16::MAX as u128 {
                             self.diagnostics.push(CompactDiagnostic::error(
@@ -1969,18 +2204,9 @@ impl<'a> Analyzer<'a> {
                     }
                     args.push(arg);
                 }
-
-                Some(Expr {
-                    kind: ExprKind::LedgerCall {
-                        field: field_id,
-                        op,
-                        args,
-                    },
-                    ty: ret_ty,
-                    span: call_span,
-                })
+                make_call(op, args, ret_ty, target_adt)
             }
-            LedgerAdt::Cell => match method_name {
+            LedgerAdt::Cell(value_type) => match method_name {
                 "read" => {
                     if !arg_nodes.is_empty() {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -1990,15 +2216,7 @@ impl<'a> Analyzer<'a> {
                         ));
                         return None;
                     }
-                    Some(Expr {
-                        kind: ExprKind::LedgerCall {
-                            field: field_id,
-                            op: LedgerOp::CellRead,
-                            args: Vec::new(),
-                        },
-                        ty: value_type,
-                        span: call_span,
-                    })
+                    make_call(LedgerOp::CellRead, Vec::new(), *value_type, target_adt)
                 }
                 "write" => {
                     if arg_nodes.len() != 1 {
@@ -2022,15 +2240,23 @@ impl<'a> Analyzer<'a> {
                         ));
                         return None;
                     }
-                    Some(Expr {
-                        kind: ExprKind::LedgerCall {
-                            field: field_id,
-                            op: LedgerOp::CellWrite,
-                            args: vec![val],
-                        },
-                        ty: Type::unit(),
-                        span: call_span,
-                    })
+                    make_call(LedgerOp::CellWrite, vec![val], Type::unit(), target_adt)
+                }
+                "resetToDefault" => {
+                    if !arg_nodes.is_empty() {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`Cell.resetToDefault` takes 0 arguments",
+                        ));
+                        return None;
+                    }
+                    make_call(
+                        LedgerOp::CellResetToDefault,
+                        Vec::new(),
+                        Type::unit(),
+                        target_adt,
+                    )
                 }
                 other => {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -2041,7 +2267,23 @@ impl<'a> Analyzer<'a> {
                     None
                 }
             },
-            LedgerAdt::Set => match method_name {
+            LedgerAdt::Set(value_type) => match method_name {
+                "isEmpty" | "size" | "resetToDefault" => {
+                    let (op, ret_ty) = match method_name {
+                        "isEmpty" => (LedgerOp::SetIsEmpty, Type::Boolean),
+                        "size" => (LedgerOp::SetSize, Type::Uint(64)),
+                        _ => (LedgerOp::SetResetToDefault, Type::unit()),
+                    };
+                    if !arg_nodes.is_empty() {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!("`Set.{method_name}` takes 0 arguments"),
+                        ));
+                        return None;
+                    }
+                    make_call(op, Vec::new(), ret_ty, target_adt)
+                }
                 "member" | "insert" | "remove" => {
                     let (op, ret_ty) = match method_name {
                         "member" => (LedgerOp::SetMember, Type::Boolean),
@@ -2069,15 +2311,7 @@ impl<'a> Analyzer<'a> {
                         ));
                         return None;
                     }
-                    Some(Expr {
-                        kind: ExprKind::LedgerCall {
-                            field: field_id,
-                            op,
-                            args: vec![elem],
-                        },
-                        ty: ret_ty,
-                        span: call_span,
-                    })
+                    make_call(op, vec![elem], ret_ty, target_adt)
                 }
                 other => {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -2088,9 +2322,221 @@ impl<'a> Analyzer<'a> {
                     None
                 }
             },
-            LedgerAdt::MerkleTree(_) | LedgerAdt::HistoricMerkleTree(_) => {
-                let historic = matches!(adt, LedgerAdt::HistoricMerkleTree(_));
-                let adt_name = adt.name();
+            LedgerAdt::List(value_type) => match method_name {
+                "isEmpty" | "length" | "head" | "popFront" | "resetToDefault" => {
+                    let (op, ret_ty) = match method_name {
+                        "isEmpty" => (LedgerOp::ListIsEmpty, Type::Boolean),
+                        "length" => (LedgerOp::ListLength, Type::Uint(64)),
+                        "head" => (LedgerOp::ListHead, Type::Maybe(value_type)),
+                        "popFront" => (LedgerOp::ListPopFront, Type::unit()),
+                        _ => (LedgerOp::ListResetToDefault, Type::unit()),
+                    };
+                    if !arg_nodes.is_empty() {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!("`List.{method_name}` takes 0 arguments"),
+                        ));
+                        return None;
+                    }
+                    make_call(op, Vec::new(), ret_ty, target_adt)
+                }
+                "pushFront" => {
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`List.pushFront` takes 1 argument",
+                        ));
+                        return None;
+                    }
+                    let mut elem = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
+                    if !self.coerce_or_check(&mut elem, &value_type) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            elem.span,
+                            format!(
+                                "`List.pushFront` expects `{}`, found `{}`",
+                                self.format_type(&value_type),
+                                self.format_type(&elem.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(LedgerOp::ListPushFront, vec![elem], Type::unit(), target_adt)
+                }
+                other => {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        method_span,
+                        format!("`List` has no method `{other}`"),
+                    ));
+                    None
+                }
+            },
+            LedgerAdt::Map { key, value } => match method_name {
+                "isEmpty" | "size" | "resetToDefault" => {
+                    let (op, ret_ty) = match method_name {
+                        "isEmpty" => (LedgerOp::MapIsEmpty, Type::Boolean),
+                        "size" => (LedgerOp::MapSize, Type::Uint(64)),
+                        _ => (LedgerOp::MapResetToDefault, Type::unit()),
+                    };
+                    if !arg_nodes.is_empty() {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!("`Map.{method_name}` takes 0 arguments"),
+                        ));
+                        return None;
+                    }
+                    make_call(op, Vec::new(), ret_ty, target_adt)
+                }
+                "member" | "remove" | "insertDefault" => {
+                    let (op, ret_ty) = match method_name {
+                        "member" => (LedgerOp::MapMember, Type::Boolean),
+                        "remove" => (LedgerOp::MapRemove, Type::unit()),
+                        _ => (LedgerOp::MapInsertDefault, Type::unit()),
+                    };
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!("`Map.{method_name}` takes 1 argument"),
+                        ));
+                        return None;
+                    }
+                    let mut k = self.check_expr(arg_nodes[0], scope, Some(&key))?;
+                    if !self.coerce_or_check(&mut k, &key) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            k.span,
+                            format!(
+                                "`Map.{method_name}` expects key `{}`, found `{}`",
+                                self.format_type(&key),
+                                self.format_type(&k.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(op, vec![k], ret_ty, target_adt)
+                }
+                "lookup" => {
+                    if arg_nodes.len() != 1 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`Map.lookup` takes 1 argument",
+                        ));
+                        return None;
+                    }
+                    let Some(val_ty) = value.cell_type().cloned() else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            format!(
+                                "`Map.lookup` returns nested ADT `{}`; call a method on it directly",
+                                value.name()
+                            ),
+                        ));
+                        return None;
+                    };
+                    let mut k = self.check_expr(arg_nodes[0], scope, Some(&key))?;
+                    if !self.coerce_or_check(&mut k, &key) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            k.span,
+                            format!(
+                                "`Map.lookup` expects key `{}`, found `{}`",
+                                self.format_type(&key),
+                                self.format_type(&k.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(LedgerOp::MapLookup, vec![k], val_ty, target_adt)
+                }
+                "insert" => {
+                    if arg_nodes.len() != 2 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            call_span,
+                            "`Map.insert` takes 2 arguments (key, value)",
+                        ));
+                        return None;
+                    }
+                    let mut k = self.check_expr(arg_nodes[0], scope, Some(&key))?;
+                    if !self.coerce_or_check(&mut k, &key) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            k.span,
+                            format!(
+                                "`Map.insert` expects key `{}`, found `{}`",
+                                self.format_type(&key),
+                                self.format_type(&k.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let v = if let Some(val_ty) = value.cell_type() {
+                        let mut val = self.check_expr(arg_nodes[1], scope, Some(val_ty))?;
+                        if !self.coerce_or_check(&mut val, val_ty) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                val.span,
+                                format!(
+                                    "`Map.insert` expects value `{}`, found `{}`",
+                                    self.format_type(val_ty),
+                                    self.format_type(&val.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        val
+                    } else if self.ast.node_tag(arg_nodes[1]) == NodeTag::DefaultExpr {
+                        let inner_ty = NodeIndex(self.ast.node_data(arg_nodes[1]).lhs);
+                        let default_adt = self.resolve_ledger_adt(inner_ty)?;
+                        if default_adt != *value {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                self.ast.node_span(arg_nodes[1]),
+                                format!(
+                                    "`Map.insert` expects default value for `{}`, found `{}`",
+                                    value.name(),
+                                    default_adt.name()
+                                ),
+                            ));
+                            return None;
+                        }
+                        Expr {
+                            kind: ExprKind::DefaultAdt(default_adt),
+                            ty: Type::unit(),
+                            span: self.ast.node_span(arg_nodes[1]),
+                        }
+                    } else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.file,
+                            self.ast.node_span(arg_nodes[1]),
+                            format!(
+                                "`Map.insert` for nested ADT `{}` requires `default<...>`",
+                                value.name()
+                            ),
+                        ));
+                        return None;
+                    };
+                    make_call(LedgerOp::MapInsert, vec![k, v], Type::unit(), target_adt)
+                }
+                other => {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.file,
+                        method_span,
+                        format!("`Map` has no method `{other}`"),
+                    ));
+                    None
+                }
+            },
+            LedgerAdt::MerkleTree { value, .. } | LedgerAdt::HistoricMerkleTree { value, .. } => {
+                let historic = matches!(target_adt, LedgerAdt::HistoricMerkleTree { .. });
+                let adt_name = target_adt.name();
                 match method_name {
                     "insert" => {
                         if arg_nodes.len() != 1 {
@@ -2101,32 +2547,29 @@ impl<'a> Analyzer<'a> {
                             ));
                             return None;
                         }
-                        let mut item = self.check_expr(arg_nodes[0], scope, Some(&value_type))?;
-                        if !self.coerce_or_check(&mut item, &value_type) {
+                        let mut item = self.check_expr(arg_nodes[0], scope, Some(&value))?;
+                        if !self.coerce_or_check(&mut item, &value) {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.file,
                                 item.span,
                                 format!(
                                     "`{adt_name}.insert` expects `{}`, found `{}`",
-                                    self.format_type(&value_type),
+                                    self.format_type(&value),
                                     self.format_type(&item.ty)
                                 ),
                             ));
                             return None;
                         }
-                        Some(Expr {
-                            kind: ExprKind::LedgerCall {
-                                field: field_id,
-                                op: if historic {
-                                    LedgerOp::HistoricMerkleTreeInsert
-                                } else {
-                                    LedgerOp::MerkleTreeInsert
-                                },
-                                args: vec![item],
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeInsert
+                            } else {
+                                LedgerOp::MerkleTreeInsert
                             },
-                            ty: Type::unit(),
-                            span: call_span,
-                        })
+                            vec![item],
+                            Type::unit(),
+                            target_adt,
+                        )
                     }
                     "checkRoot" => {
                         if arg_nodes.len() != 1 {
@@ -2150,19 +2593,36 @@ impl<'a> Analyzer<'a> {
                             ));
                             return None;
                         }
-                        Some(Expr {
-                            kind: ExprKind::LedgerCall {
-                                field: field_id,
-                                op: if historic {
-                                    LedgerOp::HistoricMerkleTreeCheckRoot
-                                } else {
-                                    LedgerOp::MerkleTreeCheckRoot
-                                },
-                                args: vec![rt],
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeCheckRoot
+                            } else {
+                                LedgerOp::MerkleTreeCheckRoot
                             },
-                            ty: Type::Boolean,
-                            span: call_span,
-                        })
+                            vec![rt],
+                            Type::Boolean,
+                            target_adt,
+                        )
+                    }
+                    "resetToDefault" => {
+                        if !arg_nodes.is_empty() {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.file,
+                                call_span,
+                                format!("`{adt_name}.resetToDefault` takes 0 arguments"),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeResetToDefault
+                            } else {
+                                LedgerOp::MerkleTreeResetToDefault
+                            },
+                            Vec::new(),
+                            Type::unit(),
+                            target_adt,
+                        )
                     }
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -2175,6 +2635,24 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+    }
+}
+
+fn eval_const_u128(expr: &Expr) -> Option<u128> {
+    match &expr.kind {
+        ExprKind::IntLit(v) => Some(*v),
+        ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => eval_const_u128(expr),
+        ExprKind::Binary { op, lhs, rhs } => {
+            let a = eval_const_u128(lhs)?;
+            let b = eval_const_u128(rhs)?;
+            match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Sub => a.checked_sub(b),
+                BinaryOp::Mul => a.checked_mul(b),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2255,6 +2733,12 @@ fn stmts_effects(stmts: &[Stmt], calls: &mut Vec<CircuitId>) -> (bool, bool) {
                 let (el, ew) = stmts_effects(else_branch, calls);
                 (cl | tl | el, cw | tw | ew)
             }
+            Stmt::ForRange { body, .. } => stmts_effects(body, calls),
+            Stmt::ForEach { iter, body, .. } => {
+                let (il, iw) = expr_effects(iter, calls);
+                let (bl, bw) = stmts_effects(body, calls);
+                (il | bl, iw | bw)
+            }
             Stmt::Expr(e) => expr_effects(e, calls),
             Stmt::Return { value: Some(e), .. } => expr_effects(e, calls),
             Stmt::Return { value: None, .. } => (false, false),
@@ -2267,8 +2751,11 @@ fn stmts_effects(stmts: &[Stmt], calls: &mut Vec<CircuitId>) -> (bool, bool) {
 
 fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
     match &expr.kind {
-        ExprKind::LedgerCall { args, .. } => {
+        ExprKind::LedgerCall { key_path, args, .. } => {
             let mut w = false;
+            for k in key_path {
+                w |= expr_effects(k, calls).1;
+            }
             for a in args {
                 w |= expr_effects(a, calls).1;
             }
@@ -2336,6 +2823,7 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
         | ExprKind::BoolLit(_)
         | ExprKind::BytesLit(_)
         | ExprKind::Default(_)
+        | ExprKind::DefaultAdt(_)
         | ExprKind::ParamRef(_)
         | ExprKind::LocalRef(_)
         | ExprKind::EnumVariant { .. }

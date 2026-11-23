@@ -306,7 +306,15 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     visit_expr(else_branch, out);
                 }
                 ExprKind::Assert { cond, .. } => visit_expr(cond, out),
-                ExprKind::WitnessCall { args, .. } | ExprKind::LedgerCall { args, .. } => {
+                ExprKind::WitnessCall { args, .. } => {
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+                ExprKind::LedgerCall { key_path, args, .. } => {
+                    for k in key_path {
+                        visit_expr(k, out);
+                    }
                     for a in args {
                         visit_expr(a, out);
                     }
@@ -315,6 +323,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 | ExprKind::BoolLit(_)
                 | ExprKind::BytesLit(_)
                 | ExprKind::Default(_)
+                | ExprKind::DefaultAdt(_)
                 | ExprKind::ParamRef(_)
                 | ExprKind::LocalRef(_)
                 | ExprKind::EnumVariant { .. }
@@ -334,6 +343,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         visit_expr(cond, out);
                         visit_stmts(then_branch, out);
                         visit_stmts(else_branch, out);
+                    }
+                    Stmt::ForRange { body, .. } => visit_stmts(body, out),
+                    Stmt::ForEach { iter, body, .. } => {
+                        visit_expr(iter, out);
+                        visit_stmts(body, out);
                     }
                     Stmt::Expr(e) => visit_expr(e, out),
                     Stmt::Return { value: Some(e), .. } => visit_expr(e, out),
@@ -360,6 +374,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 _ => false,
             }
         }
+        fn adt_uses_maybe(adt: &LedgerAdt, exported_root: bool) -> bool {
+            match adt {
+                LedgerAdt::Cell(ty) | LedgerAdt::Set(ty) => ty_uses_maybe(ty),
+                LedgerAdt::Counter => false,
+                LedgerAdt::List(ty) => exported_root || ty_uses_maybe(ty),
+                LedgerAdt::Map { key, value } => {
+                    ty_uses_maybe(key) || adt_uses_maybe(value, exported_root)
+                }
+                LedgerAdt::MerkleTree { value, .. }
+                | LedgerAdt::HistoricMerkleTree { value, .. } => ty_uses_maybe(value),
+            }
+        }
         self.input
             .program
             .exported_stdlib_types
@@ -376,7 +402,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 .program
                 .ledger_fields
                 .iter()
-                .any(|f| ty_uses_maybe(&f.value_type))
+                .any(|f| adt_uses_maybe(&f.adt, f.exported))
             || self
                 .input
                 .program
@@ -852,6 +878,128 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         )
     }
 
+    fn ts_method_sig(
+        &self,
+        name: &str,
+        params_spec: Vec<(&str, TSType<'a>)>,
+        ret: TSType<'a>,
+    ) -> TSSignature<'a> {
+        let mut params = ArenaVec::with_capacity_in(params_spec.len(), self);
+        for (pname, pty) in params_spec {
+            params.push(FormalParameter::new(
+                SPAN,
+                ArenaVec::new_in(self),
+                self.binding_ident(SPAN, pname),
+                Some(self.ts_type_annotation(pty)),
+                None,
+                false,
+                None,
+                false,
+                false,
+                self,
+            ));
+        }
+        let formal_params =
+            FormalParameters::boxed(SPAN, FormalParameterKind::Signature, params, None, self);
+        TSSignature::new_ts_method_signature(
+            SPAN,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident(name), self)),
+            false,
+            false,
+            TSMethodSignatureKind::Method,
+            None,
+            None,
+            formal_params,
+            Some(self.ts_type_annotation(ret)),
+            self,
+        )
+    }
+
+    fn ledger_adt_to_ts(&self, adt: &LedgerAdt) -> TSType<'a> {
+        match adt {
+            LedgerAdt::Cell(ty) => self.hir_type_to_ts(ty),
+            LedgerAdt::Counter => TSType::new_ts_big_int_keyword(SPAN, self),
+            LedgerAdt::Set(ty) => {
+                let mut members = ArenaVec::with_capacity_in(3, self);
+                members.push(self.ts_method_sig(
+                    "isEmpty",
+                    vec![],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "size",
+                    vec![],
+                    TSType::new_ts_big_int_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "member",
+                    vec![("elem", self.hir_type_to_ts(ty))],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                TSType::new_ts_type_literal(SPAN, members, self)
+            }
+            LedgerAdt::List(ty) => {
+                let mut members = ArenaVec::with_capacity_in(3, self);
+                members.push(self.ts_method_sig(
+                    "isEmpty",
+                    vec![],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "length",
+                    vec![],
+                    TSType::new_ts_big_int_keyword(SPAN, self),
+                ));
+                let mut maybe_args = ArenaVec::with_capacity_in(1, self);
+                maybe_args.push(self.hir_type_to_ts(ty));
+                members.push(self.ts_method_sig(
+                    "head",
+                    vec![],
+                    self.ts_type_ref("Maybe", Some(maybe_args)),
+                ));
+                TSType::new_ts_type_literal(SPAN, members, self)
+            }
+            LedgerAdt::Map { key, value } => {
+                let mut members = ArenaVec::with_capacity_in(4, self);
+                members.push(self.ts_method_sig(
+                    "isEmpty",
+                    vec![],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "size",
+                    vec![],
+                    TSType::new_ts_big_int_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "member",
+                    vec![("key", self.hir_type_to_ts(key))],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "lookup",
+                    vec![("key", self.hir_type_to_ts(key))],
+                    self.ledger_adt_to_ts(value),
+                ));
+                TSType::new_ts_type_literal(SPAN, members, self)
+            }
+            LedgerAdt::MerkleTree { .. } | LedgerAdt::HistoricMerkleTree { .. } => {
+                let mut members = ArenaVec::with_capacity_in(2, self);
+                members.push(self.ts_method_sig(
+                    "isFull",
+                    vec![],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                members.push(self.ts_method_sig(
+                    "checkRoot",
+                    vec![("rt", self.ts_runtime_type("MerkleTreeDigest", None))],
+                    TSType::new_ts_boolean_keyword(SPAN, self),
+                ));
+                TSType::new_ts_type_literal(SPAN, members, self)
+            }
+        }
+    }
+
     fn build_ledger_type(&self) -> Statement<'a> {
         let mut members = ArenaVec::new_in(self);
         for field in &self.input.program.ledger_fields {
@@ -868,7 +1016,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     self.ident(&field.name),
                     self,
                 )),
-                Some(self.ts_type_annotation(self.hir_type_to_ts(&field.value_type))),
+                Some(self.ts_type_annotation(self.ledger_adt_to_ts(&field.adt))),
                 self,
             ));
         }
@@ -966,10 +1114,12 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             }
             let decode_fn = match field.adt {
                 LedgerAdt::Counter => "decodeCounter",
-                LedgerAdt::Cell => "decodeCell",
-                LedgerAdt::Set => "decodeSet",
-                LedgerAdt::MerkleTree(_) => "decodeMerkleTree",
-                LedgerAdt::HistoricMerkleTree(_) => "decodeHistoricMerkleTree",
+                LedgerAdt::Cell(_) => "decodeCell",
+                LedgerAdt::Set(_) => "decodeSet",
+                LedgerAdt::List(_) => "decodeList",
+                LedgerAdt::Map { .. } => "decodeMap",
+                LedgerAdt::MerkleTree { .. } => "decodeMerkleTree",
+                LedgerAdt::HistoricMerkleTree { .. } => "decodeHistoricMerkleTree",
             };
             let mut args = ArenaVec::with_capacity_in(2, self);
             args.push(Argument::from(self.expr_ident(SPAN, "state")));
@@ -1419,6 +1569,136 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         self,
                     ));
                 }
+                Stmt::ForRange {
+                    local,
+                    name,
+                    start,
+                    end,
+                    body,
+                    span,
+                } => {
+                    let s = self.oxc_span(*span);
+                    let mut loop_locals = locals.clone();
+                    loop_locals.insert(*local, name.clone());
+                    let (body_stmts, _) = self.lower_stmts_inner(
+                        params,
+                        body,
+                        &mut loop_locals,
+                        wrap_circuit_results,
+                    );
+                    let init_lit = Expression::new_big_int_literal(
+                        s,
+                        self.str_atom(&start.to_string()),
+                        None,
+                        oxc_syntax::number::BigintBase::Decimal,
+                        self,
+                    );
+                    let end_lit = Expression::new_big_int_literal(
+                        s,
+                        self.str_atom(&end.to_string()),
+                        None,
+                        oxc_syntax::number::BigintBase::Decimal,
+                        self,
+                    );
+                    let one_lit = Expression::new_big_int_literal(
+                        s,
+                        self.str_atom("1"),
+                        None,
+                        oxc_syntax::number::BigintBase::Decimal,
+                        self,
+                    );
+                    let mut decls = ArenaVec::with_capacity_in(1, self);
+                    decls.push(VariableDeclarator::new(
+                        s,
+                        self.binding_ident(s, name),
+                        Some(self.ts_type_annotation(TSType::new_ts_big_int_keyword(SPAN, self))),
+                        Some(init_lit),
+                        false,
+                        self,
+                    ));
+                    let init = ForStatementInit::VariableDeclaration(VariableDeclaration::boxed(
+                        s,
+                        VariableDeclarationKind::Let,
+                        decls,
+                        false,
+                        self,
+                    ));
+                    let test = Expression::new_binary_expression(
+                        s,
+                        self.expr_ident(s, name),
+                        BinaryOperator::LessThan,
+                        end_lit,
+                        self,
+                    );
+                    let update = Expression::new_assignment_expression(
+                        s,
+                        AssignmentOperator::Assign,
+                        AssignmentTarget::new_assignment_target_identifier(
+                            s,
+                            self.ident(name),
+                            self,
+                        ),
+                        Expression::new_binary_expression(
+                            s,
+                            self.expr_ident(s, name),
+                            BinaryOperator::Addition,
+                            one_lit,
+                            self,
+                        ),
+                        self,
+                    );
+                    stmts.push(Statement::new_for_statement(
+                        s,
+                        Some(init),
+                        Some(test),
+                        Some(update),
+                        Statement::new_block_statement(s, body_stmts, self),
+                        self,
+                    ));
+                }
+                Stmt::ForEach {
+                    local,
+                    name,
+                    iter,
+                    body,
+                    span,
+                    ..
+                } => {
+                    let s = self.oxc_span(*span);
+                    let right = self.lower_expr(params, iter, locals);
+                    let mut loop_locals = locals.clone();
+                    loop_locals.insert(*local, name.clone());
+                    let (body_stmts, _) = self.lower_stmts_inner(
+                        params,
+                        body,
+                        &mut loop_locals,
+                        wrap_circuit_results,
+                    );
+                    let mut decls = ArenaVec::with_capacity_in(1, self);
+                    decls.push(VariableDeclarator::new(
+                        s,
+                        self.binding_ident(s, name),
+                        None,
+                        None,
+                        false,
+                        self,
+                    ));
+                    let left = ForStatementLeft::VariableDeclaration(VariableDeclaration::boxed(
+                        s,
+                        VariableDeclarationKind::Const,
+                        decls,
+                        false,
+                        self,
+                    ));
+                    stmts.push(Statement::new_for_of_statement(
+                        s,
+                        false,
+                        left,
+                        right,
+                        Statement::new_block_statement(s, body_stmts, self),
+                        self,
+                    ));
+                }
                 Stmt::Expr(expr) => {
                     stmts.push(Statement::new_expression_statement(
                         self.oxc_span(expr.span),
@@ -1573,6 +1853,19 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 )
             }
             ExprKind::Default(ty) => self.default_expr_for_type(span, ty),
+            ExprKind::DefaultAdt(adt) => {
+                let mut args = ArenaVec::with_capacity_in(1, self);
+                args.push(Argument::from(self.expr_str(span, adt.name())));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "defaultAdt",
+                    ),
+                    args,
+                )
+            }
             ExprKind::ParamRef(pid) => self.expr_ident(span, &params[pid.0 as usize].name),
             ExprKind::LocalRef(lid) => self.expr_ident(span, &locals[lid]),
             ExprKind::EnumVariant {
@@ -1657,8 +1950,13 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 let bin_op = match op {
                     BinaryOp::Add => BinaryOperator::Addition,
                     BinaryOp::Sub => BinaryOperator::Subtraction,
+                    BinaryOp::Mul => BinaryOperator::Multiplication,
                     BinaryOp::Eq => BinaryOperator::StrictEquality,
                     BinaryOp::Neq => BinaryOperator::StrictInequality,
+                    BinaryOp::Lt => BinaryOperator::LessThan,
+                    BinaryOp::Le => BinaryOperator::LessEqualThan,
+                    BinaryOp::Gt => BinaryOperator::GreaterThan,
+                    BinaryOp::Ge => BinaryOperator::GreaterEqualThan,
                     BinaryOp::And | BinaryOp::Or => unreachable!(),
                 };
                 Expression::new_binary_expression(
@@ -1851,43 +2149,32 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     call_args,
                 )
             }
-            ExprKind::LedgerCall { field, op, args } => {
+            ExprKind::LedgerCall {
+                field,
+                key_path,
+                op,
+                args,
+                ..
+            } => {
                 let ledger_field = self.input.program.ledger_field(*field);
+                let path_arg = if key_path.is_empty() {
+                    self.expr_num(span, ledger_field.path[0] as f64)
+                } else {
+                    let mut elems = ArenaVec::with_capacity_in(1 + key_path.len(), self);
+                    elems.push(ArrayExpressionElement::from(
+                        self.expr_num(span, ledger_field.path[0] as f64),
+                    ));
+                    for k in key_path {
+                        elems.push(ArrayExpressionElement::from(
+                            self.lower_expr(params, k, locals),
+                        ));
+                    }
+                    Expression::new_array_expression(span, elems, self)
+                };
                 match op {
-                    LedgerOp::CellRead => {
-                        let mut call_args = ArenaVec::with_capacity_in(2, self);
-                        call_args.push(Argument::from(self.expr_ident(span, "context")));
-                        call_args.push(Argument::from(
-                            self.expr_num(span, ledger_field.path[0] as f64),
-                        ));
-                        self.expr_call(
-                            span,
-                            self.expr_member(
-                                span,
-                                self.expr_ident(span, "__compactRuntime"),
-                                "readCell",
-                            ),
-                            call_args,
-                        )
-                    }
-                    LedgerOp::CellWrite => {
-                        let mut call_args = ArenaVec::with_capacity_in(3, self);
-                        call_args.push(Argument::from(self.expr_ident(span, "context")));
-                        call_args.push(Argument::from(
-                            self.expr_num(span, ledger_field.path[0] as f64),
-                        ));
-                        call_args.push(Argument::from(self.lower_expr(params, &args[0], locals)));
-                        self.expr_call(
-                            span,
-                            self.expr_member(
-                                span,
-                                self.expr_ident(span, "__compactRuntime"),
-                                "writeCell",
-                            ),
-                            call_args,
-                        )
-                    }
-                    LedgerOp::CounterIncrement | LedgerOp::CounterDecrement => {
+                    LedgerOp::CounterIncrement | LedgerOp::CounterDecrement
+                        if key_path.is_empty() && matches!(args.first().map(|a| &a.kind), Some(ExprKind::IntLit(_))) =>
+                    {
                         let amount = match args.first().map(|a| &a.kind) {
                             Some(ExprKind::IntLit(v)) => *v as f64,
                             _ => 0.0,
@@ -1932,45 +2219,48 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             call_args,
                         )
                     }
-                    LedgerOp::CounterRead => {
-                        let mut call_args = ArenaVec::with_capacity_in(2, self);
-                        call_args.push(Argument::from(self.expr_ident(span, "context")));
-                        call_args.push(Argument::from(
-                            self.expr_num(span, ledger_field.path[0] as f64),
-                        ));
-                        self.expr_call(
-                            span,
-                            self.expr_member(
-                                span,
-                                self.expr_ident(span, "__compactRuntime"),
-                                "readCounter",
-                            ),
-                            call_args,
-                        )
-                    }
-                    LedgerOp::SetMember
-                    | LedgerOp::SetInsert
-                    | LedgerOp::SetRemove
-                    | LedgerOp::MerkleTreeInsert
-                    | LedgerOp::MerkleTreeCheckRoot
-                    | LedgerOp::HistoricMerkleTreeInsert
-                    | LedgerOp::HistoricMerkleTreeCheckRoot => {
+                    _ => {
                         let rt_fn = match op {
+                            LedgerOp::CellRead => "readCell",
+                            LedgerOp::CellWrite => "writeCell",
+                            LedgerOp::CounterRead => "readCounter",
+                            LedgerOp::CounterIncrement => "counterIncrement",
+                            LedgerOp::CounterDecrement => "counterDecrement",
                             LedgerOp::SetMember => "setMember",
                             LedgerOp::SetInsert => "setInsert",
                             LedgerOp::SetRemove => "setRemove",
+                            LedgerOp::SetIsEmpty => "setIsEmpty",
+                            LedgerOp::SetSize => "setSize",
+                            LedgerOp::MapMember => "mapMember",
+                            LedgerOp::MapLookup => "mapLookup",
+                            LedgerOp::MapInsert => "mapInsert",
+                            LedgerOp::MapInsertDefault => "mapInsertDefault",
+                            LedgerOp::MapRemove => "mapRemove",
+                            LedgerOp::MapIsEmpty => "mapIsEmpty",
+                            LedgerOp::MapSize => "mapSize",
+                            LedgerOp::ListPushFront => "listPushFront",
+                            LedgerOp::ListPopFront => "listPopFront",
+                            LedgerOp::ListHead => "listHead",
+                            LedgerOp::ListLength => "listLength",
+                            LedgerOp::ListIsEmpty => "listIsEmpty",
                             LedgerOp::MerkleTreeInsert => "merkleTreeInsert",
                             LedgerOp::MerkleTreeCheckRoot => "merkleTreeCheckRoot",
                             LedgerOp::HistoricMerkleTreeInsert => "historicMerkleTreeInsert",
                             LedgerOp::HistoricMerkleTreeCheckRoot => "historicMerkleTreeCheckRoot",
-                            _ => unreachable!(),
+                            LedgerOp::CellResetToDefault
+                            | LedgerOp::CounterResetToDefault
+                            | LedgerOp::SetResetToDefault
+                            | LedgerOp::MapResetToDefault
+                            | LedgerOp::ListResetToDefault
+                            | LedgerOp::MerkleTreeResetToDefault
+                            | LedgerOp::HistoricMerkleTreeResetToDefault => "resetToDefault",
                         };
-                        let mut call_args = ArenaVec::with_capacity_in(3, self);
+                        let mut call_args = ArenaVec::with_capacity_in(2 + args.len(), self);
                         call_args.push(Argument::from(self.expr_ident(span, "context")));
-                        call_args.push(Argument::from(
-                            self.expr_num(span, ledger_field.path[0] as f64),
-                        ));
-                        call_args.push(Argument::from(self.lower_expr(params, &args[0], locals)));
+                        call_args.push(Argument::from(path_arg));
+                        for a in args {
+                            call_args.push(Argument::from(self.lower_expr(params, a, locals)));
+                        }
                         self.expr_call(
                             span,
                             self.expr_member(span, self.expr_ident(span, "__compactRuntime"), rt_fn),
@@ -2291,6 +2581,14 @@ mod tests {
     fn codegen_zerocash_contract() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/zerocash.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_adt_showcase_contract() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/adt_showcase.compact"),
             compile_ts_bundle
         );
     }
