@@ -1,4 +1,5 @@
 mod pragma;
+mod stdlib;
 mod witness;
 
 use std::collections::{HashMap, HashSet};
@@ -7,8 +8,9 @@ use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
 use compact_hir::{
     BinaryOp, Circuit, CircuitId, Constructor, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt,
-    LedgerField, LedgerFieldId, LedgerOp, LocalId, NewTypeDecl, NewTypeId, Param, ParamId, Program,
-    Stmt, StructDecl, StructField, StructId, Type, UnaryOp, WitnessDecl, WitnessId,
+    LedgerField, LedgerFieldId, LedgerOp, LocalId, NativeWitnessKind, NewTypeDecl, NewTypeId,
+    Param, ParamId, Program, Stmt, StructDecl, StructField, StructId, Type, UnaryOp, WitnessDecl,
+    WitnessId,
 };
 use compact_span::{SourceFile, Span};
 
@@ -80,6 +82,9 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         resolving_aliases: HashSet::new(),
         next_mod_instance: 0,
         next_local: 0,
+        next_ledger_slot: 0,
+        stdlib_exports: None,
+        kernel_field_id: None,
     };
     analyzer.run();
 
@@ -323,6 +328,9 @@ struct Analyzer<'a> {
     resolving_aliases: HashSet<usize>,
     next_mod_instance: usize,
     next_local: u32,
+    next_ledger_slot: u32,
+    stdlib_exports: Option<ScopeEnv>,
+    kernel_field_id: Option<LedgerFieldId>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -330,6 +338,151 @@ impl<'a> Analyzer<'a> {
         let id = LocalId(self.next_local);
         self.next_local += 1;
         id
+    }
+
+    /// Lazily parse the embedded Compact standard library and register its structs, type aliases,
+    /// and circuits as on-demand templates so only referenced items are materialized.
+    fn ensure_stdlib_loaded(&mut self) -> ScopeEnv {
+        if let Some(ref cached) = self.stdlib_exports {
+            return cached.clone();
+        }
+        let std_file = SourceFile::new(
+            compact_span::FileId(u32::MAX - 1),
+            "<CompactStandardLibrary>",
+            None,
+            stdlib::STDLIB_SOURCE,
+        );
+        let parsed = compact_parser::parse(&std_file);
+        debug_assert!(
+            !parsed.diagnostics.has_errors(),
+            "embedded CompactStandardLibrary failed to parse: {:?}",
+            parsed.diagnostics
+        );
+        let std_unit = self.units.push_owned(std_file, parsed.ast);
+        let prev = self.units.switch(std_unit);
+        let top_decls: Vec<_> = self.units.ast().root_decls().collect();
+
+        let mut std_internal_scope = ScopeEnv {
+            has_stdlib: true,
+            ..ScopeEnv::default()
+        };
+        let mut std_exported_scope = ScopeEnv {
+            has_stdlib: true,
+            ..ScopeEnv::default()
+        };
+        let mut created_structs = Vec::new();
+        let mut created_aliases = Vec::new();
+        let mut created_circuits = Vec::new();
+
+        for decl in top_decls {
+            match self.units.ast().node_tag(decl) {
+                NodeTag::StructDecl => {
+                    let s = self.units.ast().struct_decl(decl);
+                    let name = self.text(s.name_token).to_owned();
+                    let gparams = self.read_generic_params(s.gparams_start, s.gparams_end);
+                    let gid = self.generic_structs.len();
+                    self.generic_structs.push(GenericStructTemplate {
+                        unit: std_unit,
+                        name: name.clone(),
+                        gparams,
+                        fields_start: s.fields_start,
+                        fields_end: s.fields_end,
+                        exported: false,
+                        span: self.units.ast().node_span(decl),
+                        scope: ScopeEnv::default(),
+                    });
+                    std_internal_scope.generic_structs.insert(name.clone(), gid);
+                    if s.exported {
+                        std_exported_scope.generic_structs.insert(name, gid);
+                    }
+                    created_structs.push(gid);
+                }
+                NodeTag::TypeDecl => {
+                    let td = self.units.ast().type_decl(decl);
+                    let name = self.text(td.name_token).to_owned();
+                    let gparams = self.read_generic_params(td.gparams_start, td.gparams_end);
+                    let aid = self.type_aliases.len();
+                    self.type_aliases.push(TypeAliasTemplate {
+                        unit: std_unit,
+                        gparams,
+                        target_node: td.target_type,
+                        scope: ScopeEnv::default(),
+                    });
+                    std_internal_scope.type_aliases.insert(name.clone(), aid);
+                    if td.exported {
+                        std_exported_scope.type_aliases.insert(name, aid);
+                    }
+                    created_aliases.push(aid);
+                }
+                NodeTag::CircuitDecl => {
+                    let c = self.units.ast().circuit_decl(decl);
+                    let name = self.text(c.name_token).to_owned();
+                    let gparams = self.read_generic_params(c.gparams_start, c.gparams_end);
+                    let gid = self.generic_circuits.len();
+                    self.generic_circuits.push(GenericCircuitTemplate {
+                        unit: std_unit,
+                        name: name.clone(),
+                        gparams,
+                        params_start: c.params_start,
+                        params_end: c.params_end,
+                        ret_type: c.ret_type,
+                        body_node: c.body,
+                        declared_pure: c.pure,
+                        span: self.units.ast().node_span(decl),
+                        scope: ScopeEnv::default(),
+                    });
+                    std_internal_scope
+                        .generic_circuits
+                        .insert(name.clone(), gid);
+                    if c.exported {
+                        std_exported_scope.generic_circuits.insert(name, gid);
+                    }
+                    created_circuits.push(gid);
+                }
+                _ => {}
+            }
+        }
+
+        for &gid in &created_structs {
+            self.generic_structs[gid].scope = std_internal_scope.clone();
+        }
+        for &aid in &created_aliases {
+            self.type_aliases[aid].scope = std_internal_scope.clone();
+        }
+        for &gid in &created_circuits {
+            self.generic_circuits[gid].scope = std_internal_scope.clone();
+        }
+
+        self.units.switch(prev);
+        self.stdlib_exports = Some(std_exported_scope.clone());
+        std_exported_scope
+    }
+
+    /// Lazily materialize the implicit `kernel: Kernel` ledger field (with empty state path).
+    fn ensure_kernel_field(&mut self) -> LedgerFieldId {
+        if let Some(id) = self.kernel_field_id {
+            return id;
+        }
+        let id = LedgerFieldId(self.ledger_fields.len() as u32);
+        self.ledger_fields.push(LedgerField {
+            id,
+            name: "kernel".to_owned(),
+            adt: LedgerAdt::Kernel,
+            path: Vec::new(),
+            exported: false,
+            sealed: false,
+            span: Span::EMPTY,
+        });
+        self.kernel_field_id = Some(id);
+        id
+    }
+
+    /// Resolve a stdlib struct by name (instantiating its lazy 0-param template if needed).
+    fn resolve_stdlib_struct(&mut self, name: &str, span: Span) -> Option<Type> {
+        let std_scope = self.ensure_stdlib_loaded();
+        let &gid = std_scope.generic_structs.get(name)?;
+        let sid = self.instantiate_generic_struct(gid, &[], span)?;
+        Some(Type::Struct(sid))
     }
 
     fn text(&self, tok: TokenIndex) -> &str {
@@ -767,6 +920,12 @@ impl<'a> Analyzer<'a> {
             } else if let Some(&gid) = self.scope.generic_structs.get(&name) {
                 if is_module_instance {
                     exports.generic_structs.insert(name, gid);
+                } else if self.generic_structs[gid].gparams.is_empty()
+                    && let Some(sid) =
+                        self.instantiate_generic_struct(gid, &[], self.units.ast().token_span(tok))
+                {
+                    self.structs[sid.0 as usize].exported = true;
+                    self.structs[sid.0 as usize].name = name;
                 }
             } else if let Some(&nid) = self.scope.new_types.get(&name) {
                 if is_module_instance {
@@ -876,6 +1035,43 @@ impl<'a> Analyzer<'a> {
 
         if name_tag == TokenTag::Ident && raw_name == "CompactStandardLibrary" {
             self.scope.has_stdlib = true;
+            let std_scope = self.ensure_stdlib_loaded();
+            let apply_prefix = |name: &str| -> String {
+                match &prefix {
+                    Some(p) => format!("{p}{name}"),
+                    None => name.to_owned(),
+                }
+            };
+            if selections.is_empty() {
+                for (k, v) in std_scope.generic_structs {
+                    self.scope
+                        .generic_structs
+                        .entry(apply_prefix(&k))
+                        .or_insert(v);
+                }
+                for (k, v) in std_scope.type_aliases {
+                    self.scope.type_aliases.entry(apply_prefix(&k)).or_insert(v);
+                }
+                for (k, v) in std_scope.generic_circuits {
+                    self.scope
+                        .generic_circuits
+                        .entry(apply_prefix(&k))
+                        .or_insert(v);
+                }
+            } else {
+                for (orig, alias, _) in selections {
+                    let target = apply_prefix(&alias);
+                    if let Some(&v) = std_scope.generic_structs.get(&orig) {
+                        self.scope.generic_structs.insert(target.clone(), v);
+                    }
+                    if let Some(&v) = std_scope.type_aliases.get(&orig) {
+                        self.scope.type_aliases.insert(target.clone(), v);
+                    }
+                    if let Some(&v) = std_scope.generic_circuits.get(&orig) {
+                        self.scope.generic_circuits.insert(target, v);
+                    }
+                }
+            }
             return;
         }
 
@@ -1165,7 +1361,11 @@ impl<'a> Analyzer<'a> {
         }
 
         let sid = StructId(self.structs.len() as u32);
-        let mangled = format!("{}_{}", tmpl.name, self.format_generic_suffix(&vals));
+        let mangled = if vals.is_empty() {
+            tmpl.name.clone()
+        } else {
+            format!("{}_{}", tmpl.name, self.format_generic_suffix(&vals))
+        };
         self.structs.push(StructDecl {
             id: sid,
             name: mangled,
@@ -1274,7 +1474,11 @@ impl<'a> Analyzer<'a> {
 
         let ret_type = ret_type?;
         let cid = CircuitId(self.circuit_sigs.len() as u32);
-        let mangled = format!("{}_{}", tmpl.name, self.format_generic_suffix(&vals));
+        let mangled = if vals.is_empty() {
+            tmpl.name.clone()
+        } else {
+            format!("{}_{}", tmpl.name, self.format_generic_suffix(&vals))
+        };
         self.circuit_sigs.push(CircuitSig {
             id: cid,
             unit: tmpl.unit,
@@ -1431,6 +1635,9 @@ impl<'a> Analyzer<'a> {
                 let name = self.text(self.units.ast().node_main_token(node)).to_owned();
                 if name == "Counter" {
                     return Some(LedgerAdt::Counter);
+                }
+                if name == "Kernel" {
+                    return Some(LedgerAdt::Kernel);
                 }
                 if let Some(&aid) = self.scope.type_aliases.get(&name) {
                     return self.expand_type_alias_as_adt(
@@ -1598,7 +1805,13 @@ impl<'a> Analyzer<'a> {
 
         let adt = self.resolve_ledger_adt(decl.type_node)?;
         let id = LedgerFieldId(self.ledger_fields.len() as u32);
-        let path = vec![id.0];
+        let path = if matches!(adt, LedgerAdt::Kernel) {
+            Vec::new()
+        } else {
+            let slot = self.next_ledger_slot;
+            self.next_ledger_slot += 1;
+            vec![slot]
+        };
         self.ledger_fields.push(LedgerField {
             id,
             name: mangle_name(mangle_prefix, &local_name),
@@ -1735,6 +1948,15 @@ impl<'a> Analyzer<'a> {
                         if let Some(&eid) = self.scope.enums.get(&name) {
                             Some(Type::Enum(eid))
                         } else if let Some(&sid) = self.scope.structs.get(&name) {
+                            Some(Type::Struct(sid))
+                        } else if let Some(&gid) = self.scope.generic_structs.get(&name)
+                            && self.generic_structs[gid].gparams.is_empty()
+                        {
+                            let sid = self.instantiate_generic_struct(
+                                gid,
+                                &[],
+                                self.units.ast().token_span(tok),
+                            )?;
                             Some(Type::Struct(sid))
                         } else if let Some(&nid) = self.scope.new_types.get(&name) {
                             Some(Type::NewType(nid))
@@ -2622,6 +2844,13 @@ impl<'a> Analyzer<'a> {
 
     fn coerce_or_check(&self, expr: &mut Expr, expected: &Type) -> bool {
         if expr.ty == *expected {
+            return true;
+        }
+        // Implicit unsigned integer widening (`Uint<M>` -> `Uint<N>` when `M <= N`).
+        if let (Type::Uint(src_bits), Type::Uint(dst_bits)) = (&expr.ty, expected)
+            && src_bits <= dst_bits
+            && !matches!(&expr.kind, ExprKind::IntLit(_))
+        {
             return true;
         }
         if let ExprKind::IntLit(v) = &expr.kind {
@@ -3758,9 +3987,123 @@ impl<'a> Analyzer<'a> {
                                 span,
                             });
                         }
+                        "ownPublicKey" if self.scope.has_stdlib => {
+                            if !arg_nodes.is_empty() {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`ownPublicKey` expects 0 arguments, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let ret_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", span)?;
+                            return Some(Expr {
+                                kind: ExprKind::NativeWitness {
+                                    kind: NativeWitnessKind::OwnPublicKey,
+                                    args: Vec::new(),
+                                },
+                                ty: ret_ty,
+                                span,
+                            });
+                        }
+                        "createZswapInput" if self.scope.has_stdlib => {
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`createZswapInput` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let expected =
+                                self.resolve_stdlib_struct("QualifiedShieldedCoinInfo", span)?;
+                            let mut arg = self.check_expr(arg_nodes[0], scope, Some(&expected))?;
+                            if !self.coerce_or_check(&mut arg, &expected) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    arg.span,
+                                    format!(
+                                        "`createZswapInput` expects `QualifiedShieldedCoinInfo`, found `{}`",
+                                        self.format_type(&arg.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::NativeWitness {
+                                    kind: NativeWitnessKind::CreateZswapInput,
+                                    args: vec![arg],
+                                },
+                                ty: Type::unit(),
+                                span,
+                            });
+                        }
+                        "createZswapOutput" if self.scope.has_stdlib => {
+                            if arg_nodes.len() != 2 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`createZswapOutput` expects 2 arguments, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let coin_ty = self.resolve_stdlib_struct("ShieldedCoinInfo", span)?;
+                            let pk_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", span)?;
+                            let addr_ty = self.resolve_stdlib_struct("ContractAddress", span)?;
+                            let recip_ty = Type::Either(Box::new(pk_ty), Box::new(addr_ty));
+                            let mut coin = self.check_expr(arg_nodes[0], scope, Some(&coin_ty))?;
+                            if !self.coerce_or_check(&mut coin, &coin_ty) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    coin.span,
+                                    format!(
+                                        "`createZswapOutput` expects `ShieldedCoinInfo`, found `{}`",
+                                        self.format_type(&coin.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let mut recip =
+                                self.check_expr(arg_nodes[1], scope, Some(&recip_ty))?;
+                            if !self.coerce_or_check(&mut recip, &recip_ty) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    recip.span,
+                                    format!(
+                                        "`createZswapOutput` expects `{}`, found `{}`",
+                                        self.format_type(&recip_ty),
+                                        self.format_type(&recip.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::NativeWitness {
+                                    kind: NativeWitnessKind::CreateZswapOutput,
+                                    args: vec![coin, recip],
+                                },
+                                ty: Type::unit(),
+                                span,
+                            });
+                        }
                         _ => {}
                     }
                     if let Some(&cid) = self.scope.circuits.get(&callee_name) {
+                        return self.check_circuit_call(cid, &arg_nodes, span, scope);
+                    }
+                    if let Some(&gid) = self.scope.generic_circuits.get(&callee_name)
+                        && self.generic_circuits[gid].gparams.is_empty()
+                    {
+                        let cid = self.instantiate_generic_circuit(gid, &[], span)?;
                         return self.check_circuit_call(cid, &arg_nodes, span, scope);
                     }
                     if let Some(&wid) = self.scope.witnesses.get(&callee_name) {
@@ -4938,13 +5281,19 @@ impl<'a> Analyzer<'a> {
     ) -> Option<(LedgerFieldId, Vec<Expr>, LedgerAdt)> {
         match self.units.ast().node_tag(node) {
             NodeTag::IdentExpr => {
-                let name = self.text(self.units.ast().node_main_token(node));
-                let &field_id = self.scope.ledger_fields.get(name)?;
-                Some((
-                    field_id,
-                    Vec::new(),
-                    self.ledger_fields[field_id.0 as usize].adt.clone(),
-                ))
+                let name = self.text(self.units.ast().node_main_token(node)).to_owned();
+                if let Some(&field_id) = self.scope.ledger_fields.get(&name) {
+                    return Some((
+                        field_id,
+                        Vec::new(),
+                        self.ledger_fields[field_id.0 as usize].adt.clone(),
+                    ));
+                }
+                if name == "kernel" && self.scope.has_stdlib {
+                    let field_id = self.ensure_kernel_field();
+                    return Some((field_id, Vec::new(), LedgerAdt::Kernel));
+                }
+                None
             }
             NodeTag::CallExpr => {
                 let call = self.units.ast().call_expr(node);
@@ -5030,6 +5379,7 @@ impl<'a> Analyzer<'a> {
                     "increment" => (LedgerOp::CounterIncrement, 1usize, Type::unit()),
                     "decrement" => (LedgerOp::CounterDecrement, 1usize, Type::unit()),
                     "read" => (LedgerOp::CounterRead, 0usize, Type::Uint(64)),
+                    "lessThan" => (LedgerOp::CounterLessThan, 1usize, Type::Boolean),
                     "resetToDefault" => (LedgerOp::CounterResetToDefault, 0usize, Type::unit()),
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -5051,9 +5401,14 @@ impl<'a> Analyzer<'a> {
                     ));
                     return None;
                 }
+                let expected_arg_ty = if op == LedgerOp::CounterLessThan {
+                    Type::Uint(64)
+                } else {
+                    Type::Uint(16)
+                };
                 let mut args = Vec::with_capacity(arg_nodes.len());
                 for &anode in arg_nodes {
-                    let mut arg = self.check_expr(anode, scope, Some(&Type::Uint(16)))?;
+                    let mut arg = self.check_expr(anode, scope, Some(&expected_arg_ty))?;
                     if matches!(op, LedgerOp::CounterIncrement | LedgerOp::CounterDecrement)
                         && let Some(v) = eval_const_u128(&arg)
                     {
@@ -5068,6 +5423,137 @@ impl<'a> Analyzer<'a> {
                             return None;
                         }
                         arg.ty = Type::Uint(16);
+                    }
+                    args.push(arg);
+                }
+                make_call(op, args, ret_ty, target_adt)
+            }
+            LedgerAdt::Kernel => {
+                let token_type =
+                    || Type::Either(Box::new(Type::Bytes(32)), Box::new(Type::Bytes(32)));
+                let (op, expected_tys, ret_ty): (LedgerOp, Vec<Type>, Type) = match method_name {
+                    "self" => (
+                        LedgerOp::KernelSelf,
+                        vec![],
+                        self.resolve_stdlib_struct("ContractAddress", call_span)?,
+                    ),
+                    "caller" => {
+                        let ca = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                        let ua = self.resolve_stdlib_struct("UserAddress", call_span)?;
+                        let pub_addr = Type::Either(Box::new(ca), Box::new(ua));
+                        (
+                            LedgerOp::KernelCaller,
+                            vec![],
+                            Type::Maybe(Box::new(pub_addr)),
+                        )
+                    }
+                    "checkpoint" => (LedgerOp::KernelCheckpoint, vec![], Type::unit()),
+                    "claimZswapNullifier" => (
+                        LedgerOp::KernelClaimZswapNullifier,
+                        vec![Type::Bytes(32)],
+                        Type::unit(),
+                    ),
+                    "claimZswapCoinSpend" => (
+                        LedgerOp::KernelClaimZswapCoinSpend,
+                        vec![Type::Bytes(32)],
+                        Type::unit(),
+                    ),
+                    "claimZswapCoinReceive" => (
+                        LedgerOp::KernelClaimZswapCoinReceive,
+                        vec![Type::Bytes(32)],
+                        Type::unit(),
+                    ),
+                    "claimContractCall" => (
+                        LedgerOp::KernelClaimContractCall,
+                        vec![Type::Bytes(32), Type::Bytes(32), Type::Field],
+                        Type::unit(),
+                    ),
+                    "mintShielded" => (
+                        LedgerOp::KernelMintShielded,
+                        vec![Type::Bytes(32), Type::Uint(64)],
+                        Type::unit(),
+                    ),
+                    "mintUnshielded" => (
+                        LedgerOp::KernelMintUnshielded,
+                        vec![Type::Bytes(32), Type::Uint(64)],
+                        Type::unit(),
+                    ),
+                    "claimUnshieldedCoinSpend" => {
+                        let ca = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                        let ua = self.resolve_stdlib_struct("UserAddress", call_span)?;
+                        let pub_addr = Type::Either(Box::new(ca), Box::new(ua));
+                        (
+                            LedgerOp::KernelClaimUnshieldedCoinSpend,
+                            vec![token_type(), pub_addr, Type::Uint(128)],
+                            Type::unit(),
+                        )
+                    }
+                    "incUnshieldedOutputs" => (
+                        LedgerOp::KernelIncUnshieldedOutputs,
+                        vec![token_type(), Type::Uint(128)],
+                        Type::unit(),
+                    ),
+                    "incUnshieldedInputs" => (
+                        LedgerOp::KernelIncUnshieldedInputs,
+                        vec![token_type(), Type::Uint(128)],
+                        Type::unit(),
+                    ),
+                    "balance" => (LedgerOp::KernelBalance, vec![token_type()], Type::Uint(128)),
+                    "balanceLessThan" => (
+                        LedgerOp::KernelBalanceLessThan,
+                        vec![token_type(), Type::Uint(128)],
+                        Type::Boolean,
+                    ),
+                    "balanceGreaterThan" => (
+                        LedgerOp::KernelBalanceGreaterThan,
+                        vec![token_type(), Type::Uint(128)],
+                        Type::Boolean,
+                    ),
+                    "blockTimeLessThan" => (
+                        LedgerOp::KernelBlockTimeLessThan,
+                        vec![Type::Uint(64)],
+                        Type::Boolean,
+                    ),
+                    "blockTimeGreaterThan" => (
+                        LedgerOp::KernelBlockTimeGreaterThan,
+                        vec![Type::Uint(64)],
+                        Type::Boolean,
+                    ),
+                    other => {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            method_span,
+                            format!("`Kernel` has no method `{other}`"),
+                        ));
+                        return None;
+                    }
+                };
+                if arg_nodes.len() != expected_tys.len() {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "`Kernel.{method_name}` expects {} argument(s), found {}",
+                            expected_tys.len(),
+                            arg_nodes.len()
+                        ),
+                    ));
+                    return None;
+                }
+                let mut args = Vec::with_capacity(arg_nodes.len());
+                for (&anode, expected_ty) in arg_nodes.iter().zip(&expected_tys) {
+                    let mut arg = self.check_expr(anode, scope, Some(expected_ty))?;
+                    if !self.coerce_or_check(&mut arg, expected_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            arg.span,
+                            format!(
+                                "`Kernel.{method_name}` argument mismatch: expected `{}`, found `{}`",
+                                self.format_type(expected_ty),
+                                self.format_type(&arg.ty)
+                            ),
+                        ));
+                        return None;
                     }
                     args.push(arg);
                 }
@@ -5640,7 +6126,7 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
             }
             (true, w)
         }
-        ExprKind::WitnessCall { args, .. } => {
+        ExprKind::WitnessCall { args, .. } | ExprKind::NativeWitness { args, .. } => {
             let mut l = false;
             for a in args {
                 l |= expr_effects(a, calls).0;
@@ -6120,6 +6606,33 @@ mod tests {
         assert!(
             !checked.diagnostics.has_errors(),
             "expected commitments to clear witness taint without disclose, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_undisclosed_witness_passed_to_mint_shielded() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            export circuit bad_mint(sep: Bytes<32>, amt: Uint<64>, nonce: Bytes<32>): ShieldedCoinInfo {
+              const recip = right<ZswapCoinPublicKey, ContractAddress>(kernel.self());
+              return mintShieldedToken(sep, amt, disclose(nonce), recip);
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked
+                .diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("disclose")),
+            "expected witness disclosure error through stdlib mintShieldedToken, got: {:?}",
             checked.diagnostics
         );
     }

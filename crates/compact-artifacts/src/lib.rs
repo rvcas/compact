@@ -54,6 +54,42 @@ struct ArgInfo {
     ty: Value,
 }
 
+fn maxval_decimal(bits: u32) -> String {
+    if bits < 128 {
+        return ((1u128 << bits) - 1).to_string();
+    }
+    if bits == 128 {
+        return u128::MAX.to_string();
+    }
+    let mut digits = vec![1u8];
+    for _ in 0..bits {
+        let mut carry = 0u8;
+        for d in &mut digits {
+            let v = *d * 2 + carry;
+            *d = v % 10;
+            carry = v / 10;
+        }
+        if carry > 0 {
+            digits.push(carry);
+        }
+    }
+    for d in &mut digits {
+        if *d > 0 {
+            *d -= 1;
+            break;
+        }
+        *d = 9;
+    }
+    while digits.len() > 1 && digits.last() == Some(&0) {
+        digits.pop();
+    }
+    digits
+        .into_iter()
+        .rev()
+        .map(|d| (b'0' + d) as char)
+        .collect()
+}
+
 fn type_to_json(program: &Program, ty: &Type) -> Value {
     let mut map = Map::new();
     match ty {
@@ -65,10 +101,7 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
         }
         Type::Uint(bits) => {
             map.insert("type-name".into(), Value::String("Uint".into()));
-            map.insert(
-                "maxval".into(),
-                Value::String(((1u128 << bits) - 1).to_string()),
-            );
+            map.insert("maxval".into(), Value::String(maxval_decimal(*bits)));
         }
         Type::Bytes(len) => {
             map.insert("type-name".into(), Value::String("Bytes".into()));
@@ -187,6 +220,9 @@ fn insert_adt_fields(
             map.insert("depth".into(), Value::Number((*depth as u64).into()));
             map.insert("type".into(), type_to_json(program, value));
         }
+        LedgerAdt::Kernel => {
+            map.insert(tag_key.into(), Value::String("Kernel".into()));
+        }
     }
 }
 
@@ -263,6 +299,7 @@ pub fn render_contract_info(program: &Program) -> String {
     let ledger = program
         .ledger_fields
         .iter()
+        .filter(|f| !matches!(f.adt, LedgerAdt::Kernel))
         .map(|f| ledger_field_to_json(program, f))
         .collect();
 

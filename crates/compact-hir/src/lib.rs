@@ -49,6 +49,8 @@ pub enum LedgerAdt {
         depth: u32,
         value: Box<Type>,
     },
+    /// Special top-level Kernel ADT providing transaction/block/token/effects primitives.
+    Kernel,
 }
 
 impl LedgerAdt {
@@ -61,6 +63,7 @@ impl LedgerAdt {
             Self::Map { .. } => "Map",
             Self::MerkleTree { .. } => "MerkleTree",
             Self::HistoricMerkleTree { .. } => "HistoricMerkleTree",
+            Self::Kernel => "Kernel",
         }
     }
 
@@ -85,6 +88,7 @@ pub enum LedgerOp {
     CounterIncrement,
     CounterDecrement,
     CounterRead,
+    CounterLessThan,
     CounterResetToDefault,
     SetMember,
     SetInsert,
@@ -112,6 +116,23 @@ pub enum LedgerOp {
     HistoricMerkleTreeInsert,
     HistoricMerkleTreeCheckRoot,
     HistoricMerkleTreeResetToDefault,
+    KernelSelf,
+    KernelCaller,
+    KernelCheckpoint,
+    KernelClaimZswapNullifier,
+    KernelClaimZswapCoinSpend,
+    KernelClaimZswapCoinReceive,
+    KernelClaimContractCall,
+    KernelMintShielded,
+    KernelMintUnshielded,
+    KernelClaimUnshieldedCoinSpend,
+    KernelIncUnshieldedOutputs,
+    KernelIncUnshieldedInputs,
+    KernelBalance,
+    KernelBalanceLessThan,
+    KernelBalanceGreaterThan,
+    KernelBlockTimeLessThan,
+    KernelBlockTimeGreaterThan,
 }
 
 impl LedgerOp {
@@ -121,6 +142,7 @@ impl LedgerOp {
             Self::CellWrite => "write",
             Self::CounterIncrement => "increment",
             Self::CounterDecrement => "decrement",
+            Self::CounterLessThan => "lessThan",
             Self::SetMember | Self::MapMember => "member",
             Self::MapLookup => "lookup",
             Self::SetInsert
@@ -143,6 +165,23 @@ impl LedgerOp {
             | Self::ListResetToDefault
             | Self::MerkleTreeResetToDefault
             | Self::HistoricMerkleTreeResetToDefault => "resetToDefault",
+            Self::KernelSelf => "self",
+            Self::KernelCaller => "caller",
+            Self::KernelCheckpoint => "checkpoint",
+            Self::KernelClaimZswapNullifier => "claimZswapNullifier",
+            Self::KernelClaimZswapCoinSpend => "claimZswapCoinSpend",
+            Self::KernelClaimZswapCoinReceive => "claimZswapCoinReceive",
+            Self::KernelClaimContractCall => "claimContractCall",
+            Self::KernelMintShielded => "mintShielded",
+            Self::KernelMintUnshielded => "mintUnshielded",
+            Self::KernelClaimUnshieldedCoinSpend => "claimUnshieldedCoinSpend",
+            Self::KernelIncUnshieldedOutputs => "incUnshieldedOutputs",
+            Self::KernelIncUnshieldedInputs => "incUnshieldedInputs",
+            Self::KernelBalance => "balance",
+            Self::KernelBalanceLessThan => "balanceLessThan",
+            Self::KernelBalanceGreaterThan => "balanceGreaterThan",
+            Self::KernelBlockTimeLessThan => "blockTimeLessThan",
+            Self::KernelBlockTimeGreaterThan => "blockTimeGreaterThan",
         }
     }
 
@@ -168,6 +207,16 @@ impl LedgerOp {
                 | Self::MerkleTreeResetToDefault
                 | Self::HistoricMerkleTreeInsert
                 | Self::HistoricMerkleTreeResetToDefault
+                | Self::KernelCheckpoint
+                | Self::KernelClaimZswapNullifier
+                | Self::KernelClaimZswapCoinSpend
+                | Self::KernelClaimZswapCoinReceive
+                | Self::KernelClaimContractCall
+                | Self::KernelMintShielded
+                | Self::KernelMintUnshielded
+                | Self::KernelClaimUnshieldedCoinSpend
+                | Self::KernelIncUnshieldedOutputs
+                | Self::KernelIncUnshieldedInputs
         )
     }
 }
@@ -300,6 +349,23 @@ pub enum BinaryOp {
     Or,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeWitnessKind {
+    OwnPublicKey,
+    CreateZswapInput,
+    CreateZswapOutput,
+}
+
+impl NativeWitnessKind {
+    pub fn runtime_name(self) -> &'static str {
+        match self {
+            Self::OwnPublicKey => "ownPublicKey",
+            Self::CreateZswapInput => "createZswapInput",
+            Self::CreateZswapOutput => "createZswapOutput",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     IntLit(u128),
@@ -343,6 +409,10 @@ pub enum ExprKind {
     Disclose(Box<Expr>),
     WitnessCall {
         witness: WitnessId,
+        args: Vec<Expr>,
+    },
+    NativeWitness {
+        kind: NativeWitnessKind,
         args: Vec<Expr>,
     },
     CircuitCall {
@@ -604,6 +674,7 @@ impl Program {
             LedgerAdt::HistoricMerkleTree { depth, value } => {
                 format!("HistoricMerkleTree<{depth}, {}>", self.format_type(value))
             }
+            LedgerAdt::Kernel => "Kernel".into(),
         }
     }
 

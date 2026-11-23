@@ -296,6 +296,19 @@ impl<'a> WitnessChecker<'a> {
                 let w = self.program.witness(*witness);
                 Taint::single(format!("return value of witness `{}`", w.name), expr.span)
             }
+            ExprKind::NativeWitness { kind, args } => {
+                for a in args {
+                    let _ = self.check_expr(a, param_taints, locals, guard_taint);
+                }
+                match kind {
+                    compact_hir::NativeWitnessKind::OwnPublicKey => Taint::single(
+                        "return value of native witness `ownPublicKey`".to_owned(),
+                        expr.span,
+                    ),
+                    compact_hir::NativeWitnessKind::CreateZswapInput
+                    | compact_hir::NativeWitnessKind::CreateZswapOutput => Taint::clean(),
+                }
+            }
             ExprKind::CircuitCall { circuit, args } => {
                 let arg_taints: Vec<_> = args
                     .iter()
@@ -329,8 +342,13 @@ impl<'a> WitnessChecker<'a> {
                         );
                     }
                 }
-                for arg in args {
+                for (arg_idx, arg) in args.iter().enumerate() {
                     let arg_taint = self.check_expr(arg, param_taints, locals, guard_taint);
+                    // `kernel.claimContractCall(addr, entry_point, comm)`: `comm` is a commitment (`discloses nothing`).
+                    if matches!(op, compact_hir::LedgerOp::KernelClaimContractCall) && arg_idx == 2
+                    {
+                        continue;
+                    }
                     if arg_taint.is_tainted() {
                         self.report_disclosure(
                             arg.span,
@@ -445,7 +463,8 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         ExprKind::Tuple(elems)
         | ExprKind::Vector(elems)
         | ExprKind::BytesPack(elems)
-        | ExprKind::WitnessCall { args: elems, .. } => {
+        | ExprKind::WitnessCall { args: elems, .. }
+        | ExprKind::NativeWitness { args: elems, .. } => {
             for e in elems {
                 collect_calls_expr(e, out);
             }

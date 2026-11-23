@@ -342,7 +342,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     visit_expr(else_branch, out);
                 }
                 ExprKind::Assert { cond, .. } => visit_expr(cond, out),
-                ExprKind::WitnessCall { args, .. } => {
+                ExprKind::WitnessCall { args, .. } | ExprKind::NativeWitness { args, .. } => {
                     for a in args {
                         visit_expr(a, out);
                     }
@@ -413,7 +413,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         fn adt_uses_maybe(adt: &LedgerAdt, exported_root: bool) -> bool {
             match adt {
                 LedgerAdt::Cell(ty) | LedgerAdt::Set(ty) => ty_uses_maybe(ty),
-                LedgerAdt::Counter => false,
+                LedgerAdt::Counter | LedgerAdt::Kernel => false,
                 LedgerAdt::List(ty) => exported_root || ty_uses_maybe(ty),
                 LedgerAdt::Map { key, value } => {
                     ty_uses_maybe(key) || adt_uses_maybe(value, exported_root)
@@ -494,7 +494,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 LedgerAdt::Cell(ty) | LedgerAdt::Set(ty) | LedgerAdt::List(ty) => {
                     ty_uses_either(ty)
                 }
-                LedgerAdt::Counter => false,
+                LedgerAdt::Counter | LedgerAdt::Kernel => false,
                 LedgerAdt::Map { key, value } => ty_uses_either(key) || adt_uses_either(value),
                 LedgerAdt::MerkleTree { value, .. }
                 | LedgerAdt::HistoricMerkleTree { value, .. } => ty_uses_either(value),
@@ -1157,13 +1157,14 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 ));
                 TSType::new_ts_type_literal(SPAN, members, self)
             }
+            LedgerAdt::Kernel => TSType::new_ts_unknown_keyword(SPAN, self),
         }
     }
 
     fn build_ledger_type(&self) -> Statement<'a> {
         let mut members = ArenaVec::new_in(self);
         for field in &self.input.program.ledger_fields {
-            if !field.exported {
+            if !field.exported || matches!(field.adt, LedgerAdt::Kernel) {
                 continue;
             }
             members.push(TSSignature::new_ts_property_signature(
@@ -1280,6 +1281,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 LedgerAdt::Map { .. } => "decodeMap",
                 LedgerAdt::MerkleTree { .. } => "decodeMerkleTree",
                 LedgerAdt::HistoricMerkleTree { .. } => "decodeHistoricMerkleTree",
+                LedgerAdt::Kernel => continue,
             };
             let mut args = ArenaVec::with_capacity_in(2, self);
             args.push(Argument::from(self.expr_ident(SPAN, "state")));
@@ -2350,6 +2352,22 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     call_args,
                 )
             }
+            ExprKind::NativeWitness { kind, args } => {
+                let mut call_args = ArenaVec::with_capacity_in(1 + args.len(), self);
+                call_args.push(Argument::from(self.expr_ident(span, "context")));
+                for a in args {
+                    call_args.push(Argument::from(self.lower_expr(params, a, locals)));
+                }
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        kind.runtime_name(),
+                    ),
+                    call_args,
+                )
+            }
             ExprKind::PersistentHash { arg, .. } => {
                 let mut call_args = ArenaVec::with_capacity_in(1, self);
                 call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
@@ -2577,6 +2595,26 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 ..
             } => {
                 let ledger_field = self.input.program.ledger_field(*field);
+                if matches!(ledger_field.adt, LedgerAdt::Kernel) {
+                    let mut call_args = ArenaVec::with_capacity_in(1 + args.len(), self);
+                    call_args.push(Argument::from(self.expr_ident(span, "context")));
+                    for a in args {
+                        call_args.push(Argument::from(self.lower_expr(params, a, locals)));
+                    }
+                    return self.expr_call(
+                        span,
+                        self.expr_member(
+                            span,
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                "kernel",
+                            ),
+                            op.name(),
+                        ),
+                        call_args,
+                    );
+                }
                 let path_arg = if key_path.is_empty() {
                     self.expr_num(span, ledger_field.path[0] as f64)
                 } else {
@@ -2648,6 +2686,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             LedgerOp::CellRead => "readCell",
                             LedgerOp::CellWrite => "writeCell",
                             LedgerOp::CounterRead => "readCounter",
+                            LedgerOp::CounterLessThan => "counterLessThan",
                             LedgerOp::CounterIncrement => "counterIncrement",
                             LedgerOp::CounterDecrement => "counterDecrement",
                             LedgerOp::SetMember => "setMember",
@@ -2678,6 +2717,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             | LedgerOp::ListResetToDefault
                             | LedgerOp::MerkleTreeResetToDefault
                             | LedgerOp::HistoricMerkleTreeResetToDefault => "resetToDefault",
+                            _ => unreachable!("Kernel ops handled above"),
                         };
                         let mut call_args = ArenaVec::with_capacity_in(2 + args.len(), self);
                         call_args.push(Argument::from(self.expr_ident(span, "context")));
@@ -3067,6 +3107,14 @@ mod tests {
     fn codegen_patterns_map_fold_and_either() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/functional_patterns.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_kernel_block_time_and_tokens() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/token_vault.compact"),
             compile_ts_bundle
         );
     }

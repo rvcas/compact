@@ -1,0 +1,55 @@
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+export { Maybe, Either, ContractAddress, ShieldedCoinInfo, ShieldedSendResult }
+
+export ledger deadline: Uint<64>;
+export ledger minted_batches: Counter;
+
+constructor(unlock_time: Uint<64>) {
+  deadline = disclose(unlock_time);
+}
+
+export circuit check_time_window(now_bound: Uint<64>): Boolean {
+  assert(blockTimeGte(deadline), "too early");
+  assert(blockTimeLt(disclose(now_bound)), "window expired");
+  assert(!minted_batches.lessThan(0), "counter non-negative");
+  return blockTimeLte(disclose(now_bound)) && blockTimeGt(0);
+}
+
+export circuit mint_shielded_reward(
+  domain_sep: Bytes<32>,
+  amount: Uint<64>,
+  seed: Bytes<32>,
+): ShieldedCoinInfo {
+  const pk = ownPublicKey();
+  const nonce = evolveNonce(0, disclose(seed));
+  const recipient = left<ZswapCoinPublicKey, ContractAddress>(disclose(pk));
+  const coin = mintShieldedToken(
+    disclose(domain_sep),
+    disclose(amount),
+    nonce,
+    recipient,
+  );
+  minted_batches += 1;
+  kernel.checkpoint();
+  return coin;
+}
+
+export circuit manage_unshielded(
+  domain_sep: Bytes<32>,
+  amount: Uint<64>,
+  user: UserAddress,
+): [Bytes<32>, Uint<128>] {
+  const recipient = right<ContractAddress, UserAddress>(disclose(user));
+  const color = mintUnshieldedToken(disclose(domain_sep), disclose(amount), recipient);
+  receiveUnshielded(color, 10);
+  assert(unshieldedBalanceGte(color, 0), "balance check");
+  const bal = unshieldedBalance(color);
+  sendUnshielded(color, 5, recipient);
+  return [color, bal];
+}
+
+export circuit inspect_caller(): Maybe<PublicAddress> {
+  return kernel.caller();
+}

@@ -8,8 +8,8 @@ rust-version.workspace = true
 compact-ast.workspace = true
 compact-diagnostics.workspace = true
 compact-hir.workspace = true
+compact-parser.workspace = true
 compact-span.workspace = true
 
 [dev-dependencies]
-compact-parser.workspace = true
 compact-test-utils.workspace = true

@@ -1,0 +1,838 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+export { Maybe, Either, ContractAddress, ShieldedCoinInfo, ShieldedSendResult }
+
+export ledger deadline: Uint<64>;
+export ledger minted_batches: Counter;
+
+constructor(unlock_time: Uint<64>) {
+  deadline = disclose(unlock_time);
+}
+
+export circuit check_time_window(now_bound: Uint<64>): Boolean {
+  assert(blockTimeGte(deadline), "too early");
+  assert(blockTimeLt(disclose(now_bound)), "window expired");
+  assert(!minted_batches.lessThan(0), "counter non-negative");
+  return blockTimeLte(disclose(now_bound)) && blockTimeGt(0);
+}
+
+export circuit mint_shielded_reward(
+  domain_sep: Bytes<32>,
+  amount: Uint<64>,
+  seed: Bytes<32>,
+): ShieldedCoinInfo {
+  const pk = ownPublicKey();
+  const nonce = evolveNonce(0, disclose(seed));
+  const recipient = left<ZswapCoinPublicKey, ContractAddress>(disclose(pk));
+  const coin = mintShieldedToken(
+    disclose(domain_sep),
+    disclose(amount),
+    nonce,
+    recipient,
+  );
+  minted_batches += 1;
+  kernel.checkpoint();
+  return coin;
+}
+
+export circuit manage_unshielded(
+  domain_sep: Bytes<32>,
+  amount: Uint<64>,
+  user: UserAddress,
+): [Bytes<32>, Uint<128>] {
+  const recipient = right<ContractAddress, UserAddress>(disclose(user));
+  const color = mintUnshieldedToken(disclose(domain_sep), disclose(amount), recipient);
+  receiveUnshielded(color, 10);
+  assert(unshieldedBalanceGte(color, 0), "balance check");
+  const bal = unshieldedBalance(color);
+  sendUnshielded(color, 5, recipient);
+  return [color, bal];
+}
+
+export circuit inspect_caller(): Maybe<PublicAddress> {
+  return kernel.caller();
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+export type Either<
+	A,
+	B
+> = {
+	is_left: boolean;
+	left: A;
+	right: B;
+};
+export type ShieldedCoinInfo = {
+	nonce: Uint8Array;
+	color: Uint8Array;
+	value: bigint;
+};
+type UserAddress = {
+	bytes: Uint8Array;
+};
+export type ContractAddress = {
+	bytes: Uint8Array;
+};
+export type ShieldedSendResult = {
+	change: Maybe<ShieldedCoinInfo>;
+	sent: ShieldedCoinInfo;
+};
+type ZswapCoinPublicKey = {
+	bytes: Uint8Array;
+};
+type CoinPreimage = {
+	domain_sep: Uint8Array;
+	info: ShieldedCoinInfo;
+	dataType: boolean;
+	data: Uint8Array;
+};
+function _blockTimeGte(context: __compactRuntime.CircuitContext<unknown>, time: bigint): boolean {
+	return !_blockTimeLt(context, time);
+}
+function _blockTimeLt(context: __compactRuntime.CircuitContext<unknown>, time: bigint): boolean {
+	return __compactRuntime.kernel.blockTimeLessThan(context, time);
+}
+function _blockTimeLte(context: __compactRuntime.CircuitContext<unknown>, time: bigint): boolean {
+	return !_blockTimeGt(context, time);
+}
+function _blockTimeGt(context: __compactRuntime.CircuitContext<unknown>, time: bigint): boolean {
+	return __compactRuntime.kernel.blockTimeGreaterThan(context, time);
+}
+function _evolveNonce(index: bigint, nonce: Uint8Array): Uint8Array {
+	return __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([
+		new Uint8Array([
+			109,
+			105,
+			100,
+			110,
+			105,
+			103,
+			104,
+			116,
+			58,
+			107,
+			101,
+			114,
+			110,
+			101,
+			108,
+			58,
+			110,
+			111,
+			110,
+			99,
+			101,
+			95,
+			101,
+			118,
+			111,
+			108,
+			118,
+			101
+		]),
+		index,
+		__compactRuntime.degradeToTransient(nonce)
+	]));
+}
+function _mintShieldedToken(context: __compactRuntime.CircuitContext<unknown>, domain_sep: Uint8Array, value: bigint, nonce: Uint8Array, recipient: Either<ZswapCoinPublicKey, ContractAddress>): ShieldedCoinInfo {
+	const coin: ShieldedCoinInfo = {
+		nonce,
+		color: _tokenType(domain_sep, __compactRuntime.kernel.self(context)),
+		value
+	};
+	__compactRuntime.kernel.mintShielded(context, domain_sep, value);
+	__compactRuntime.createZswapOutput(context, coin, recipient);
+	const cm: Uint8Array = _coinCommitment(coin, recipient);
+	__compactRuntime.kernel.claimZswapCoinSpend(context, cm);
+	if (!recipient.is_left && __compactRuntime.equal(recipient.right.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.claimZswapCoinReceive(context, cm);
+	}
+	return coin;
+}
+function _mintUnshieldedToken(context: __compactRuntime.CircuitContext<unknown>, domainSep: Uint8Array, amount: bigint, recipient: Either<ContractAddress, UserAddress>): Uint8Array {
+	__compactRuntime.kernel.mintUnshielded(context, domainSep, amount);
+	const color: Uint8Array = _tokenType(domainSep, __compactRuntime.kernel.self(context));
+	__compactRuntime.kernel.claimUnshieldedCoinSpend(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, recipient, amount);
+	if (recipient.is_left && __compactRuntime.equal(recipient.left.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.incUnshieldedInputs(context, {
+			is_left: true,
+			left: color,
+			right: new Uint8Array(32)
+		}, amount);
+	}
+	return color;
+}
+function _receiveUnshielded(context: __compactRuntime.CircuitContext<unknown>, color: Uint8Array, amount: bigint): [] {
+	__compactRuntime.kernel.incUnshieldedInputs(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+}
+function _unshieldedBalanceGte(context: __compactRuntime.CircuitContext<unknown>, color: Uint8Array, amount: bigint): boolean {
+	return !_unshieldedBalanceLt(context, color, amount);
+}
+function _unshieldedBalance(context: __compactRuntime.CircuitContext<unknown>, color: Uint8Array): bigint {
+	return __compactRuntime.kernel.balance(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	});
+}
+function _sendUnshielded(context: __compactRuntime.CircuitContext<unknown>, color: Uint8Array, amount: bigint, recipient: Either<ContractAddress, UserAddress>): [] {
+	__compactRuntime.kernel.incUnshieldedOutputs(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+	__compactRuntime.kernel.claimUnshieldedCoinSpend(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, recipient, amount);
+	if (recipient.is_left && __compactRuntime.equal(recipient.left.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.incUnshieldedInputs(context, {
+			is_left: true,
+			left: color,
+			right: new Uint8Array(32)
+		}, amount);
+	}
+}
+function _tokenType(domain_sep: Uint8Array, contractAddress: ContractAddress): Uint8Array {
+	return __compactRuntime.persistentCommit([domain_sep, contractAddress.bytes], new Uint8Array([
+		109,
+		105,
+		100,
+		110,
+		105,
+		103,
+		104,
+		116,
+		58,
+		100,
+		101,
+		114,
+		105,
+		118,
+		101,
+		95,
+		116,
+		111,
+		107,
+		101,
+		110,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]));
+}
+function _coinCommitment(coin: ShieldedCoinInfo, recipient: Either<ZswapCoinPublicKey, ContractAddress>): Uint8Array {
+	return __compactRuntime.persistentHash({
+		domain_sep: new Uint8Array([
+			109,
+			105,
+			100,
+			110,
+			105,
+			103,
+			104,
+			116,
+			58,
+			122,
+			115,
+			119,
+			97,
+			112,
+			45,
+			99,
+			99,
+			91,
+			118,
+			49,
+			93
+		]),
+		info: coin,
+		dataType: recipient.is_left,
+		data: recipient.is_left ? recipient.left.bytes : recipient.right.bytes
+	});
+}
+function _unshieldedBalanceLt(context: __compactRuntime.CircuitContext<unknown>, color: Uint8Array, amount: bigint): boolean {
+	return __compactRuntime.kernel.balanceLessThan(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+}
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	check_time_window(context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	mint_shielded_reward(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo>;
+	manage_unshielded(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]>;
+	inspect_caller(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	check_time_window(context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	mint_shielded_reward(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo>;
+	manage_unshielded(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]>;
+	inspect_caller(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>>;
+};
+export type Ledger = {
+	readonly deadline: bigint;
+	readonly minted_batches: bigint;
+};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {
+		deadline: __compactRuntime.decodeCell(state, 0),
+		minted_batches: __compactRuntime.decodeCounter(state, 1)
+	};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			check_time_window: (context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_blockTimeGte(context, __compactRuntime.readCell(context, 0)), "too early");
+				__compactRuntime.assert(_blockTimeLt(context, now_bound), "window expired");
+				__compactRuntime.assert(!__compactRuntime.counterLessThan(context, 1, 0n), "counter non-negative");
+				return {
+					result: _blockTimeLte(context, now_bound) && _blockTimeGt(context, 0n),
+					context
+				};
+			},
+			mint_shielded_reward: (context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo> => {
+				const pk: ZswapCoinPublicKey = __compactRuntime.ownPublicKey(context);
+				const nonce: Uint8Array = _evolveNonce(0n, seed);
+				const recipient: Either<ZswapCoinPublicKey, ContractAddress> = {
+					is_left: true,
+					left: pk,
+					right: { bytes: new Uint8Array(32) }
+				};
+				const coin: ShieldedCoinInfo = _mintShieldedToken(context, domain_sep, amount, nonce, recipient);
+				__compactRuntime.queryLedger(context, [
+					{ idx: {
+						cached: false,
+						pushPath: true,
+						path: 1
+					} },
+					{ addi: { immediate: 1 } },
+					{ ins: {
+						cached: true,
+						n: 1
+					} }
+				]);
+				__compactRuntime.kernel.checkpoint(context);
+				return {
+					result: coin,
+					context
+				};
+			},
+			manage_unshielded: (context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]> => {
+				const recipient: Either<ContractAddress, UserAddress> = {
+					is_left: false,
+					left: { bytes: new Uint8Array(32) },
+					right: user
+				};
+				const color: Uint8Array = _mintUnshieldedToken(context, domain_sep, amount, recipient);
+				_receiveUnshielded(context, color, 10n);
+				__compactRuntime.assert(_unshieldedBalanceGte(context, color, 0n), "balance check");
+				const bal: bigint = _unshieldedBalance(context, color);
+				_sendUnshielded(context, color, 5n, recipient);
+				return {
+					result: [color, bal],
+					context
+				};
+			},
+			inspect_caller: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>> => {
+				return {
+					result: __compactRuntime.kernel.caller(context),
+					context
+				};
+			}
+		};
+		this.circuits = {
+			check_time_window: (context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean> => {
+				__compactRuntime.assert(_blockTimeGte(context, __compactRuntime.readCell(context, 0)), "too early");
+				__compactRuntime.assert(_blockTimeLt(context, now_bound), "window expired");
+				__compactRuntime.assert(!__compactRuntime.counterLessThan(context, 1, 0n), "counter non-negative");
+				return {
+					result: _blockTimeLte(context, now_bound) && _blockTimeGt(context, 0n),
+					context
+				};
+			},
+			mint_shielded_reward: (context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo> => {
+				const pk: ZswapCoinPublicKey = __compactRuntime.ownPublicKey(context);
+				const nonce: Uint8Array = _evolveNonce(0n, seed);
+				const recipient: Either<ZswapCoinPublicKey, ContractAddress> = {
+					is_left: true,
+					left: pk,
+					right: { bytes: new Uint8Array(32) }
+				};
+				const coin: ShieldedCoinInfo = _mintShieldedToken(context, domain_sep, amount, nonce, recipient);
+				__compactRuntime.queryLedger(context, [
+					{ idx: {
+						cached: false,
+						pushPath: true,
+						path: 1
+					} },
+					{ addi: { immediate: 1 } },
+					{ ins: {
+						cached: true,
+						n: 1
+					} }
+				]);
+				__compactRuntime.kernel.checkpoint(context);
+				return {
+					result: coin,
+					context
+				};
+			},
+			manage_unshielded: (context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]> => {
+				const recipient: Either<ContractAddress, UserAddress> = {
+					is_left: false,
+					left: { bytes: new Uint8Array(32) },
+					right: user
+				};
+				const color: Uint8Array = _mintUnshieldedToken(context, domain_sep, amount, recipient);
+				_receiveUnshielded(context, color, 10n);
+				__compactRuntime.assert(_unshieldedBalanceGte(context, color, 0n), "balance check");
+				const bal: bigint = _unshieldedBalance(context, color);
+				_sendUnshielded(context, color, 5n, recipient);
+				return {
+					result: [color, bal],
+					context
+				};
+			},
+			inspect_caller: (context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>> => {
+				return {
+					result: __compactRuntime.kernel.caller(context),
+					context
+				};
+			}
+		};
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>, unlock_time: bigint): __compactRuntime.ConstructorResult<T> {
+		__compactRuntime.writeCell(context, 0, unlock_time);
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+function _blockTimeGte(context, time) {
+	return !_blockTimeLt(context, time);
+}
+function _blockTimeLt(context, time) {
+	return __compactRuntime.kernel.blockTimeLessThan(context, time);
+}
+function _blockTimeLte(context, time) {
+	return !_blockTimeGt(context, time);
+}
+function _blockTimeGt(context, time) {
+	return __compactRuntime.kernel.blockTimeGreaterThan(context, time);
+}
+function _evolveNonce(index, nonce) {
+	return __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([
+		new Uint8Array([
+			109,
+			105,
+			100,
+			110,
+			105,
+			103,
+			104,
+			116,
+			58,
+			107,
+			101,
+			114,
+			110,
+			101,
+			108,
+			58,
+			110,
+			111,
+			110,
+			99,
+			101,
+			95,
+			101,
+			118,
+			111,
+			108,
+			118,
+			101
+		]),
+		index,
+		__compactRuntime.degradeToTransient(nonce)
+	]));
+}
+function _mintShieldedToken(context, domain_sep, value, nonce, recipient) {
+	const coin = {
+		nonce,
+		color: _tokenType(domain_sep, __compactRuntime.kernel.self(context)),
+		value
+	};
+	__compactRuntime.kernel.mintShielded(context, domain_sep, value);
+	__compactRuntime.createZswapOutput(context, coin, recipient);
+	const cm = _coinCommitment(coin, recipient);
+	__compactRuntime.kernel.claimZswapCoinSpend(context, cm);
+	if (!recipient.is_left && __compactRuntime.equal(recipient.right.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.claimZswapCoinReceive(context, cm);
+	}
+	return coin;
+}
+function _mintUnshieldedToken(context, domainSep, amount, recipient) {
+	__compactRuntime.kernel.mintUnshielded(context, domainSep, amount);
+	const color = _tokenType(domainSep, __compactRuntime.kernel.self(context));
+	__compactRuntime.kernel.claimUnshieldedCoinSpend(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, recipient, amount);
+	if (recipient.is_left && __compactRuntime.equal(recipient.left.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.incUnshieldedInputs(context, {
+			is_left: true,
+			left: color,
+			right: new Uint8Array(32)
+		}, amount);
+	}
+	return color;
+}
+function _receiveUnshielded(context, color, amount) {
+	__compactRuntime.kernel.incUnshieldedInputs(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+}
+function _unshieldedBalanceGte(context, color, amount) {
+	return !_unshieldedBalanceLt(context, color, amount);
+}
+function _unshieldedBalance(context, color) {
+	return __compactRuntime.kernel.balance(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	});
+}
+function _sendUnshielded(context, color, amount, recipient) {
+	__compactRuntime.kernel.incUnshieldedOutputs(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+	__compactRuntime.kernel.claimUnshieldedCoinSpend(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, recipient, amount);
+	if (recipient.is_left && __compactRuntime.equal(recipient.left.bytes, __compactRuntime.kernel.self(context).bytes)) {
+		__compactRuntime.kernel.incUnshieldedInputs(context, {
+			is_left: true,
+			left: color,
+			right: new Uint8Array(32)
+		}, amount);
+	}
+}
+function _tokenType(domain_sep, contractAddress) {
+	return __compactRuntime.persistentCommit([domain_sep, contractAddress.bytes], new Uint8Array([
+		109,
+		105,
+		100,
+		110,
+		105,
+		103,
+		104,
+		116,
+		58,
+		100,
+		101,
+		114,
+		105,
+		118,
+		101,
+		95,
+		116,
+		111,
+		107,
+		101,
+		110,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0
+	]));
+}
+function _coinCommitment(coin, recipient) {
+	return __compactRuntime.persistentHash({
+		domain_sep: new Uint8Array([
+			109,
+			105,
+			100,
+			110,
+			105,
+			103,
+			104,
+			116,
+			58,
+			122,
+			115,
+			119,
+			97,
+			112,
+			45,
+			99,
+			99,
+			91,
+			118,
+			49,
+			93
+		]),
+		info: coin,
+		dataType: recipient.is_left,
+		data: recipient.is_left ? recipient.left.bytes : recipient.right.bytes
+	});
+}
+function _unshieldedBalanceLt(context, color, amount) {
+	return __compactRuntime.kernel.balanceLessThan(context, {
+		is_left: true,
+		left: color,
+		right: new Uint8Array(32)
+	}, amount);
+}
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return {
+		deadline: __compactRuntime.decodeCell(state, 0),
+		minted_batches: __compactRuntime.decodeCounter(state, 1)
+	};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = {
+			check_time_window: (context, now_bound) => {
+				__compactRuntime.assert(_blockTimeGte(context, __compactRuntime.readCell(context, 0)), "too early");
+				__compactRuntime.assert(_blockTimeLt(context, now_bound), "window expired");
+				__compactRuntime.assert(!__compactRuntime.counterLessThan(context, 1, 0n), "counter non-negative");
+				return {
+					result: _blockTimeLte(context, now_bound) && _blockTimeGt(context, 0n),
+					context
+				};
+			},
+			mint_shielded_reward: (context, domain_sep, amount, seed) => {
+				const pk = __compactRuntime.ownPublicKey(context);
+				const nonce = _evolveNonce(0n, seed);
+				const recipient = {
+					is_left: true,
+					left: pk,
+					right: { bytes: new Uint8Array(32) }
+				};
+				const coin = _mintShieldedToken(context, domain_sep, amount, nonce, recipient);
+				__compactRuntime.queryLedger(context, [
+					{ idx: {
+						cached: false,
+						pushPath: true,
+						path: 1
+					} },
+					{ addi: { immediate: 1 } },
+					{ ins: {
+						cached: true,
+						n: 1
+					} }
+				]);
+				__compactRuntime.kernel.checkpoint(context);
+				return {
+					result: coin,
+					context
+				};
+			},
+			manage_unshielded: (context, domain_sep, amount, user) => {
+				const recipient = {
+					is_left: false,
+					left: { bytes: new Uint8Array(32) },
+					right: user
+				};
+				const color = _mintUnshieldedToken(context, domain_sep, amount, recipient);
+				_receiveUnshielded(context, color, 10n);
+				__compactRuntime.assert(_unshieldedBalanceGte(context, color, 0n), "balance check");
+				const bal = _unshieldedBalance(context, color);
+				_sendUnshielded(context, color, 5n, recipient);
+				return {
+					result: [color, bal],
+					context
+				};
+			},
+			inspect_caller: (context) => {
+				return {
+					result: __compactRuntime.kernel.caller(context),
+					context
+				};
+			}
+		};
+		this.circuits = {
+			check_time_window: (context, now_bound) => {
+				__compactRuntime.assert(_blockTimeGte(context, __compactRuntime.readCell(context, 0)), "too early");
+				__compactRuntime.assert(_blockTimeLt(context, now_bound), "window expired");
+				__compactRuntime.assert(!__compactRuntime.counterLessThan(context, 1, 0n), "counter non-negative");
+				return {
+					result: _blockTimeLte(context, now_bound) && _blockTimeGt(context, 0n),
+					context
+				};
+			},
+			mint_shielded_reward: (context, domain_sep, amount, seed) => {
+				const pk = __compactRuntime.ownPublicKey(context);
+				const nonce = _evolveNonce(0n, seed);
+				const recipient = {
+					is_left: true,
+					left: pk,
+					right: { bytes: new Uint8Array(32) }
+				};
+				const coin = _mintShieldedToken(context, domain_sep, amount, nonce, recipient);
+				__compactRuntime.queryLedger(context, [
+					{ idx: {
+						cached: false,
+						pushPath: true,
+						path: 1
+					} },
+					{ addi: { immediate: 1 } },
+					{ ins: {
+						cached: true,
+						n: 1
+					} }
+				]);
+				__compactRuntime.kernel.checkpoint(context);
+				return {
+					result: coin,
+					context
+				};
+			},
+			manage_unshielded: (context, domain_sep, amount, user) => {
+				const recipient = {
+					is_left: false,
+					left: { bytes: new Uint8Array(32) },
+					right: user
+				};
+				const color = _mintUnshieldedToken(context, domain_sep, amount, recipient);
+				_receiveUnshielded(context, color, 10n);
+				__compactRuntime.assert(_unshieldedBalanceGte(context, color, 0n), "balance check");
+				const bal = _unshieldedBalance(context, color);
+				_sendUnshielded(context, color, 5n, recipient);
+				return {
+					result: [color, bal],
+					context
+				};
+			},
+			inspect_caller: (context) => {
+				return {
+					result: __compactRuntime.kernel.caller(context),
+					context
+				};
+			}
+		};
+	}
+	initialState(context, unlock_time) {
+		__compactRuntime.writeCell(context, 0, unlock_time);
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Maybe<T> = {
+	is_some: boolean;
+	value: T;
+};
+export type Either<
+	A,
+	B
+> = {
+	is_left: boolean;
+	left: A;
+	right: B;
+};
+export type ShieldedCoinInfo = {
+	nonce: Uint8Array;
+	color: Uint8Array;
+	value: bigint;
+};
+type UserAddress = {
+	bytes: Uint8Array;
+};
+export type ContractAddress = {
+	bytes: Uint8Array;
+};
+export type ShieldedSendResult = {
+	change: Maybe<ShieldedCoinInfo>;
+	sent: ShieldedCoinInfo;
+};
+export type Witnesses<T> = {};
+export type ImpureCircuits<T> = {
+	check_time_window(context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	mint_shielded_reward(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo>;
+	manage_unshielded(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]>;
+	inspect_caller(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	check_time_window(context: __compactRuntime.CircuitContext<T>, now_bound: bigint): __compactRuntime.CircuitResults<T, boolean>;
+	mint_shielded_reward(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, seed: Uint8Array): __compactRuntime.CircuitResults<T, ShieldedCoinInfo>;
+	manage_unshielded(context: __compactRuntime.CircuitContext<T>, domain_sep: Uint8Array, amount: bigint, user: UserAddress): __compactRuntime.CircuitResults<T, [Uint8Array, bigint]>;
+	inspect_caller(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, Maybe<Either<ContractAddress, UserAddress>>>;
+};
+export type Ledger = {
+	readonly deadline: bigint;
+	readonly minted_batches: bigint;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>, unlock_time: bigint): __compactRuntime.ConstructorResult<T>;
+}
+export {};

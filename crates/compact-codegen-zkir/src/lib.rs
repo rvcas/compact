@@ -805,4 +805,12 @@ mod tests {
             compile_all_zkir
         );
     }
+
+    #[test]
+    fn zkir_kernel_block_time_and_tokens() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/token_vault.compact"),
+            compile_all_zkir
+        );
+    }
 }
