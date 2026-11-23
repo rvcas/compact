@@ -79,6 +79,7 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         generic_circuit_cache: HashMap::new(),
         resolving_aliases: HashSet::new(),
         next_mod_instance: 0,
+        next_local: 0,
     };
     analyzer.run();
 
@@ -321,9 +322,16 @@ struct Analyzer<'a> {
     generic_circuit_cache: HashMap<(usize, Vec<GenericArgVal>), CircuitId>,
     resolving_aliases: HashSet<usize>,
     next_mod_instance: usize,
+    next_local: u32,
 }
 
 impl<'a> Analyzer<'a> {
+    fn alloc_local(&mut self) -> LocalId {
+        let id = LocalId(self.next_local);
+        self.next_local += 1;
+        id
+    }
+
     fn text(&self, tok: TokenIndex) -> &str {
         self.units.ast().token_text(tok, self.units.file().text())
     }
@@ -789,7 +797,11 @@ impl<'a> Analyzer<'a> {
                 && self.scope.has_stdlib
                 && matches!(
                     name.as_str(),
-                    "Maybe" | "MerkleTreeDigest" | "MerkleTreePathEntry" | "MerkleTreePath"
+                    "Maybe"
+                        | "Either"
+                        | "MerkleTreeDigest"
+                        | "MerkleTreePathEntry"
+                        | "MerkleTreePath"
                 )
             {
                 if !self.exported_stdlib_types.iter().any(|s| s == &name) {
@@ -1801,6 +1813,22 @@ impl<'a> Analyzer<'a> {
                         let inner = self.resolve_type(arg_nodes[0])?;
                         Some(Type::Maybe(Box::new(inner)))
                     }
+                    "Either" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                span,
+                                format!(
+                                    "`Either` expects 2 type arguments, found {}",
+                                    arg_nodes.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        let left = self.resolve_type(arg_nodes[0])?;
+                        let right = self.resolve_type(arg_nodes[1])?;
+                        Some(Type::Either(Box::new(left), Box::new(right)))
+                    }
                     "MerkleTreePath" => {
                         if arg_nodes.len() != 2 {
                             self.diagnostics.push(CompactDiagnostic::error(
@@ -1939,6 +1967,11 @@ impl<'a> Analyzer<'a> {
                 ("is_some".to_owned(), Type::Boolean),
                 ("value".to_owned(), (**inner).clone()),
             ]),
+            Type::Either(left, right) => Some(vec![
+                ("is_left".to_owned(), Type::Boolean),
+                ("left".to_owned(), (**left).clone()),
+                ("right".to_owned(), (**right).clone()),
+            ]),
             Type::MerkleTreeDigest => Some(vec![("field".to_owned(), Type::Field)]),
             Type::MerkleTreePathEntry => Some(vec![
                 ("sibling".to_owned(), Type::MerkleTreeDigest),
@@ -1971,6 +2004,11 @@ impl<'a> Analyzer<'a> {
             Type::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Type::NewType(id) => self.new_types[id.0 as usize].name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
+            Type::Either(left, right) => format!(
+                "Either<{}, {}>",
+                self.format_type(left),
+                self.format_type(right)
+            ),
             Type::MerkleTreeDigest => "MerkleTreeDigest".into(),
             Type::MerkleTreePathEntry => "MerkleTreePathEntry".into(),
             Type::MerkleTreePath(depth, leaf) => {
@@ -1986,7 +2024,7 @@ impl<'a> Analyzer<'a> {
         for p in &params {
             scope.insert(p.name.clone(), ValueBinding::Param(p.id, p.ty.clone()));
         }
-        let mut next_local: u32 = 0;
+        self.next_local = 0;
         let block_data = self.units.ast().node_data(decl.body);
         let stmt_nodes: Vec<_> = self
             .units
@@ -1996,9 +2034,7 @@ impl<'a> Analyzer<'a> {
         let ret_unit = Type::unit();
         let mut body = Vec::new();
         for snode in stmt_nodes {
-            if let Some(stmt) = self.check_stmt(snode, &mut scope, &mut next_local, &ret_unit) {
-                body.push(stmt);
-            }
+            self.check_stmt(snode, &mut scope, &ret_unit, &mut body);
         }
         self.constructor = Some(Constructor {
             params,
@@ -2025,7 +2061,7 @@ impl<'a> Analyzer<'a> {
         for p in &params {
             scope.insert(p.name.clone(), ValueBinding::Param(p.id, p.ty.clone()));
         }
-        let mut next_local: u32 = 0;
+        self.next_local = 0;
 
         let block_data = self.units.ast().node_data(body_node);
         let stmt_nodes: Vec<_> = self
@@ -2036,9 +2072,7 @@ impl<'a> Analyzer<'a> {
 
         let mut body = Vec::new();
         for snode in stmt_nodes {
-            if let Some(stmt) = self.check_stmt(snode, &mut scope, &mut next_local, &ret_type) {
-                body.push(stmt);
-            }
+            self.check_stmt(snode, &mut scope, &ret_type, &mut body);
         }
 
         self.scope = prev_scope;
@@ -2061,10 +2095,10 @@ impl<'a> Analyzer<'a> {
         &mut self,
         node: NodeIndex,
         scope: &HashMap<String, ValueBinding>,
-        next_local: &mut u32,
         expected_ret: &Type,
     ) -> Vec<Stmt> {
         let mut inner_scope = scope.clone();
+        let mut stmts = Vec::new();
         if self.units.ast().node_tag(node) == NodeTag::Block {
             let block_data = self.units.ast().node_data(node);
             let stmt_nodes: Vec<_> = self
@@ -2072,20 +2106,190 @@ impl<'a> Analyzer<'a> {
                 .ast()
                 .extra_nodes(block_data.lhs, block_data.rhs)
                 .collect();
-            let mut stmts = Vec::new();
             for snode in stmt_nodes {
-                if let Some(stmt) =
-                    self.check_stmt(snode, &mut inner_scope, next_local, expected_ret)
-                {
-                    stmts.push(stmt);
+                self.check_stmt(snode, &mut inner_scope, expected_ret, &mut stmts);
+            }
+        } else {
+            self.check_stmt(node, &mut inner_scope, expected_ret, &mut stmts);
+        }
+        stmts
+    }
+
+    fn bind_pattern(
+        &mut self,
+        pat: NodeIndex,
+        val: Expr,
+        scope: &mut HashMap<String, ValueBinding>,
+        out: &mut Vec<Stmt>,
+        stmt_span: Span,
+    ) {
+        let pat_span = self.units.ast().node_span(pat);
+        match self.units.ast().node_tag(pat) {
+            NodeTag::PatIdent => {
+                let name = self.text(self.units.ast().node_main_token(pat)).to_owned();
+                let local = self.alloc_local();
+                let ty = val.ty.clone();
+                scope.insert(name.clone(), ValueBinding::Local(local, ty.clone()));
+                out.push(Stmt::Const {
+                    local,
+                    name,
+                    ty,
+                    init: val,
+                    span: stmt_span,
+                });
+            }
+            NodeTag::PatTuple => {
+                let data = self.units.ast().node_data(pat);
+                let elems: Vec<_> = self.units.ast().extra_nodes(data.lhs, data.rhs).collect();
+                let val_u = self.underlying_type(&val.ty).clone();
+                let elem_tys: Vec<Type> = match val_u {
+                    Type::Tuple(tys) => {
+                        if tys.len() != elems.len() {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                pat_span,
+                                format!(
+                                    "tuple destructuring pattern has {} element(s), but value has {}",
+                                    elems.len(),
+                                    tys.len()
+                                ),
+                            ));
+                            return;
+                        }
+                        tys
+                    }
+                    Type::Vector(len, ety) => {
+                        if len as usize != elems.len() {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                pat_span,
+                                format!(
+                                    "vector destructuring pattern has {} element(s), but `Vector<{len}, ...>` has {len}",
+                                    elems.len()
+                                ),
+                            ));
+                            return;
+                        }
+                        vec![(*ety).clone(); elems.len()]
+                    }
+                    other => {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            pat_span,
+                            format!(
+                                "cannot destructure type `{}` with a tuple/vector pattern",
+                                self.format_type(&other)
+                            ),
+                        ));
+                        return;
+                    }
+                };
+                // Bind the scrutinee once so side-effecting expressions are evaluated once.
+                let tmp = self.alloc_local();
+                let tmp_ty = val.ty.clone();
+                out.push(Stmt::Const {
+                    local: tmp,
+                    name: format!("__pat_{}", tmp.0),
+                    ty: tmp_ty.clone(),
+                    init: val,
+                    span: stmt_span,
+                });
+                for (i, (sub_pat, ety)) in elems.into_iter().zip(elem_tys).enumerate() {
+                    if !sub_pat.is_some() {
+                        continue;
+                    }
+                    let elem_expr = Expr {
+                        kind: ExprKind::Index {
+                            base: Box::new(Expr {
+                                kind: ExprKind::LocalRef(tmp),
+                                ty: tmp_ty.clone(),
+                                span: stmt_span,
+                            }),
+                            index: Box::new(Expr {
+                                kind: ExprKind::IntLit(i as u128),
+                                ty: Type::Uint(64),
+                                span: stmt_span,
+                            }),
+                        },
+                        ty: ety,
+                        span: self.units.ast().node_span(sub_pat),
+                    };
+                    self.bind_pattern(sub_pat, elem_expr, scope, out, stmt_span);
                 }
             }
-            stmts
-        } else if let Some(stmt) = self.check_stmt(node, &mut inner_scope, next_local, expected_ret)
-        {
-            vec![stmt]
-        } else {
-            Vec::new()
+            NodeTag::PatStruct => {
+                let data = self.units.ast().node_data(pat);
+                let field_nodes: Vec<_> =
+                    self.units.ast().extra_nodes(data.lhs, data.rhs).collect();
+                let Some(struct_fields) = self.struct_fields_of(&val.ty) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        pat_span,
+                        format!(
+                            "cannot destructure non-struct type `{}` with a struct pattern",
+                            self.format_type(&val.ty)
+                        ),
+                    ));
+                    return;
+                };
+                let tmp = self.alloc_local();
+                let tmp_ty = val.ty.clone();
+                out.push(Stmt::Const {
+                    local: tmp,
+                    name: format!("__pat_{}", tmp.0),
+                    ty: tmp_ty.clone(),
+                    init: val,
+                    span: stmt_span,
+                });
+                for fnode in field_nodes {
+                    let sf = self.units.ast().pat_struct_field(fnode);
+                    let fname = self.text(sf.name_token).to_owned();
+                    let fspan = self.units.ast().token_span(sf.name_token);
+                    let Some((_, fty)) = struct_fields.iter().find(|(n, _)| *n == fname) else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            fspan,
+                            format!(
+                                "struct `{}` has no field `{fname}`",
+                                self.format_type(&tmp_ty)
+                            ),
+                        ));
+                        continue;
+                    };
+                    let field_expr = Expr {
+                        kind: ExprKind::FieldAccess {
+                            base: Box::new(Expr {
+                                kind: ExprKind::LocalRef(tmp),
+                                ty: tmp_ty.clone(),
+                                span: stmt_span,
+                            }),
+                            field: fname.clone(),
+                        },
+                        ty: fty.clone(),
+                        span: fspan,
+                    };
+                    if let Some(sub_pat) = sf.pat {
+                        self.bind_pattern(sub_pat, field_expr, scope, out, stmt_span);
+                    } else {
+                        let local = self.alloc_local();
+                        scope.insert(fname.clone(), ValueBinding::Local(local, fty.clone()));
+                        out.push(Stmt::Const {
+                            local,
+                            name: fname,
+                            ty: fty.clone(),
+                            init: field_expr,
+                            span: stmt_span,
+                        });
+                    }
+                }
+            }
+            _ => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    pat_span,
+                    "unsupported binding pattern",
+                ));
+            }
         }
     }
 
@@ -2093,14 +2297,20 @@ impl<'a> Analyzer<'a> {
         &mut self,
         node: NodeIndex,
         scope: &mut HashMap<String, ValueBinding>,
-        next_local: &mut u32,
         expected_ret: &Type,
-    ) -> Option<Stmt> {
+        out: &mut Vec<Stmt>,
+    ) {
         let data = self.units.ast().node_data(node);
         match self.units.ast().node_tag(node) {
+            NodeTag::Block => {
+                let stmts = self.check_stmt_list(node, scope, expected_ret);
+                out.extend(stmts);
+            }
             NodeTag::IfStmt => {
                 let stmt = self.units.ast().if_stmt(node);
-                let cond = self.check_expr(stmt.cond, scope, Some(&Type::Boolean))?;
+                let Some(cond) = self.check_expr(stmt.cond, scope, Some(&Type::Boolean)) else {
+                    return;
+                };
                 if cond.ty != Type::Boolean {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
@@ -2110,33 +2320,37 @@ impl<'a> Analyzer<'a> {
                             self.format_type(&cond.ty)
                         ),
                     ));
-                    return None;
+                    return;
                 }
-                let then_branch =
-                    self.check_stmt_list(stmt.then_branch, scope, next_local, expected_ret);
+                let then_branch = self.check_stmt_list(stmt.then_branch, scope, expected_ret);
                 let else_branch = match stmt.else_branch {
-                    Some(eb) => self.check_stmt_list(eb, scope, next_local, expected_ret),
+                    Some(eb) => self.check_stmt_list(eb, scope, expected_ret),
                     None => Vec::new(),
                 };
-                Some(Stmt::If {
+                out.push(Stmt::If {
                     cond,
                     then_branch,
                     else_branch,
                     span: self.units.ast().node_span(node),
-                })
+                });
             }
             NodeTag::ForRangeStmt => {
                 let stmt = self.units.ast().for_range_stmt(node);
                 let var_name = self.text(stmt.name_token).to_owned();
-                let start_expr = self.check_expr(stmt.start, scope, Some(&Type::Uint(64)))?;
-                let end_expr = self.check_expr(stmt.end, scope, Some(&Type::Uint(64)))?;
+                let Some(start_expr) = self.check_expr(stmt.start, scope, Some(&Type::Uint(64)))
+                else {
+                    return;
+                };
+                let Some(end_expr) = self.check_expr(stmt.end, scope, Some(&Type::Uint(64))) else {
+                    return;
+                };
                 let Some(start) = eval_const_u128(&start_expr) else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         start_expr.span,
                         "`for` range lower bound must be a compile-time integer constant",
                     ));
-                    return None;
+                    return;
                 };
                 let Some(end) = eval_const_u128(&end_expr) else {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -2144,7 +2358,7 @@ impl<'a> Analyzer<'a> {
                         end_expr.span,
                         "`for` range upper bound must be a compile-time integer constant",
                     ));
-                    return None;
+                    return;
                 };
                 if start > end {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -2152,26 +2366,27 @@ impl<'a> Analyzer<'a> {
                         self.units.ast().node_span(node),
                         format!("invalid `for` range `{start}..{end}`: start exceeds end"),
                     ));
-                    return None;
+                    return;
                 }
-                let local = LocalId(*next_local);
-                *next_local += 1;
+                let local = self.alloc_local();
                 let mut loop_scope = scope.clone();
                 loop_scope.insert(var_name.clone(), ValueBinding::Local(local, Type::Uint(64)));
-                let body = self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
-                Some(Stmt::ForRange {
+                let body = self.check_stmt_list(stmt.body, &loop_scope, expected_ret);
+                out.push(Stmt::ForRange {
                     local,
                     name: var_name,
                     start: start as u64,
                     end: end as u64,
                     body,
                     span: self.units.ast().node_span(node),
-                })
+                });
             }
             NodeTag::ForEachStmt => {
                 let stmt = self.units.ast().for_each_stmt(node);
                 let var_name = self.text(stmt.name_token).to_owned();
-                let iter = self.check_expr(stmt.iter, scope, None)?;
+                let Some(iter) = self.check_expr(stmt.iter, scope, None) else {
+                    return;
+                };
                 let (len, elem_ty) = match &iter.ty {
                     Type::Vector(len, elem) => (*len, (**elem).clone()),
                     Type::Tuple(elems)
@@ -2188,18 +2403,17 @@ impl<'a> Analyzer<'a> {
                                 self.format_type(other)
                             ),
                         ));
-                        return None;
+                        return;
                     }
                 };
-                let local = LocalId(*next_local);
-                *next_local += 1;
+                let local = self.alloc_local();
                 let mut loop_scope = scope.clone();
                 loop_scope.insert(
                     var_name.clone(),
                     ValueBinding::Local(local, elem_ty.clone()),
                 );
-                let body = self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
-                Some(Stmt::ForEach {
+                let body = self.check_stmt_list(stmt.body, &loop_scope, expected_ret);
+                out.push(Stmt::ForEach {
                     local,
                     name: var_name,
                     elem_ty,
@@ -2207,53 +2421,111 @@ impl<'a> Analyzer<'a> {
                     len,
                     body,
                     span: self.units.ast().node_span(node),
-                })
+                });
             }
             NodeTag::ConstStmt => {
                 let stmt = self.units.ast().const_stmt(node);
-                let name = self.text(stmt.name_token).to_owned();
                 let annotated = match stmt.ty {
-                    Some(ty_node) => Some(self.resolve_type(ty_node)?),
+                    Some(ty_node) => match self.resolve_type(ty_node) {
+                        Some(t) => Some(t),
+                        None => return,
+                    },
                     None => None,
                 };
-                let mut init = self.check_expr(stmt.init, scope, annotated.as_ref())?;
-                let ty = if let Some(ann) = annotated {
+                let Some(mut init) = self.check_expr(stmt.init, scope, annotated.as_ref()) else {
+                    return;
+                };
+                if let Some(ann) = annotated {
                     if !self.coerce_or_check(&mut init, &ann) {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.units.file(),
                             init.span,
                             format!(
-                                "type mismatch in `const {name}`: expected `{}`, found `{}`",
+                                "type mismatch in `const` binding: expected `{}`, found `{}`",
                                 self.format_type(&ann),
                                 self.format_type(&init.ty)
                             ),
                         ));
+                    } else {
+                        init.ty = ann;
                     }
-                    ann
-                } else {
-                    init.ty.clone()
-                };
-                let local = LocalId(*next_local);
-                *next_local += 1;
-                scope.insert(name.clone(), ValueBinding::Local(local, ty.clone()));
-                Some(Stmt::Const {
-                    local,
-                    name,
-                    ty,
-                    init,
-                    span: self.units.ast().node_span(node),
-                })
+                }
+                let stmt_span = self.units.ast().node_span(node);
+                self.bind_pattern(stmt.pat, init, scope, out, stmt_span);
             }
             NodeTag::AssignStmt => {
                 let stmt = self.units.ast().assign_stmt(node);
                 let assign_span = self.units.ast().node_span(node);
+                let op_tag = self.units.ast().token_tag(stmt.eq_token);
+
+                if matches!(op_tag, TokenTag::PlusEq | TokenTag::MinusEq) {
+                    let Some((field_id, key_path, target_adt)) =
+                        self.try_extract_ledger_chain(stmt.lhs, scope)
+                    else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            self.units.ast().node_span(stmt.lhs),
+                            format!(
+                                "left-hand side of `{}` must be a `Counter` ledger target",
+                                op_tag.as_str()
+                            ),
+                        ));
+                        return;
+                    };
+                    if target_adt != LedgerAdt::Counter {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            assign_span,
+                            format!(
+                                "cannot use `{}` on ledger ADT `{}`; only `Counter` supports compound assignment",
+                                op_tag.as_str(),
+                                target_adt.name()
+                            ),
+                        ));
+                        return;
+                    }
+                    let expected = Type::Uint(16);
+                    let Some(mut rhs) = self.check_expr(stmt.rhs, scope, Some(&expected)) else {
+                        return;
+                    };
+                    if !self.coerce_or_check(&mut rhs, &expected) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            rhs.span,
+                            format!(
+                                "`{}` on `Counter` expects `Uint<16>`, found `{}`",
+                                op_tag.as_str(),
+                                self.format_type(&rhs.ty)
+                            ),
+                        ));
+                        return;
+                    }
+                    let op = if op_tag == TokenTag::PlusEq {
+                        LedgerOp::CounterIncrement
+                    } else {
+                        LedgerOp::CounterDecrement
+                    };
+                    out.push(Stmt::Expr(Expr {
+                        kind: ExprKind::LedgerCall {
+                            field: field_id,
+                            key_path,
+                            target_adt,
+                            op,
+                            args: vec![rhs],
+                        },
+                        ty: Type::unit(),
+                        span: assign_span,
+                    }));
+                    return;
+                }
+
                 if self.units.ast().node_tag(stmt.lhs) != NodeTag::IdentExpr {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         self.units.ast().node_span(stmt.lhs),
                         "left-hand side of assignment must be a ledger field",
                     ));
-                    return None;
+                    return;
                 }
                 let lhs_tok = self.units.ast().node_main_token(stmt.lhs);
                 let field_name = self.text(lhs_tok).to_owned();
@@ -2263,7 +2535,7 @@ impl<'a> Analyzer<'a> {
                         self.units.ast().token_span(lhs_tok),
                         format!("cannot assign to `{field_name}`: not a ledger field"),
                     ));
-                    return None;
+                    return;
                 };
                 let field = &self.ledger_fields[field_id.0 as usize];
                 let Some(expected_val_ty) = field.adt.cell_type().cloned() else {
@@ -2275,10 +2547,12 @@ impl<'a> Analyzer<'a> {
                             field.adt.name()
                         ),
                     ));
-                    return None;
+                    return;
                 };
                 let target_adt = field.adt.clone();
-                let mut rhs = self.check_expr(stmt.rhs, scope, Some(&expected_val_ty))?;
+                let Some(mut rhs) = self.check_expr(stmt.rhs, scope, Some(&expected_val_ty)) else {
+                    return;
+                };
                 if !self.coerce_or_check(&mut rhs, &expected_val_ty) {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
@@ -2289,9 +2563,9 @@ impl<'a> Analyzer<'a> {
                             self.format_type(&expected_val_ty)
                         ),
                     ));
-                    return None;
+                    return;
                 }
-                Some(Stmt::Expr(Expr {
+                out.push(Stmt::Expr(Expr {
                     kind: ExprKind::LedgerCall {
                         field: field_id,
                         key_path: Vec::new(),
@@ -2301,16 +2575,20 @@ impl<'a> Analyzer<'a> {
                     },
                     ty: Type::unit(),
                     span: assign_span,
-                }))
+                }));
             }
             NodeTag::ExprStmt => {
-                let expr = self.check_expr(NodeIndex(data.lhs), scope, None)?;
-                Some(Stmt::Expr(expr))
+                if let Some(expr) = self.check_expr(NodeIndex(data.lhs), scope, None) {
+                    out.push(Stmt::Expr(expr));
+                }
             }
             NodeTag::ReturnStmt => {
                 let span = self.units.ast().node_span(node);
                 let value = if let Some(expr_node) = NodeIndex(data.lhs).into_option() {
-                    let mut expr = self.check_expr(expr_node, scope, Some(expected_ret))?;
+                    let Some(mut expr) = self.check_expr(expr_node, scope, Some(expected_ret))
+                    else {
+                        return;
+                    };
                     if !self.coerce_or_check(&mut expr, expected_ret) {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.units.file(),
@@ -2336,9 +2614,9 @@ impl<'a> Analyzer<'a> {
                     }
                     None
                 };
-                Some(Stmt::Return { value, span })
+                out.push(Stmt::Return { value, span });
             }
-            _ => None,
+            _ => {}
         }
     }
 
@@ -2352,9 +2630,28 @@ impl<'a> Analyzer<'a> {
                     expr.ty = Type::Field;
                     return true;
                 }
-                Type::Uint(bits) if *bits < 128 && *v < (1u128 << bits) => {
+                Type::Uint(bits) if *bits >= 128 || *v < (1u128 << bits) => {
                     expr.ty = expected.clone();
                     return true;
+                }
+                _ => {}
+            }
+        }
+        if let Type::Vector(expected_len, elem_ty) = expected {
+            match &mut expr.kind {
+                ExprKind::Tuple(elems) if elems.len() == *expected_len as usize => {
+                    if elems.iter_mut().all(|e| self.coerce_or_check(e, elem_ty)) {
+                        let moved = std::mem::take(elems);
+                        expr.kind = ExprKind::Vector(moved);
+                        expr.ty = expected.clone();
+                        return true;
+                    }
+                }
+                ExprKind::Block { tail, .. } => {
+                    if self.coerce_or_check(tail, expected) {
+                        expr.ty = expected.clone();
+                        return true;
+                    }
                 }
                 _ => {}
             }
@@ -2385,7 +2682,7 @@ impl<'a> Analyzer<'a> {
                     }
                 };
                 let ty = match expected {
-                    Some(Type::Uint(bits)) if *bits < 128 && val < (1u128 << bits) => {
+                    Some(Type::Uint(bits)) if *bits >= 128 || val < (1u128 << bits) => {
                         Type::Uint(*bits)
                     }
                     _ => Type::Uint(64),
@@ -2393,6 +2690,16 @@ impl<'a> Analyzer<'a> {
                 Some(Expr {
                     kind: ExprKind::IntLit(val),
                     ty,
+                    span,
+                })
+            }
+            NodeTag::StringLitExpr => {
+                let tok = self.units.ast().node_main_token(node);
+                let bytes = unquote_string(self.text(tok)).into_bytes();
+                let len = bytes.len() as u32;
+                Some(Expr {
+                    kind: ExprKind::BytesLit(bytes),
+                    ty: Type::Bytes(len),
                     span,
                 })
             }
@@ -2636,8 +2943,52 @@ impl<'a> Analyzer<'a> {
                     .ast()
                     .extra_nodes(lit.fields_start, lit.fields_end)
                     .collect();
+                let mut prelude: Vec<Stmt> = Vec::new();
                 let mut provided: HashMap<String, Expr> = HashMap::new();
                 for fnode in lit_nodes {
+                    if self.units.ast().node_tag(fnode) == NodeTag::SpreadExpr {
+                        let sdata = self.units.ast().node_data(fnode);
+                        let base_expr = self.check_expr(NodeIndex(sdata.lhs), scope, Some(&ty))?;
+                        if base_expr.ty != ty {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                base_expr.span,
+                                format!(
+                                    "struct spread expects `{}`, found `{}`",
+                                    self.format_type(&ty),
+                                    self.format_type(&base_expr.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        let tmp = self.alloc_local();
+                        let bspan = base_expr.span;
+                        prelude.push(Stmt::Const {
+                            local: tmp,
+                            name: format!("__spread_{}", tmp.0),
+                            ty: ty.clone(),
+                            init: base_expr,
+                            span: bspan,
+                        });
+                        for (fname, fty) in &expected_fields {
+                            provided.insert(
+                                fname.clone(),
+                                Expr {
+                                    kind: ExprKind::FieldAccess {
+                                        base: Box::new(Expr {
+                                            kind: ExprKind::LocalRef(tmp),
+                                            ty: ty.clone(),
+                                            span: bspan,
+                                        }),
+                                        field: fname.clone(),
+                                    },
+                                    ty: fty.clone(),
+                                    span: bspan,
+                                },
+                            );
+                        }
+                        continue;
+                    }
                     let sf = self.units.ast().struct_lit_field(fnode);
                     let fname = self.text(sf.name_token).to_owned();
                     let Some((_, expected_ty)) = expected_fields.iter().find(|(n, _)| *n == fname)
@@ -2679,15 +3030,278 @@ impl<'a> Analyzer<'a> {
                     };
                     ordered.push((fname, val));
                 }
-                Some(Expr {
+                let struct_expr = Expr {
                     kind: ExprKind::StructLit { fields: ordered },
-                    ty,
+                    ty: ty.clone(),
                     span,
-                })
+                };
+                if prelude.is_empty() {
+                    Some(struct_expr)
+                } else {
+                    Some(Expr {
+                        kind: ExprKind::Block {
+                            stmts: prelude,
+                            tail: Box::new(struct_expr),
+                        },
+                        ty,
+                        span,
+                    })
+                }
+            }
+            NodeTag::BytesLitExpr => {
+                let lit = self.units.ast().bytes_lit_expr(node);
+                let elem_nodes: Vec<_> = self
+                    .units
+                    .ast()
+                    .extra_nodes(lit.elems_start, lit.elems_end)
+                    .collect();
+                let mut prelude: Vec<Stmt> = Vec::new();
+                let mut byte_exprs: Vec<Expr> = Vec::new();
+                for enode in elem_nodes {
+                    if self.units.ast().node_tag(enode) == NodeTag::SpreadExpr {
+                        let sdata = self.units.ast().node_data(enode);
+                        let inner = self.check_expr(NodeIndex(sdata.lhs), scope, None)?;
+                        let inner_span = inner.span;
+                        let inner_u = self.underlying_type(&inner.ty).clone();
+                        match inner_u {
+                            Type::Bytes(k) => {
+                                let vec_ty = Type::Vector(k, Box::new(Type::Uint(8)));
+                                let tmp = self.alloc_local();
+                                prelude.push(Stmt::Const {
+                                    local: tmp,
+                                    name: format!("__bspread_{}", tmp.0),
+                                    ty: vec_ty.clone(),
+                                    init: Expr {
+                                        kind: ExprKind::Cast {
+                                            expr: Box::new(inner),
+                                            target: vec_ty.clone(),
+                                        },
+                                        ty: vec_ty.clone(),
+                                        span: inner_span,
+                                    },
+                                    span: inner_span,
+                                });
+                                for i in 0..k {
+                                    byte_exprs.push(Expr {
+                                        kind: ExprKind::Index {
+                                            base: Box::new(Expr {
+                                                kind: ExprKind::LocalRef(tmp),
+                                                ty: vec_ty.clone(),
+                                                span: inner_span,
+                                            }),
+                                            index: Box::new(Expr {
+                                                kind: ExprKind::IntLit(i as u128),
+                                                ty: Type::Uint(64),
+                                                span: inner_span,
+                                            }),
+                                        },
+                                        ty: Type::Uint(8),
+                                        span: inner_span,
+                                    });
+                                }
+                            }
+                            Type::Vector(k, ety)
+                                if *self.underlying_type(&ety) == Type::Uint(8) =>
+                            {
+                                let vec_ty = inner.ty.clone();
+                                let tmp = self.alloc_local();
+                                prelude.push(Stmt::Const {
+                                    local: tmp,
+                                    name: format!("__bspread_{}", tmp.0),
+                                    ty: vec_ty.clone(),
+                                    init: inner,
+                                    span: inner_span,
+                                });
+                                for i in 0..k {
+                                    byte_exprs.push(Expr {
+                                        kind: ExprKind::Index {
+                                            base: Box::new(Expr {
+                                                kind: ExprKind::LocalRef(tmp),
+                                                ty: vec_ty.clone(),
+                                                span: inner_span,
+                                            }),
+                                            index: Box::new(Expr {
+                                                kind: ExprKind::IntLit(i as u128),
+                                                ty: Type::Uint(64),
+                                                span: inner_span,
+                                            }),
+                                        },
+                                        ty: Type::Uint(8),
+                                        span: inner_span,
+                                    });
+                                }
+                            }
+                            other => {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    inner_span,
+                                    format!(
+                                        "spread inside `Bytes[...]` expects `Bytes<N>` or `Vector<N, Uint<8>>`, found `{}`",
+                                        self.format_type(&other)
+                                    ),
+                                ));
+                                return None;
+                            }
+                        }
+                    } else {
+                        let mut e = self.check_expr(enode, scope, Some(&Type::Uint(8)))?;
+                        if !self.coerce_or_check(&mut e, &Type::Uint(8)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                e.span,
+                                format!(
+                                    "`Bytes[...]` element must be `Uint<8>`, found `{}`",
+                                    self.format_type(&e.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        byte_exprs.push(e);
+                    }
+                }
+                let ty = Type::Bytes(byte_exprs.len() as u32);
+                let pack = Expr {
+                    kind: ExprKind::BytesPack(byte_exprs),
+                    ty: ty.clone(),
+                    span,
+                };
+                if prelude.is_empty() {
+                    Some(pack)
+                } else {
+                    Some(Expr {
+                        kind: ExprKind::Block {
+                            stmts: prelude,
+                            tail: Box::new(pack),
+                        },
+                        ty,
+                        span,
+                    })
+                }
             }
             NodeTag::TupleExpr => {
                 let data = self.units.ast().node_data(node);
                 let elem_nodes: Vec<_> = self.units.ast().extra_nodes(data.lhs, data.rhs).collect();
+                let has_spread = elem_nodes
+                    .iter()
+                    .any(|&n| self.units.ast().node_tag(n) == NodeTag::SpreadExpr);
+                if has_spread {
+                    let expected_elem_ty = match expected {
+                        Some(Type::Vector(_, elem_ty)) => Some(elem_ty.as_ref()),
+                        _ => None,
+                    };
+                    let mut prelude: Vec<Stmt> = Vec::new();
+                    let mut flat: Vec<Expr> = Vec::new();
+                    let mut tys: Vec<Type> = Vec::new();
+                    for enode in elem_nodes {
+                        if self.units.ast().node_tag(enode) == NodeTag::SpreadExpr {
+                            let sdata = self.units.ast().node_data(enode);
+                            let inner = self.check_expr(NodeIndex(sdata.lhs), scope, None)?;
+                            let inner_span = inner.span;
+                            let inner_ty = inner.ty.clone();
+                            let inner_u = self.underlying_type(&inner_ty).clone();
+                            let spread_tys: Vec<Type> = match inner_u {
+                                Type::Vector(k, ety) => vec![(*ety).clone(); k as usize],
+                                Type::Tuple(etys) => etys,
+                                other => {
+                                    self.diagnostics.push(CompactDiagnostic::error(
+                                        self.units.file(),
+                                        inner_span,
+                                        format!(
+                                            "cannot spread type `{}` inside `[...]`; expected `Vector` or tuple",
+                                            self.format_type(&other)
+                                        ),
+                                    ));
+                                    return None;
+                                }
+                            };
+                            let tmp = self.alloc_local();
+                            prelude.push(Stmt::Const {
+                                local: tmp,
+                                name: format!("__spread_{}", tmp.0),
+                                ty: inner_ty.clone(),
+                                init: inner,
+                                span: inner_span,
+                            });
+                            for (i, ety) in spread_tys.into_iter().enumerate() {
+                                tys.push(ety.clone());
+                                flat.push(Expr {
+                                    kind: ExprKind::Index {
+                                        base: Box::new(Expr {
+                                            kind: ExprKind::LocalRef(tmp),
+                                            ty: inner_ty.clone(),
+                                            span: inner_span,
+                                        }),
+                                        index: Box::new(Expr {
+                                            kind: ExprKind::IntLit(i as u128),
+                                            ty: Type::Uint(64),
+                                            span: inner_span,
+                                        }),
+                                    },
+                                    ty: ety,
+                                    span: inner_span,
+                                });
+                            }
+                        } else {
+                            let e = self.check_expr(enode, scope, expected_elem_ty)?;
+                            tys.push(e.ty.clone());
+                            flat.push(e);
+                        }
+                    }
+                    if let Some(Type::Vector(expected_len, elem_ty)) = expected {
+                        if flat.len() != *expected_len as usize {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                span,
+                                format!(
+                                    "expected `Vector` of length {expected_len}, found {} element(s)",
+                                    flat.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        for e in &mut flat {
+                            if !self.coerce_or_check(e, elem_ty) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    e.span,
+                                    format!(
+                                        "vector element type mismatch: expected `{}`, found `{}`",
+                                        self.format_type(elem_ty),
+                                        self.format_type(&e.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                        }
+                        let ty = Type::Vector(*expected_len, elem_ty.clone());
+                        return Some(Expr {
+                            kind: ExprKind::Block {
+                                stmts: prelude,
+                                tail: Box::new(Expr {
+                                    kind: ExprKind::Vector(flat),
+                                    ty: ty.clone(),
+                                    span,
+                                }),
+                            },
+                            ty,
+                            span,
+                        });
+                    }
+                    let ty = Type::Tuple(tys);
+                    return Some(Expr {
+                        kind: ExprKind::Block {
+                            stmts: prelude,
+                            tail: Box::new(Expr {
+                                kind: ExprKind::Tuple(flat),
+                                ty: ty.clone(),
+                                span,
+                            }),
+                        },
+                        ty,
+                        span,
+                    });
+                }
+
                 if let Some(Type::Vector(expected_len, elem_ty)) = expected {
                     if elem_nodes.len() != *expected_len as usize {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -2951,6 +3565,20 @@ impl<'a> Analyzer<'a> {
                             | (Type::Boolean, Type::Field)
                             | (Type::Enum(_), Type::Field)
                             | (Type::Field, Type::Field)
+                    )
+                    || matches!(
+                        (src_u, dst_u),
+                        (Type::Bytes(n), Type::Field) if *n <= 31
+                    )
+                    || matches!(
+                        (src_u, dst_u),
+                        (Type::Bytes(n), Type::Vector(m, elem))
+                            if n == m && *self.underlying_type(elem) == Type::Uint(8)
+                    )
+                    || matches!(
+                        (src_u, dst_u),
+                        (Type::Vector(n, elem), Type::Bytes(m))
+                            if n == m && *self.underlying_type(elem) == Type::Uint(8)
                     );
                 if !valid {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -3059,12 +3687,78 @@ impl<'a> Analyzer<'a> {
                     .extra_nodes(call.args_start, call.args_end)
                     .collect();
 
-                // 1. Direct identifier call: `pad(...)`, circuit call, or witness call.
+                // 1. Direct identifier call: builtins (`pad`, `map`, `fold`, `degradeToTransient`,
+                // `upgradeFromTransient`), circuit call, or witness call.
                 if self.units.ast().node_tag(call.callee) == NodeTag::IdentExpr {
                     let callee_tok = self.units.ast().node_main_token(call.callee);
                     let callee_name = self.text(callee_tok).to_owned();
-                    if callee_name == "pad" {
-                        return self.check_pad_call(&arg_nodes, span);
+                    match callee_name.as_str() {
+                        "pad" => return self.check_pad_call(&arg_nodes, span),
+                        "map" => return self.check_map_call(&arg_nodes, span, scope),
+                        "fold" => return self.check_fold_call(&arg_nodes, span, scope),
+                        "degradeToTransient" => {
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`degradeToTransient` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let expected = Type::Bytes(32);
+                            let mut arg = self.check_expr(arg_nodes[0], scope, Some(&expected))?;
+                            if !self.coerce_or_check(&mut arg, &expected) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    arg.span,
+                                    format!(
+                                        "`degradeToTransient` expects `Bytes<32>`, found `{}`",
+                                        self.format_type(&arg.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::DegradeToTransient(Box::new(arg)),
+                                ty: Type::Field,
+                                span,
+                            });
+                        }
+                        "upgradeFromTransient" => {
+                            if arg_nodes.len() != 1 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`upgradeFromTransient` expects 1 argument, found {}",
+                                        arg_nodes.len()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            let expected = Type::Field;
+                            let mut arg = self.check_expr(arg_nodes[0], scope, Some(&expected))?;
+                            if !self.coerce_or_check(&mut arg, &expected) {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    arg.span,
+                                    format!(
+                                        "`upgradeFromTransient` expects `Field`, found `{}`",
+                                        self.format_type(&arg.ty)
+                                    ),
+                                ));
+                                return None;
+                            }
+                            return Some(Expr {
+                                kind: ExprKind::UpgradeFromTransient(Box::new(arg)),
+                                ty: Type::Bytes(32),
+                                span,
+                            });
+                        }
+                        _ => {}
                     }
                     if let Some(&cid) = self.scope.circuits.get(&callee_name) {
                         return self.check_circuit_call(cid, &arg_nodes, span, scope);
@@ -3184,6 +3878,511 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn eval_higher_order_call(
+        &mut self,
+        fn_node: NodeIndex,
+        arg_exprs: Vec<Expr>,
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        match self.units.ast().node_tag(fn_node) {
+            NodeTag::IdentExpr => {
+                let tok = self.units.ast().node_main_token(fn_node);
+                let name = self.text(tok).to_owned();
+                let Some(&cid) = self.scope.circuits.get(&name) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        self.units.ast().token_span(tok),
+                        format!("unknown circuit `{name}` passed to higher-order builtin"),
+                    ));
+                    return None;
+                };
+                let expected_params: Vec<Type> = self.circuit_sigs[cid.0 as usize]
+                    .params
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect();
+                let ret_type = self.circuit_sigs[cid.0 as usize].ret_type.clone();
+                if arg_exprs.len() != expected_params.len() {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "circuit `{name}` expects {} argument(s), found {}",
+                            expected_params.len(),
+                            arg_exprs.len()
+                        ),
+                    ));
+                    return None;
+                }
+                let mut coerced = Vec::with_capacity(arg_exprs.len());
+                for (mut arg, expected_ty) in arg_exprs.into_iter().zip(&expected_params) {
+                    if !self.coerce_or_check(&mut arg, expected_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            arg.span,
+                            format!(
+                                "argument type mismatch calling `{name}`: expected `{}`, found `{}`",
+                                self.format_type(expected_ty),
+                                self.format_type(&arg.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    coerced.push(arg);
+                }
+                Some(Expr {
+                    kind: ExprKind::CircuitCall {
+                        circuit: cid,
+                        args: coerced,
+                    },
+                    ty: ret_type,
+                    span: call_span,
+                })
+            }
+            NodeTag::ArrowExpr => {
+                let arrow = self.units.ast().arrow_expr(fn_node);
+                let param_nodes: Vec<_> = self
+                    .units
+                    .ast()
+                    .extra_nodes(arrow.params_start, arrow.params_end)
+                    .collect();
+                if param_nodes.len() != arg_exprs.len() {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "arrow circuit expects {} argument(s), found {}",
+                            param_nodes.len(),
+                            arg_exprs.len()
+                        ),
+                    ));
+                    return None;
+                }
+                let annotated_ret = match arrow.ret_type {
+                    Some(rt) => Some(self.resolve_type(rt)?),
+                    None => None,
+                };
+                let mut inner_scope = scope.clone();
+                let mut stmts = Vec::with_capacity(param_nodes.len());
+                for (pnode, mut arg) in param_nodes.into_iter().zip(arg_exprs) {
+                    let p = self.units.ast().param(pnode);
+                    let pname = self.text(p.name_token).to_owned();
+                    let pty = if p.type_node.is_some() {
+                        let expected_ty = self.resolve_type(p.type_node)?;
+                        if !self.coerce_or_check(&mut arg, &expected_ty) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                arg.span,
+                                format!(
+                                    "arrow parameter `{pname}` expects `{}`, found `{}`",
+                                    self.format_type(&expected_ty),
+                                    self.format_type(&arg.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        expected_ty
+                    } else {
+                        arg.ty.clone()
+                    };
+                    let local = self.alloc_local();
+                    let pspan = self.units.ast().node_span(pnode);
+                    inner_scope.insert(pname.clone(), ValueBinding::Local(local, pty.clone()));
+                    stmts.push(Stmt::Const {
+                        local,
+                        name: pname,
+                        ty: pty,
+                        init: arg,
+                        span: pspan,
+                    });
+                }
+
+                if self.units.ast().node_tag(arrow.body) == NodeTag::Block {
+                    let block_data = self.units.ast().node_data(arrow.body);
+                    let stmt_nodes: Vec<_> = self
+                        .units
+                        .ast()
+                        .extra_nodes(block_data.lhs, block_data.rhs)
+                        .collect();
+                    let mut body_stmts = Vec::new();
+                    let mut ret_val: Option<Expr> = None;
+                    for (i, snode) in stmt_nodes.iter().copied().enumerate() {
+                        if self.units.ast().node_tag(snode) == NodeTag::ReturnStmt
+                            && i + 1 == stmt_nodes.len()
+                        {
+                            let rdata = self.units.ast().node_data(snode);
+                            if let Some(enode) = NodeIndex(rdata.lhs).into_option() {
+                                let mut expr =
+                                    self.check_expr(enode, &inner_scope, annotated_ret.as_ref())?;
+                                if let Some(ref rt) = annotated_ret {
+                                    if !self.coerce_or_check(&mut expr, rt) {
+                                        self.diagnostics.push(CompactDiagnostic::error(
+                                            self.units.file(),
+                                            expr.span,
+                                            format!(
+                                                "arrow return type mismatch: expected `{}`, found `{}`",
+                                                self.format_type(rt),
+                                                self.format_type(&expr.ty)
+                                            ),
+                                        ));
+                                        return None;
+                                    }
+                                    expr.ty = rt.clone();
+                                }
+                                ret_val = Some(expr);
+                            }
+                        } else {
+                            let expected_stmt_ret =
+                                annotated_ret.clone().unwrap_or_else(Type::unit);
+                            self.check_stmt(
+                                snode,
+                                &mut inner_scope,
+                                &expected_stmt_ret,
+                                &mut body_stmts,
+                            );
+                        }
+                    }
+                    stmts.extend(body_stmts);
+                    let tail = ret_val.unwrap_or_else(|| Expr {
+                        kind: ExprKind::Tuple(Vec::new()),
+                        ty: Type::unit(),
+                        span: call_span,
+                    });
+                    let ty = tail.ty.clone();
+                    Some(Expr {
+                        kind: ExprKind::Block {
+                            stmts,
+                            tail: Box::new(tail),
+                        },
+                        ty,
+                        span: call_span,
+                    })
+                } else {
+                    let mut tail =
+                        self.check_expr(arrow.body, &inner_scope, annotated_ret.as_ref())?;
+                    if let Some(ref rt) = annotated_ret {
+                        if !self.coerce_or_check(&mut tail, rt) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                tail.span,
+                                format!(
+                                    "arrow return type mismatch: expected `{}`, found `{}`",
+                                    self.format_type(rt),
+                                    self.format_type(&tail.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        tail.ty = rt.clone();
+                    }
+                    let ty = tail.ty.clone();
+                    Some(Expr {
+                        kind: ExprKind::Block {
+                            stmts,
+                            tail: Box::new(tail),
+                        },
+                        ty,
+                        span: call_span,
+                    })
+                }
+            }
+            _ => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    self.units.ast().node_span(fn_node),
+                    "expected circuit name or arrow expression `(...) => ...`",
+                ));
+                None
+            }
+        }
+    }
+
+    fn extract_vector_arg(
+        &mut self,
+        node: NodeIndex,
+        scope: &HashMap<String, ValueBinding>,
+        builtin: &str,
+    ) -> Option<(Expr, u32, Type)> {
+        let mut expr = self.check_expr(node, scope, None)?;
+        let u = self.underlying_type(&expr.ty).clone();
+        match u {
+            Type::Vector(len, elem) => Some((expr, len, (*elem).clone())),
+            Type::Tuple(elems) if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) => {
+                let len = elems.len() as u32;
+                let elem = elems[0].clone();
+                let vec_ty = Type::Vector(len, Box::new(elem.clone()));
+                let _ = self.coerce_or_check(&mut expr, &vec_ty);
+                Some((expr, len, elem))
+            }
+            other => {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    expr.span,
+                    format!(
+                        "`{builtin}` vector argument must have `Vector<N, T>` type, found `{}`",
+                        self.format_type(&other)
+                    ),
+                ));
+                None
+            }
+        }
+    }
+
+    fn check_map_call(
+        &mut self,
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        if arg_nodes.len() < 2 {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                "`map(f, v1, ...)` expects a function and at least one `Vector` argument",
+            ));
+            return None;
+        }
+        let fn_node = arg_nodes[0];
+        let mut prelude = Vec::new();
+        let mut vec_locals: Vec<(LocalId, Type, Type, Span)> = Vec::new();
+        let mut expected_len: Option<u32> = None;
+
+        for &vnode in &arg_nodes[1..] {
+            let (vexpr, len, elem_ty) = self.extract_vector_arg(vnode, scope, "map")?;
+            if let Some(prev) = expected_len {
+                if len != prev {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        vexpr.span,
+                        format!(
+                            "`map` vector length mismatch: expected length {prev}, found {len}"
+                        ),
+                    ));
+                    return None;
+                }
+            } else {
+                expected_len = Some(len);
+            }
+            let tmp = self.alloc_local();
+            let vty = vexpr.ty.clone();
+            let vspan = vexpr.span;
+            prelude.push(Stmt::Const {
+                local: tmp,
+                name: format!("__map_v_{}", tmp.0),
+                ty: vty.clone(),
+                init: vexpr,
+                span: vspan,
+            });
+            vec_locals.push((tmp, vty, elem_ty, vspan));
+        }
+
+        let len = expected_len.unwrap_or(0);
+        let mut results = Vec::with_capacity(len as usize);
+        let mut out_elem_ty: Option<Type> = None;
+        for i in 0..len {
+            let call_args: Vec<Expr> = vec_locals
+                .iter()
+                .map(|(lid, vty, ety, vspan)| Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(Expr {
+                            kind: ExprKind::LocalRef(*lid),
+                            ty: vty.clone(),
+                            span: *vspan,
+                        }),
+                        index: Box::new(Expr {
+                            kind: ExprKind::IntLit(i as u128),
+                            ty: Type::Uint(64),
+                            span: *vspan,
+                        }),
+                    },
+                    ty: ety.clone(),
+                    span: *vspan,
+                })
+                .collect();
+            let res = self.eval_higher_order_call(fn_node, call_args, call_span, scope)?;
+            if let Some(ref prev_ty) = out_elem_ty {
+                if res.ty != *prev_ty {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        res.span,
+                        format!(
+                            "`map` element type mismatch: expected `{}`, found `{}`",
+                            self.format_type(prev_ty),
+                            self.format_type(&res.ty)
+                        ),
+                    ));
+                    return None;
+                }
+            } else {
+                out_elem_ty = Some(res.ty.clone());
+            }
+            results.push(res);
+        }
+
+        let elem_ty = out_elem_ty.unwrap_or_else(Type::unit);
+        let vec_ty = Type::Vector(len, Box::new(elem_ty));
+        let tail = Expr {
+            kind: ExprKind::Vector(results),
+            ty: vec_ty.clone(),
+            span: call_span,
+        };
+        Some(Expr {
+            kind: ExprKind::Block {
+                stmts: prelude,
+                tail: Box::new(tail),
+            },
+            ty: vec_ty,
+            span: call_span,
+        })
+    }
+
+    fn check_fold_call(
+        &mut self,
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        if arg_nodes.len() < 3 {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                "`fold(f, init, v1, ...)` expects a function, an initial accumulator, and at least one `Vector`",
+            ));
+            return None;
+        }
+        let fn_node = arg_nodes[0];
+        let expected_init_ty: Option<Type> = match self.units.ast().node_tag(fn_node) {
+            NodeTag::IdentExpr => {
+                let name = self
+                    .text(self.units.ast().node_main_token(fn_node))
+                    .to_owned();
+                self.scope
+                    .circuits
+                    .get(&name)
+                    .and_then(|&cid| self.circuit_sigs[cid.0 as usize].params.first())
+                    .map(|p| p.ty.clone())
+            }
+            NodeTag::ArrowExpr => {
+                let arrow = self.units.ast().arrow_expr(fn_node);
+                let first_param = self
+                    .units
+                    .ast()
+                    .extra_nodes(arrow.params_start, arrow.params_end)
+                    .next();
+                first_param.and_then(|pnode| {
+                    let p = self.units.ast().param(pnode);
+                    if p.type_node.is_some() {
+                        self.resolve_type(p.type_node)
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
+        let mut init_expr = self.check_expr(arg_nodes[1], scope, expected_init_ty.as_ref())?;
+        if let Some(ref exp_ty) = expected_init_ty
+            && self.coerce_or_check(&mut init_expr, exp_ty)
+        {
+            init_expr.ty = exp_ty.clone();
+        }
+        let mut prelude = Vec::new();
+        let mut acc_local = self.alloc_local();
+        let mut acc_ty = init_expr.ty.clone();
+        let init_span = init_expr.span;
+        prelude.push(Stmt::Const {
+            local: acc_local,
+            name: format!("__fold_acc_{}", acc_local.0),
+            ty: acc_ty.clone(),
+            init: init_expr,
+            span: init_span,
+        });
+
+        let mut vec_locals: Vec<(LocalId, Type, Type, Span)> = Vec::new();
+        let mut expected_len: Option<u32> = None;
+        for &vnode in &arg_nodes[2..] {
+            let (vexpr, len, elem_ty) = self.extract_vector_arg(vnode, scope, "fold")?;
+            if let Some(prev) = expected_len {
+                if len != prev {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        vexpr.span,
+                        format!(
+                            "`fold` vector length mismatch: expected length {prev}, found {len}"
+                        ),
+                    ));
+                    return None;
+                }
+            } else {
+                expected_len = Some(len);
+            }
+            let tmp = self.alloc_local();
+            let vty = vexpr.ty.clone();
+            let vspan = vexpr.span;
+            prelude.push(Stmt::Const {
+                local: tmp,
+                name: format!("__fold_v_{}", tmp.0),
+                ty: vty.clone(),
+                init: vexpr,
+                span: vspan,
+            });
+            vec_locals.push((tmp, vty, elem_ty, vspan));
+        }
+
+        let len = expected_len.unwrap_or(0);
+        for i in 0..len {
+            let mut call_args = Vec::with_capacity(1 + vec_locals.len());
+            call_args.push(Expr {
+                kind: ExprKind::LocalRef(acc_local),
+                ty: acc_ty.clone(),
+                span: call_span,
+            });
+            for (lid, vty, ety, vspan) in &vec_locals {
+                call_args.push(Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(Expr {
+                            kind: ExprKind::LocalRef(*lid),
+                            ty: vty.clone(),
+                            span: *vspan,
+                        }),
+                        index: Box::new(Expr {
+                            kind: ExprKind::IntLit(i as u128),
+                            ty: Type::Uint(64),
+                            span: *vspan,
+                        }),
+                    },
+                    ty: ety.clone(),
+                    span: *vspan,
+                });
+            }
+            let step = self.eval_higher_order_call(fn_node, call_args, call_span, scope)?;
+            acc_ty = step.ty.clone();
+            acc_local = self.alloc_local();
+            prelude.push(Stmt::Const {
+                local: acc_local,
+                name: format!("__fold_acc_{}", acc_local.0),
+                ty: acc_ty.clone(),
+                init: step,
+                span: call_span,
+            });
+        }
+
+        let tail = Expr {
+            kind: ExprKind::LocalRef(acc_local),
+            ty: acc_ty.clone(),
+            span: call_span,
+        };
+        Some(Expr {
+            kind: ExprKind::Block {
+                stmts: prelude,
+                tail: Box::new(tail),
+            },
+            ty: acc_ty,
+            span: call_span,
+        })
+    }
+
     fn check_generic_builtin(
         &mut self,
         name: &str,
@@ -3239,6 +4438,106 @@ impl<'a> Analyzer<'a> {
                     span: call_span,
                 })
             }
+            "left" => {
+                if targ_nodes.len() != 2 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`left<A, B>(value)` expects 2 type arguments and 1 value argument",
+                    ));
+                    return None;
+                }
+                let left_ty = self.resolve_type(targ_nodes[0])?;
+                let right_ty = self.resolve_type(targ_nodes[1])?;
+                let mut val = self.check_expr(arg_nodes[0], scope, Some(&left_ty))?;
+                if !self.coerce_or_check(&mut val, &left_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        val.span,
+                        format!(
+                            "`left` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&left_ty),
+                            self.format_type(&val.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::StructLit {
+                        fields: vec![
+                            (
+                                "is_left".to_owned(),
+                                Expr {
+                                    kind: ExprKind::BoolLit(true),
+                                    ty: Type::Boolean,
+                                    span: call_span,
+                                },
+                            ),
+                            ("left".to_owned(), val),
+                            (
+                                "right".to_owned(),
+                                Expr {
+                                    kind: ExprKind::Default(right_ty.clone()),
+                                    ty: right_ty.clone(),
+                                    span: call_span,
+                                },
+                            ),
+                        ],
+                    },
+                    ty: Type::Either(Box::new(left_ty), Box::new(right_ty)),
+                    span: call_span,
+                })
+            }
+            "right" => {
+                if targ_nodes.len() != 2 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`right<A, B>(value)` expects 2 type arguments and 1 value argument",
+                    ));
+                    return None;
+                }
+                let left_ty = self.resolve_type(targ_nodes[0])?;
+                let right_ty = self.resolve_type(targ_nodes[1])?;
+                let mut val = self.check_expr(arg_nodes[0], scope, Some(&right_ty))?;
+                if !self.coerce_or_check(&mut val, &right_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        val.span,
+                        format!(
+                            "`right` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&right_ty),
+                            self.format_type(&val.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::StructLit {
+                        fields: vec![
+                            (
+                                "is_left".to_owned(),
+                                Expr {
+                                    kind: ExprKind::BoolLit(false),
+                                    ty: Type::Boolean,
+                                    span: call_span,
+                                },
+                            ),
+                            (
+                                "left".to_owned(),
+                                Expr {
+                                    kind: ExprKind::Default(left_ty.clone()),
+                                    ty: left_ty.clone(),
+                                    span: call_span,
+                                },
+                            ),
+                            ("right".to_owned(), val),
+                        ],
+                    },
+                    ty: Type::Either(Box::new(left_ty), Box::new(right_ty)),
+                    span: call_span,
+                })
+            }
             "persistentHash" => {
                 if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -3268,6 +4567,130 @@ impl<'a> Analyzer<'a> {
                         arg: Box::new(arg),
                     },
                     ty: Type::Bytes(32),
+                    span: call_span,
+                })
+            }
+            "transientHash" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`transientHash<T>(value)` expects 1 type argument and 1 value argument",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut arg = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut arg, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        arg.span,
+                        format!(
+                            "`transientHash` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&arg.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::TransientHash {
+                        input_ty,
+                        arg: Box::new(arg),
+                    },
+                    ty: Type::Field,
+                    span: call_span,
+                })
+            }
+            "persistentCommit" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 2 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`persistentCommit<T>(value, rand)` expects 1 type argument and 2 value arguments",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut value = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut value, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        value.span,
+                        format!(
+                            "`persistentCommit` value mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&value.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                let rand_ty = Type::Bytes(32);
+                let mut rand = self.check_expr(arg_nodes[1], scope, Some(&rand_ty))?;
+                if !self.coerce_or_check(&mut rand, &rand_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        rand.span,
+                        format!(
+                            "`persistentCommit` randomness must be `Bytes<32>`, found `{}`",
+                            self.format_type(&rand.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::PersistentCommit {
+                        input_ty,
+                        value: Box::new(value),
+                        rand: Box::new(rand),
+                    },
+                    ty: Type::Bytes(32),
+                    span: call_span,
+                })
+            }
+            "transientCommit" => {
+                if targ_nodes.len() != 1 || arg_nodes.len() != 2 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`transientCommit<T>(value, rand)` expects 1 type argument and 2 value arguments",
+                    ));
+                    return None;
+                }
+                let input_ty = self.resolve_type(targ_nodes[0])?;
+                let mut value = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut value, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        value.span,
+                        format!(
+                            "`transientCommit` value mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&value.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                let rand_ty = Type::Field;
+                let mut rand = self.check_expr(arg_nodes[1], scope, Some(&rand_ty))?;
+                if !self.coerce_or_check(&mut rand, &rand_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        rand.span,
+                        format!(
+                            "`transientCommit` randomness must be `Field`, found `{}`",
+                            self.format_type(&rand.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::TransientCommit {
+                        input_ty,
+                        value: Box::new(value),
+                        rand: Box::new(rand),
+                    },
+                    ty: Type::Field,
                     span: call_span,
                 })
             }
@@ -4234,7 +5657,7 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
             }
             (l, w)
         }
-        ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
+        ExprKind::Tuple(elems) | ExprKind::Vector(elems) | ExprKind::BytesPack(elems) => {
             let (mut l, mut w) = (false, false);
             for e in elems {
                 let (el, ew) = expr_effects(e, calls);
@@ -4243,15 +5666,29 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
             }
             (l, w)
         }
+        ExprKind::Block { stmts, tail } => {
+            let (l1, w1) = stmts_effects(stmts, calls);
+            let (l2, w2) = expr_effects(tail, calls);
+            (l1 | l2, w1 | w2)
+        }
         ExprKind::Unary { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::TransientHash { arg: operand, .. }
+        | ExprKind::DegradeToTransient(operand)
+        | ExprKind::UpgradeFromTransient(operand)
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_effects(operand, calls),
+        ExprKind::PersistentCommit { value, rand, .. }
+        | ExprKind::TransientCommit { value, rand, .. } => {
+            let (l1, w1) = expr_effects(value, calls);
+            let (l2, w2) = expr_effects(rand, calls);
+            (l1 | l2, w1 | w2)
+        }
         ExprKind::Index { base, index } => {
             let (l1, w1) = expr_effects(base, calls);
             let (l2, w2) = expr_effects(index, calls);
@@ -4608,6 +6045,81 @@ mod tests {
                 .message
                 .contains("out of bounds"),
             "expected out of bounds error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_tuple_destructure_length_mismatch() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            export circuit f(v: Vector<2, Field>): Field {
+              const [a, b, c] = v;
+              return a + b + c;
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("destructuring pattern"),
+            "expected destructuring mismatch error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_compound_assign_on_non_counter() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            ledger x: Field;
+            export circuit f(): [] {
+              x += 1;
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("Counter"),
+            "expected Counter compound assign error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn accepts_undisclosed_witness_inside_commitments() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            export ledger pc: Bytes<32>;
+            export ledger tc: Field;
+            witness secret(): Field;
+            witness rand_bytes(): Bytes<32>;
+            witness rand_field(): Field;
+            export circuit commit(): [] {
+              pc = persistentCommit<Field>(secret(), rand_bytes());
+              tc = transientCommit<Field>(secret(), rand_field());
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(
+            !checked.diagnostics.has_errors(),
+            "expected commitments to clear witness taint without disclose, got: {:?}",
             checked.diagnostics
         );
     }

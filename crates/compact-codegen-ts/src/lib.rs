@@ -262,6 +262,12 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 targs.push(self.hir_type_to_ts(inner));
                 self.ts_type_ref("Maybe", Some(targs))
             }
+            Type::Either(left, right) => {
+                let mut targs = ArenaVec::with_capacity_in(2, self);
+                targs.push(self.hir_type_to_ts(left));
+                targs.push(self.hir_type_to_ts(right));
+                self.ts_type_ref("Either", Some(targs))
+            }
             Type::MerkleTreeDigest => self.ts_runtime_type("MerkleTreeDigest", None),
             Type::MerkleTreePathEntry => self.ts_runtime_type("MerkleTreePathEntry", None),
             Type::MerkleTreePath(_, leaf) => {
@@ -288,19 +294,31 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         visit_expr(a, out);
                     }
                 }
-                ExprKind::Tuple(es) | ExprKind::Vector(es) => {
+                ExprKind::Tuple(es) | ExprKind::Vector(es) | ExprKind::BytesPack(es) => {
                     for e in es {
                         visit_expr(e, out);
                     }
+                }
+                ExprKind::Block { stmts, tail } => {
+                    visit_stmts(stmts, out);
+                    visit_expr(tail, out);
                 }
                 ExprKind::Unary { operand, .. }
                 | ExprKind::Cast { expr: operand, .. }
                 | ExprKind::Disclose(operand)
                 | ExprKind::PersistentHash { arg: operand, .. }
+                | ExprKind::TransientHash { arg: operand, .. }
+                | ExprKind::DegradeToTransient(operand)
+                | ExprKind::UpgradeFromTransient(operand)
                 | ExprKind::MerkleTreePathRoot { path: operand, .. }
                 | ExprKind::FieldAccess { base: operand, .. }
                 | ExprKind::Slice { base: operand, .. }
                 | ExprKind::MaybeSome(operand) => visit_expr(operand, out),
+                ExprKind::PersistentCommit { value, rand, .. }
+                | ExprKind::TransientCommit { value, rand, .. } => {
+                    visit_expr(value, out);
+                    visit_expr(rand, out);
+                }
                 ExprKind::Index { base, index } => {
                     visit_expr(base, out);
                     visit_expr(index, out);
@@ -462,6 +480,100 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         }
     }
 
+    fn uses_either(&self) -> bool {
+        fn ty_uses_either(ty: &Type) -> bool {
+            match ty {
+                Type::Either(_, _) => true,
+                Type::Maybe(e) | Type::Vector(_, e) => ty_uses_either(e),
+                Type::Tuple(es) => es.iter().any(ty_uses_either),
+                _ => false,
+            }
+        }
+        fn adt_uses_either(adt: &LedgerAdt) -> bool {
+            match adt {
+                LedgerAdt::Cell(ty) | LedgerAdt::Set(ty) | LedgerAdt::List(ty) => {
+                    ty_uses_either(ty)
+                }
+                LedgerAdt::Counter => false,
+                LedgerAdt::Map { key, value } => ty_uses_either(key) || adt_uses_either(value),
+                LedgerAdt::MerkleTree { value, .. }
+                | LedgerAdt::HistoricMerkleTree { value, .. } => ty_uses_either(value),
+            }
+        }
+        self.input
+            .program
+            .exported_stdlib_types
+            .iter()
+            .any(|s| s == "Either")
+            || self.input.program.circuits.iter().any(|c| {
+                ty_uses_either(&c.ret_type) || c.params.iter().any(|p| ty_uses_either(&p.ty))
+            })
+            || self
+                .input
+                .program
+                .ledger_fields
+                .iter()
+                .any(|f| adt_uses_either(&f.adt))
+            || self.input.program.witnesses.iter().any(|w| {
+                ty_uses_either(&w.ret_type) || w.params.iter().any(|p| ty_uses_either(&p.ty))
+            })
+            || self
+                .input
+                .program
+                .structs
+                .iter()
+                .any(|s| s.fields.iter().any(|f| ty_uses_either(&f.ty)))
+    }
+
+    fn build_either_type(&self, exported: bool) -> Statement<'a> {
+        let mut tparams = ArenaVec::with_capacity_in(2, self);
+        tparams.push(self.ts_type_param("A"));
+        tparams.push(self.ts_type_param("B"));
+        let mut members = ArenaVec::with_capacity_in(3, self);
+        members.push(TSSignature::new_ts_property_signature(
+            SPAN,
+            false,
+            false,
+            false,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident("is_left"), self)),
+            Some(self.ts_type_annotation(TSType::new_ts_boolean_keyword(SPAN, self))),
+            self,
+        ));
+        members.push(TSSignature::new_ts_property_signature(
+            SPAN,
+            false,
+            false,
+            false,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident("left"), self)),
+            Some(self.ts_type_annotation(self.ts_type_ref("A", None))),
+            self,
+        ));
+        members.push(TSSignature::new_ts_property_signature(
+            SPAN,
+            false,
+            false,
+            false,
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, self.ident("right"), self)),
+            Some(self.ts_type_annotation(self.ts_type_ref("B", None))),
+            self,
+        ));
+        let obj = TSType::new_ts_type_literal(SPAN, members, self);
+        let type_parameters = Some(TSTypeParameterDeclaration::boxed(SPAN, tparams, self));
+        let decl = Declaration::new_ts_type_alias_declaration(
+            SPAN,
+            BindingIdentifier::new(SPAN, self.ident("Either"), self),
+            type_parameters,
+            obj,
+            false,
+            self,
+        );
+        if exported {
+            Statement::new_export_declaration(SPAN, decl, self)
+        } else {
+            Statement::from(decl)
+        }
+    }
+
     fn build_program(&self) -> Program<'a> {
         let mut body = ArenaVec::new_in(self);
 
@@ -477,6 +589,15 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 .iter()
                 .any(|s| s == "Maybe");
             body.push(self.build_maybe_type(exported));
+        }
+        if self.uses_either() {
+            let exported = self
+                .input
+                .program
+                .exported_stdlib_types
+                .iter()
+                .any(|s| s == "Either");
+            body.push(self.build_either_type(exported));
         }
 
         // Emit enum declarations (exported if exported in Compact; still emitted locally if used).
@@ -1835,6 +1956,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             }
             Type::Struct(_)
             | Type::Maybe(_)
+            | Type::Either(_, _)
             | Type::MerkleTreeDigest
             | Type::MerkleTreePathEntry
             | Type::MerkleTreePath(_, _) => {
@@ -1965,6 +2087,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             | Type::Tuple(_)
                             | Type::Struct(_)
                             | Type::Maybe(_)
+                            | Type::Either(_, _)
                             | Type::MerkleTreeDigest
                             | Type::MerkleTreePathEntry
                             | Type::MerkleTreePath(_, _)
@@ -2020,8 +2143,175 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 self.lower_expr(params, else_branch, locals),
                 self,
             ),
-            ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => {
-                self.lower_expr(params, expr, locals)
+            ExprKind::Disclose(expr) => self.lower_expr(params, expr, locals),
+            ExprKind::Cast { expr, target } => {
+                let src_u = self.input.program.underlying_type(&expr.ty);
+                let dst_u = self.input.program.underlying_type(target);
+                match (src_u, dst_u) {
+                    (Type::Bytes(_), Type::Vector(_, _)) => {
+                        // `Array.from(expr, (b) => BigInt(b))`
+                        let mut b_params = ArenaVec::with_capacity_in(1, self);
+                        b_params.push(FormalParameter::new(
+                            span,
+                            ArenaVec::new_in(self),
+                            self.binding_ident(span, "b"),
+                            None,
+                            None,
+                            false,
+                            None,
+                            false,
+                            false,
+                            self,
+                        ));
+                        let formal_params = FormalParameters::boxed(
+                            span,
+                            FormalParameterKind::ArrowFormalParameters,
+                            b_params,
+                            None,
+                            self,
+                        );
+                        let mut bigint_args = ArenaVec::with_capacity_in(1, self);
+                        bigint_args.push(Argument::from(self.expr_ident(span, "b")));
+                        let bigint_call =
+                            self.expr_call(span, self.expr_ident(span, "BigInt"), bigint_args);
+                        let mut m_stmts = ArenaVec::with_capacity_in(1, self);
+                        m_stmts.push(Statement::new_return_statement(
+                            span,
+                            Some(bigint_call),
+                            self,
+                        ));
+                        let m_body =
+                            FunctionBody::boxed(span, ArenaVec::new_in(self), m_stmts, self);
+                        let mapper = Expression::new_arrow_function_expression(
+                            span,
+                            false,
+                            None,
+                            formal_params,
+                            None,
+                            ArrowFunctionBody::FunctionBody(m_body),
+                            self,
+                        );
+                        let mut from_args = ArenaVec::with_capacity_in(2, self);
+                        from_args.push(Argument::from(self.lower_expr(params, expr, locals)));
+                        from_args.push(Argument::from(mapper));
+                        self.expr_call(
+                            span,
+                            self.expr_member(span, self.expr_ident(span, "Array"), "from"),
+                            from_args,
+                        )
+                    }
+                    (Type::Vector(_, _), Type::Bytes(_)) => {
+                        // `new Uint8Array(expr.map((b) => Number(b)))`
+                        let mut b_params = ArenaVec::with_capacity_in(1, self);
+                        b_params.push(FormalParameter::new(
+                            span,
+                            ArenaVec::new_in(self),
+                            self.binding_ident(span, "b"),
+                            None,
+                            None,
+                            false,
+                            None,
+                            false,
+                            false,
+                            self,
+                        ));
+                        let formal_params = FormalParameters::boxed(
+                            span,
+                            FormalParameterKind::ArrowFormalParameters,
+                            b_params,
+                            None,
+                            self,
+                        );
+                        let mut num_args = ArenaVec::with_capacity_in(1, self);
+                        num_args.push(Argument::from(self.expr_ident(span, "b")));
+                        let num_call =
+                            self.expr_call(span, self.expr_ident(span, "Number"), num_args);
+                        let mut m_stmts = ArenaVec::with_capacity_in(1, self);
+                        m_stmts.push(Statement::new_return_statement(span, Some(num_call), self));
+                        let m_body =
+                            FunctionBody::boxed(span, ArenaVec::new_in(self), m_stmts, self);
+                        let mapper = Expression::new_arrow_function_expression(
+                            span,
+                            false,
+                            None,
+                            formal_params,
+                            None,
+                            ArrowFunctionBody::FunctionBody(m_body),
+                            self,
+                        );
+                        let mut map_args = ArenaVec::with_capacity_in(1, self);
+                        map_args.push(Argument::from(mapper));
+                        let mapped = self.expr_call(
+                            span,
+                            self.expr_member(span, self.lower_expr(params, expr, locals), "map"),
+                            map_args,
+                        );
+                        let mut ctor_args = ArenaVec::with_capacity_in(1, self);
+                        ctor_args.push(Argument::from(mapped));
+                        Expression::new_new_expression(
+                            span,
+                            self.expr_ident(span, "Uint8Array"),
+                            None,
+                            ctor_args,
+                            self,
+                        )
+                    }
+                    _ => self.lower_expr(params, expr, locals),
+                }
+            }
+            ExprKind::BytesPack(elems) => {
+                let mut arr = ArenaVec::with_capacity_in(elems.len(), self);
+                for elem in elems {
+                    let elem_expr = match &elem.kind {
+                        ExprKind::IntLit(v) => self.expr_num(span, *v as f64),
+                        _ => {
+                            let mut nargs = ArenaVec::with_capacity_in(1, self);
+                            nargs.push(Argument::from(self.lower_expr(params, elem, locals)));
+                            self.expr_call(span, self.expr_ident(span, "Number"), nargs)
+                        }
+                    };
+                    arr.push(ArrayExpressionElement::from(elem_expr));
+                }
+                let mut args = ArenaVec::with_capacity_in(1, self);
+                args.push(Argument::from(Expression::new_array_expression(
+                    span, arr, self,
+                )));
+                Expression::new_new_expression(
+                    span,
+                    self.expr_ident(span, "Uint8Array"),
+                    None,
+                    args,
+                    self,
+                )
+            }
+            ExprKind::Block { stmts, tail } => {
+                let mut block_locals = locals.clone();
+                let (mut body_stmts, _) =
+                    self.lower_stmts_inner(params, stmts, &mut block_locals, false);
+                let tail_expr = self.lower_expr(params, tail, &block_locals);
+                body_stmts.push(Statement::new_return_statement(span, Some(tail_expr), self));
+                let body = FunctionBody::boxed(span, ArenaVec::new_in(self), body_stmts, self);
+                let formal_params = FormalParameters::boxed(
+                    span,
+                    FormalParameterKind::ArrowFormalParameters,
+                    ArenaVec::new_in(self),
+                    None,
+                    self,
+                );
+                let arrow = Expression::new_arrow_function_expression(
+                    span,
+                    false,
+                    None,
+                    formal_params,
+                    None,
+                    ArrowFunctionBody::FunctionBody(body),
+                    self,
+                );
+                self.expr_call(
+                    span,
+                    Expression::new_parenthesized_expression(span, arrow, self),
+                    ArenaVec::new_in(self),
+                )
             }
             ExprKind::Assert { cond, message } => {
                 let mut args = ArenaVec::with_capacity_in(2, self);
@@ -2069,6 +2359,73 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         span,
                         self.expr_ident(span, "__compactRuntime"),
                         "persistentHash",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::TransientHash { arg, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "transientHash",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::PersistentCommit { value, rand, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.lower_expr(params, value, locals)));
+                call_args.push(Argument::from(self.lower_expr(params, rand, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "persistentCommit",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::TransientCommit { value, rand, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.lower_expr(params, value, locals)));
+                call_args.push(Argument::from(self.lower_expr(params, rand, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "transientCommit",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::DegradeToTransient(arg) => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "degradeToTransient",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::UpgradeFromTransient(arg) => {
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(self.lower_expr(params, arg, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "upgradeFromTransient",
                     ),
                     call_args,
                 )
@@ -2702,6 +3059,14 @@ mod tests {
               return [first<Field, AccountId>(p) + v[idx], slice<2>(v, 1)];
             }
             "#,
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_patterns_map_fold_and_either() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/functional_patterns.compact"),
             compile_ts_bundle
         );
     }

@@ -189,6 +189,8 @@ pub enum Type {
     NewType(NewTypeId),
     /// Standard-library `Maybe<T> { is_some: Boolean, value: T }`.
     Maybe(Box<Type>),
+    /// Standard-library `Either<A, B> { is_left: Boolean, left: A, right: B }`.
+    Either(Box<Type>, Box<Type>),
     /// Standard-library `MerkleTreeDigest { field: Field }`.
     MerkleTreeDigest,
     /// Standard-library `MerkleTreePathEntry { sibling: MerkleTreeDigest, goes_left: Boolean }`.
@@ -360,6 +362,29 @@ pub enum ExprKind {
         input_ty: Type,
         arg: Box<Expr>,
     },
+    TransientHash {
+        input_ty: Type,
+        arg: Box<Expr>,
+    },
+    PersistentCommit {
+        input_ty: Type,
+        value: Box<Expr>,
+        rand: Box<Expr>,
+    },
+    TransientCommit {
+        input_ty: Type,
+        value: Box<Expr>,
+        rand: Box<Expr>,
+    },
+    DegradeToTransient(Box<Expr>),
+    UpgradeFromTransient(Box<Expr>),
+    /// Pack `N` `Uint<8>` byte expressions into a `Bytes<N>` value (`Bytes[b0, b1, ...]`).
+    BytesPack(Vec<Expr>),
+    /// Scoped block expression evaluating `stmts` in order and yielding `tail`.
+    Block {
+        stmts: Vec<Stmt>,
+        tail: Box<Expr>,
+    },
     MerkleTreePathRoot {
         depth: u32,
         leaf_ty: Type,
@@ -498,6 +523,11 @@ impl Program {
                 ("is_some".to_owned(), Type::Boolean),
                 ("value".to_owned(), (**inner).clone()),
             ]),
+            Type::Either(left, right) => Some(vec![
+                ("is_left".to_owned(), Type::Boolean),
+                ("left".to_owned(), (**left).clone()),
+                ("right".to_owned(), (**right).clone()),
+            ]),
             Type::MerkleTreeDigest => Some(vec![("field".to_owned(), Type::Field)]),
             Type::MerkleTreePathEntry => Some(vec![
                 ("sibling".to_owned(), Type::MerkleTreeDigest),
@@ -546,6 +576,11 @@ impl Program {
             Type::Struct(id) => self.struct_decl(*id).name.clone(),
             Type::NewType(id) => self.new_type_decl(*id).name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
+            Type::Either(left, right) => format!(
+                "Either<{}, {}>",
+                self.format_type(left),
+                self.format_type(right)
+            ),
             Type::MerkleTreeDigest => "MerkleTreeDigest".into(),
             Type::MerkleTreePathEntry => "MerkleTreePathEntry".into(),
             Type::MerkleTreePath(depth, leaf) => {

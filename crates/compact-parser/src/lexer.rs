@@ -201,7 +201,10 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                 TokenTag::Comma
             }
             b'.' => {
-                if pos + 1 < len && bytes[pos + 1] == b'.' {
+                if pos + 2 < len && bytes[pos + 1] == b'.' && bytes[pos + 2] == b'.' {
+                    pos += 3;
+                    TokenTag::DotDotDot
+                } else if pos + 1 < len && bytes[pos + 1] == b'.' {
                     pos += 2;
                     TokenTag::DotDot
                 } else {
@@ -218,12 +221,22 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                 TokenTag::Question
             }
             b'+' => {
-                pos += 1;
-                TokenTag::Plus
+                if pos + 1 < len && bytes[pos + 1] == b'=' {
+                    pos += 2;
+                    TokenTag::PlusEq
+                } else {
+                    pos += 1;
+                    TokenTag::Plus
+                }
             }
             b'-' => {
-                pos += 1;
-                TokenTag::Minus
+                if pos + 1 < len && bytes[pos + 1] == b'=' {
+                    pos += 2;
+                    TokenTag::MinusEq
+                } else {
+                    pos += 1;
+                    TokenTag::Minus
+                }
             }
             b'*' => {
                 pos += 1;
@@ -233,6 +246,9 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                 if pos + 1 < len && bytes[pos + 1] == b'=' {
                     pos += 2;
                     TokenTag::EqEq
+                } else if pos + 1 < len && bytes[pos + 1] == b'>' {
+                    pos += 2;
+                    TokenTag::FatArrow
                 } else {
                     pos += 1;
                     TokenTag::Eq

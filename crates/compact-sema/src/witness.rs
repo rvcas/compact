@@ -221,19 +221,36 @@ impl<'a> WitnessChecker<'a> {
             | ExprKind::MaybeNone(_) => Taint::clean(),
             ExprKind::ParamRef(pid) => param_taints[pid.0 as usize].clone(),
             ExprKind::LocalRef(lid) => locals.get(lid).cloned().unwrap_or_default(),
-            ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::Vector(elems) | ExprKind::BytesPack(elems) => {
                 elems.iter().fold(Taint::clean(), |acc, e| {
                     acc.merge(&self.check_expr(e, param_taints, locals, guard_taint))
                 })
             }
+            ExprKind::Block { stmts, tail } => {
+                let mut block_locals = locals.clone();
+                let st =
+                    self.check_stmts_in_scope(stmts, param_taints, &mut block_locals, guard_taint);
+                let tt = self.check_expr(tail, param_taints, &block_locals, guard_taint);
+                st.merge(&tt)
+            }
             ExprKind::Unary { operand, .. }
             | ExprKind::Cast { expr: operand, .. }
             | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::TransientHash { arg: operand, .. }
+            | ExprKind::DegradeToTransient(operand)
+            | ExprKind::UpgradeFromTransient(operand)
             | ExprKind::MerkleTreePathRoot { path: operand, .. }
             | ExprKind::FieldAccess { base: operand, .. }
             | ExprKind::Slice { base: operand, .. }
             | ExprKind::MaybeSome(operand) => {
                 self.check_expr(operand, param_taints, locals, guard_taint)
+            }
+            ExprKind::PersistentCommit { value, rand, .. }
+            | ExprKind::TransientCommit { value, rand, .. } => {
+                // Cryptographic commitments hide both value and randomness (`discloses nothing`).
+                let _ = self.check_expr(value, param_taints, locals, guard_taint);
+                let _ = self.check_expr(rand, param_taints, locals, guard_taint);
+                Taint::clean()
             }
             ExprKind::Index { base, index } => {
                 let bt = self.check_expr(base, param_taints, locals, guard_taint);
@@ -427,10 +444,15 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         }
         ExprKind::Tuple(elems)
         | ExprKind::Vector(elems)
+        | ExprKind::BytesPack(elems)
         | ExprKind::WitnessCall { args: elems, .. } => {
             for e in elems {
                 collect_calls_expr(e, out);
             }
+        }
+        ExprKind::Block { stmts, tail } => {
+            collect_calls_stmts(stmts, out);
+            collect_calls_expr(tail, out);
         }
         ExprKind::StructLit { fields } => {
             for (_, e) in fields {
@@ -442,10 +464,18 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         | ExprKind::Assert { cond: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::TransientHash { arg: operand, .. }
+        | ExprKind::DegradeToTransient(operand)
+        | ExprKind::UpgradeFromTransient(operand)
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => collect_calls_expr(operand, out),
+        ExprKind::PersistentCommit { value, rand, .. }
+        | ExprKind::TransientCommit { value, rand, .. } => {
+            collect_calls_expr(value, out);
+            collect_calls_expr(rand, out);
+        }
         ExprKind::Index { base, index } => {
             collect_calls_expr(base, out);
             collect_calls_expr(index, out);

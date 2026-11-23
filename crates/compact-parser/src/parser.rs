@@ -720,7 +720,7 @@ impl<'a> Parser<'a> {
             }
             TokenTag::Const => {
                 let const_tok = self.advance();
-                let name_tok = self.expect(TokenTag::Ident)?;
+                let pat = self.parse_pattern()?;
                 let ty = if self.peek() == TokenTag::Colon {
                     self.advance();
                     self.parse_type()?
@@ -730,7 +730,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenTag::Eq)?;
                 let init = self.parse_expr()?;
                 let semi = self.expect(TokenTag::Semi)?;
-                let (extra_start, _) = self.ast.push_extra_slice(&[name_tok.0, ty.0, init.0]);
+                let (extra_start, _) = self.ast.push_extra_slice(&[pat.0, ty.0, init.0]);
                 Some(self.ast.push_node(
                     NodeTag::ConstStmt,
                     const_tok,
@@ -739,7 +739,10 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let expr = self.parse_expr()?;
-                if self.peek() == TokenTag::Eq {
+                if matches!(
+                    self.peek(),
+                    TokenTag::Eq | TokenTag::PlusEq | TokenTag::MinusEq
+                ) {
                     let eq_tok = self.advance();
                     let rhs = self.parse_expr()?;
                     let semi = self.expect(TokenTag::Semi)?;
@@ -757,6 +760,81 @@ impl<'a> Parser<'a> {
                         NodeData::new(expr.0, semi.0),
                     ))
                 }
+            }
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Option<NodeIndex> {
+        match self.peek() {
+            TokenTag::Ident => {
+                let tok = self.advance();
+                Some(
+                    self.ast
+                        .push_node(NodeTag::PatIdent, tok, NodeData::default()),
+                )
+            }
+            TokenTag::LBracket => {
+                let lbracket = self.advance();
+                let mut elems = Vec::new();
+                while self.peek() != TokenTag::RBracket && self.peek() != TokenTag::Eof {
+                    if self.peek() == TokenTag::Comma {
+                        elems.push(NodeIndex::NONE.0);
+                        self.advance();
+                        continue;
+                    }
+                    let elem = self.parse_pattern()?;
+                    elems.push(elem.0);
+                    if self.peek() == TokenTag::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(TokenTag::RBracket)?;
+                let (start, end) = self.ast.push_extra_slice(&elems);
+                Some(
+                    self.ast
+                        .push_node(NodeTag::PatTuple, lbracket, NodeData::new(start, end)),
+                )
+            }
+            TokenTag::LBrace => {
+                let lbrace = self.advance();
+                let mut fields = Vec::new();
+                while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
+                    let fname = self.expect(TokenTag::Ident)?;
+                    let sub_pat = if self.peek() == TokenTag::Colon {
+                        self.advance();
+                        self.parse_pattern()?
+                    } else {
+                        NodeIndex::NONE
+                    };
+                    let fnode = self.ast.push_node(
+                        NodeTag::PatStructField,
+                        fname,
+                        NodeData::new(sub_pat.0, 0),
+                    );
+                    fields.push(fnode.0);
+                    if self.peek() == TokenTag::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(TokenTag::RBrace)?;
+                let (start, end) = self.ast.push_extra_slice(&fields);
+                Some(
+                    self.ast
+                        .push_node(NodeTag::PatStruct, lbrace, NodeData::new(start, end)),
+                )
+            }
+            other => {
+                let tok = self.current_tok();
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.file,
+                    self.ast.token_span(tok),
+                    format!("expected pattern, found `{}`", other.as_str()),
+                ));
+                None
             }
         }
     }
@@ -1093,13 +1171,22 @@ impl<'a> Parser<'a> {
         let lbrace = self.expect(TokenTag::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
-            let fname = self.expect(TokenTag::Ident)?;
-            self.expect(TokenTag::Colon)?;
-            let val = self.parse_expr()?;
-            let fnode = self
-                .ast
-                .push_node(NodeTag::StructLitField, fname, NodeData::new(val.0, 0));
-            fields.push(fnode.0);
+            if self.peek() == TokenTag::DotDotDot {
+                let dots = self.advance();
+                let spread_expr = self.parse_expr()?;
+                let snode =
+                    self.ast
+                        .push_node(NodeTag::SpreadExpr, dots, NodeData::new(spread_expr.0, 0));
+                fields.push(snode.0);
+            } else {
+                let fname = self.expect(TokenTag::Ident)?;
+                self.expect(TokenTag::Colon)?;
+                let val = self.parse_expr()?;
+                let fnode =
+                    self.ast
+                        .push_node(NodeTag::StructLitField, fname, NodeData::new(val.0, 0));
+                fields.push(fnode.0);
+            }
             if self.peek() == TokenTag::Comma {
                 self.advance();
             } else {
@@ -1116,9 +1203,120 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn parse_spread_or_expr(&mut self) -> Option<NodeIndex> {
+        if self.peek() == TokenTag::DotDotDot {
+            let dots = self.advance();
+            let inner = self.parse_expr()?;
+            Some(
+                self.ast
+                    .push_node(NodeTag::SpreadExpr, dots, NodeData::new(inner.0, 0)),
+            )
+        } else {
+            self.parse_expr()
+        }
+    }
+
+    fn try_parse_arrow_expr(&mut self) -> Option<NodeIndex> {
+        let saved_cursor = self.cursor;
+        let saved_diags = self.diagnostics.diagnostics.len();
+        let saved_extra = self.ast.extra_data.len();
+
+        let lparen = self.advance(); // consume '('
+        let mut params = Vec::new();
+        let mut ok = true;
+        while self.peek() != TokenTag::RParen && self.peek() != TokenTag::Eof {
+            if self.peek() != TokenTag::Ident {
+                ok = false;
+                break;
+            }
+            let name_tok = self.advance();
+            let ty = if self.peek() == TokenTag::Colon {
+                self.advance();
+                if let Some(t) = self.parse_type() {
+                    t
+                } else {
+                    ok = false;
+                    break;
+                }
+            } else {
+                NodeIndex::NONE
+            };
+            let pnode = self
+                .ast
+                .push_node(NodeTag::Param, name_tok, NodeData::new(ty.0, 0));
+            params.push(pnode.0);
+            if self.peek() == TokenTag::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if ok && self.peek() == TokenTag::RParen {
+            self.advance();
+            let ret_type = if self.peek() == TokenTag::Colon {
+                self.advance();
+                match self.parse_type() {
+                    Some(t) => t,
+                    None => {
+                        ok = false;
+                        NodeIndex::NONE
+                    }
+                }
+            } else {
+                NodeIndex::NONE
+            };
+            if ok && self.peek() == TokenTag::FatArrow {
+                let arrow_tok = self.advance();
+                let body = if self.peek() == TokenTag::LBrace {
+                    self.parse_block()?
+                } else {
+                    self.parse_expr()?
+                };
+                let (pstart, pend) = self.ast.push_extra_slice(&params);
+                let (extra_start, _) = self
+                    .ast
+                    .push_extra_slice(&[pstart, pend, ret_type.0, body.0]);
+                return Some(self.ast.push_node(
+                    NodeTag::ArrowExpr,
+                    arrow_tok,
+                    NodeData::new(extra_start, lparen.0),
+                ));
+            }
+        }
+
+        self.cursor = saved_cursor;
+        self.diagnostics.diagnostics.truncate(saved_diags);
+        self.ast.extra_data.truncate(saved_extra);
+        None
+    }
+
     fn parse_primary_expr(&mut self) -> Option<NodeIndex> {
         match self.peek() {
             TokenTag::Ident => {
+                if self.ast.token_text(self.current_tok(), self.file.text()) == "Bytes"
+                    && self.peek_at(1) == TokenTag::LBracket
+                {
+                    let bytes_tok = self.advance();
+                    self.advance(); // '['
+                    let mut elems = Vec::new();
+                    while self.peek() != TokenTag::RBracket && self.peek() != TokenTag::Eof {
+                        let elem = self.parse_spread_or_expr()?;
+                        elems.push(elem.0);
+                        if self.peek() == TokenTag::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let rbracket = self.expect(TokenTag::RBracket)?;
+                    let (estart, eend) = self.ast.push_extra_slice(&elems);
+                    let (extra_start, _) = self.ast.push_extra_slice(&[estart, eend]);
+                    return Some(self.ast.push_node(
+                        NodeTag::BytesLitExpr,
+                        bytes_tok,
+                        NodeData::new(extra_start, rbracket.0),
+                    ));
+                }
                 let tok = self.advance();
                 Some(
                     self.ast
@@ -1186,7 +1384,7 @@ impl<'a> Parser<'a> {
                 let lbracket = self.advance();
                 let mut elems = Vec::new();
                 while self.peek() != TokenTag::RBracket && self.peek() != TokenTag::Eof {
-                    let elem = self.parse_expr()?;
+                    let elem = self.parse_spread_or_expr()?;
                     elems.push(elem.0);
                     if self.peek() == TokenTag::Comma {
                         self.advance();
@@ -1202,6 +1400,9 @@ impl<'a> Parser<'a> {
                 )
             }
             TokenTag::LParen => {
+                if let Some(arrow) = self.try_parse_arrow_expr() {
+                    return Some(arrow);
+                }
                 self.advance();
                 let inner = self.parse_expr()?;
                 self.expect(TokenTag::RParen)?;

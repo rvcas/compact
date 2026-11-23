@@ -452,13 +452,12 @@ impl<'a> Formatter<'a> {
                 self.out.push_str(", ");
             }
             let p = self.ast.param(param);
-            write!(
-                self.out,
-                "{}: ",
-                self.ast.token_text(p.name_token, self.source)
-            )
-            .unwrap();
-            self.format_type(p.type_node);
+            self.out
+                .push_str(self.ast.token_text(p.name_token, self.source));
+            if p.type_node.is_some() {
+                self.out.push_str(": ");
+                self.format_type(p.type_node);
+            }
         }
     }
 
@@ -579,12 +578,8 @@ impl<'a> Formatter<'a> {
             }
             NodeTag::ConstStmt => {
                 let stmt = self.ast.const_stmt(node);
-                write!(
-                    self.out,
-                    "const {}",
-                    self.ast.token_text(stmt.name_token, self.source)
-                )
-                .unwrap();
+                self.out.push_str("const ");
+                self.format_pattern(stmt.pat);
                 if let Some(ty) = stmt.ty {
                     self.out.push_str(": ");
                     self.format_type(ty);
@@ -596,7 +591,12 @@ impl<'a> Formatter<'a> {
             NodeTag::AssignStmt => {
                 let stmt = self.ast.assign_stmt(node);
                 self.format_expr(stmt.lhs);
-                self.out.push_str(" = ");
+                write!(
+                    self.out,
+                    " {} ",
+                    self.ast.token_text(stmt.eq_token, self.source)
+                )
+                .unwrap();
                 self.format_expr(stmt.rhs);
                 self.out.push(';');
             }
@@ -756,14 +756,96 @@ impl<'a> Formatter<'a> {
                     if i > 0 {
                         self.out.push_str(", ");
                     }
-                    let sf = self.ast.struct_lit_field(f);
-                    write!(
-                        self.out,
-                        "{}: ",
-                        self.ast.token_text(sf.name_token, self.source)
-                    )
-                    .unwrap();
-                    self.format_expr(sf.value);
+                    if self.ast.node_tag(f) == NodeTag::SpreadExpr {
+                        self.format_expr(f);
+                    } else {
+                        let sf = self.ast.struct_lit_field(f);
+                        write!(
+                            self.out,
+                            "{}: ",
+                            self.ast.token_text(sf.name_token, self.source)
+                        )
+                        .unwrap();
+                        self.format_expr(sf.value);
+                    }
+                }
+                self.out.push_str(" }");
+            }
+            NodeTag::SpreadExpr => {
+                self.out.push_str("...");
+                self.format_expr(NodeIndex(data.lhs));
+            }
+            NodeTag::BytesLitExpr => {
+                let lit = self.ast.bytes_lit_expr(node);
+                self.out.push_str("Bytes[");
+                let elems: Vec<_> = self
+                    .ast
+                    .extra_nodes(lit.elems_start, lit.elems_end)
+                    .collect();
+                for (i, elem) in elems.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.format_expr(elem);
+                }
+                self.out.push(']');
+            }
+            NodeTag::ArrowExpr => {
+                let arrow = self.ast.arrow_expr(node);
+                self.out.push('(');
+                self.format_params(arrow.params_start, arrow.params_end);
+                self.out.push(')');
+                if let Some(ret) = arrow.ret_type {
+                    self.out.push_str(": ");
+                    self.format_type(ret);
+                }
+                self.out.push_str(" => ");
+                if self.ast.node_tag(arrow.body) == NodeTag::Block {
+                    self.format_block(arrow.body, 1);
+                } else {
+                    self.format_expr(arrow.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn format_pattern(&mut self, node: NodeIndex) {
+        let data = self.ast.node_data(node);
+        match self.ast.node_tag(node) {
+            NodeTag::PatIdent => {
+                self.out.push_str(
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source),
+                );
+            }
+            NodeTag::PatTuple => {
+                self.out.push('[');
+                let elems: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                for (i, elem) in elems.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    if elem.is_some() {
+                        self.format_pattern(elem);
+                    }
+                }
+                self.out.push(']');
+            }
+            NodeTag::PatStruct => {
+                self.out.push_str("{ ");
+                let fields: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
+                for (i, field) in fields.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    let sf = self.ast.pat_struct_field(field);
+                    self.out
+                        .push_str(self.ast.token_text(sf.name_token, self.source));
+                    if let Some(sub) = sf.pat {
+                        self.out.push_str(": ");
+                        self.format_pattern(sub);
+                    }
                 }
                 self.out.push_str(" }");
             }
@@ -880,6 +962,31 @@ mod tests {
             module Vault<K>{export ledger m:Map<K,Counter>;export circuit bump(k:K):[]{m.lookup(k).increment(1);}}
             import {bump as bump_field} from Vault<Field> prefix V_;
             export circuit pick<T>(v:Vector<3,T>,i:Uint<8>):T{const x:T=v[i];return x;}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_patterns_arrows_spreads_and_bytes() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+            export ledger ops:Counter;
+            struct Point{x:Field;y:Field;}
+            export circuit demo(pt:Point,v:Vector<2,Field>,raw:Bytes<4>):[Field,Bytes<4>]{
+              const {x:px,y}=pt;
+              const [a,b]=v;
+              const doubled=map((n)=>n+px,v);
+              const sum=fold((acc:Field,n:Field):Field=>{const t=acc+n;return t;},0,doubled);
+              const next=Point{...pt,x:sum};
+              const ext:Vector<3,Field> = [...doubled,a+b];
+              const bv=raw as Vector<4,Uint<8>>;
+              const rev=Bytes[bv[3],bv[2],bv[1],bv[0]];
+              ops+=2;
+              ops-=1;
+              return [next.x+ext[2],rev];
+            }
             "#,
             fmt
         );

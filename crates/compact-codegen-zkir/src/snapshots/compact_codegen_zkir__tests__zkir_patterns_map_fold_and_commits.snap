@@ -1,0 +1,153 @@
+---
+source: crates/compact-codegen-zkir/src/lib.rs
+---
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+export { Either }
+
+struct Point {
+  x: Field;
+  y: Field;
+}
+
+export ledger ops: Counter;
+export ledger latest_commit: Bytes<32>;
+export ledger latest_tcommit: Field;
+
+witness secret_val(): Field;
+witness secret_rand(): Bytes<32>;
+witness secret_tr(): Field;
+
+circuit add_fields(a: Field, b: Field): Field {
+  return a + b;
+}
+
+export circuit transform_and_commit(
+  pt: Point,
+  xs: Vector<2, Field>,
+  ys: Vector<2, Field>,
+  raw: Bytes<4>,
+  flag: Boolean,
+): [Field, Vector<3, Field>, Bytes<4>, Either<Field, Boolean>] {
+  // Struct & tuple destructuring
+  const { x: px, y } = pt;
+  const [x0, x1] = xs;
+
+  // Higher-order map (inline arrow with capture) & fold (named circuit + block arrow)
+  const shifted: Vector<2, Field> = map((v) => v + px, xs);
+  const zipped: Vector<2, Field> = map((a, b) => {
+    const sum = a + b;
+    return sum + y;
+  }, shifted, ys);
+  const total: Field = fold(add_fields, 0, zipped);
+
+  // Vector spread & struct update spread
+  const combined: Vector<3, Field> = [...shifted, x0 + x1];
+  const moved: Point = Point{ ...pt, x: total };
+
+  // Bytes[...] literal & Bytes<4> <-> Vector<4, Uint<8>> cast
+  const bv: Vector<4, Uint<8>> = raw as Vector<4, Uint<8>>;
+  const reversed: Bytes<4> = Bytes[bv[3], bv[2], bv[1], bv[0]];
+
+  // Cryptographic commitments (no disclose needed) & transient/persistent conversions
+  const sv = secret_val();
+  const c = persistentCommit<Field>(sv, secret_rand());
+  const tc = transientCommit<Field>(sv, secret_tr());
+  latest_commit = c;
+  latest_tcommit = tc;
+  const degraded: Field = degradeToTransient(c);
+  const upgraded: Bytes<32> = upgradeFromTransient(transientHash<Vector<2, Field>>([degraded, tc]));
+  assert(degradeToTransient(upgraded) == degraded || true, "roundtrip");
+
+  // Counter compound assignment shorthand
+  ops += 2;
+  ops -= 1;
+
+  // Either<A, B> + left/right
+  const choice: Either<Field, Boolean> = flag
+    ? left<Field, Boolean>(moved.x)
+    : right<Field, Boolean>(flag);
+
+  return [moved.x, combined, reversed, choice];
+}
+===
+{
+  "version": {"major":3,"minor":1},
+  "do_communications_commitment": true,
+  "inputs": [
+    {"name":"%pt.0","type":"Scalar<BLS12-381>"},
+    {"name":"%pt.1","type":"Scalar<BLS12-381>"},
+    {"name":"%xs.2","type":"Scalar<BLS12-381>"},
+    {"name":"%xs.3","type":"Scalar<BLS12-381>"},
+    {"name":"%ys.4","type":"Scalar<BLS12-381>"},
+    {"name":"%ys.5","type":"Scalar<BLS12-381>"},
+    {"name":"%raw.6","type":"Scalar<BLS12-381>"},
+    {"name":"%flag.7","type":"Scalar<BLS12-381>"}
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    {"op":"constrain_bits","val":"%raw.6","bits":32},
+    {"op":"constrain_to_boolean","val":"%flag.7"},
+    {"op":"add","a":"%xs.2","b":"%pt.0","output":"%t.8"},
+    {"op":"add","a":"%xs.3","b":"%pt.0","output":"%t.9"},
+    {"op":"add","a":"%t.8","b":"%ys.4","output":"%t.10"},
+    {"op":"add","a":"%t.10","b":"%pt.1","output":"%t.11"},
+    {"op":"add","a":"%t.9","b":"%ys.5","output":"%t.12"},
+    {"op":"add","a":"%t.12","b":"%pt.1","output":"%t.13"},
+    {"op":"add","a":"0x00","b":"%t.11","output":"%t.14"},
+    {"op":"add","a":"%t.14","b":"%t.13","output":"%t.15"},
+    {"op":"add","a":"%xs.2","b":"%xs.3","output":"%t.16"},
+    {"op":"div_mod_power_of_two","val":"%raw.6","bits":8,"outputs":["%quo.17","%byte.18"]},
+    {"op":"div_mod_power_of_two","val":"%quo.17","bits":8,"outputs":["%quo.19","%byte.20"]},
+    {"op":"div_mod_power_of_two","val":"%quo.19","bits":8,"outputs":["%quo.21","%byte.22"]},
+    {"op":"mul","a":"%byte.18","b":"0x0001","output":"%t.23"},
+    {"op":"add","a":"%t.23","b":"%byte.20","output":"%t.24"},
+    {"op":"mul","a":"%t.24","b":"0x0001","output":"%t.25"},
+    {"op":"add","a":"%t.25","b":"%byte.22","output":"%t.26"},
+    {"op":"mul","a":"%t.26","b":"0x0001","output":"%t.27"},
+    {"op":"add","a":"%t.27","b":"%quo.21","output":"%t.28"},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%sv.29"},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.30"},
+    {"op":"constrain_bits","val":"%t.30","bits":8},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.31"},
+    {"op":"constrain_bits","val":"%t.31","bits":248},
+    {"op":"persistent_hash","alignment":[{"tag":"atom","value":{"tag":"bytes","length":32}},{"tag":"atom","value":{"tag":"field"}}],"inputs":["%t.30","%t.31","%sv.29"],"output":"%bytes.32"},
+    {"op":"bytes_into_natives","bytes":"%bytes.32","outputs":["%c.33","%c.34"]},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.35"},
+    {"op":"transient_hash","inputs":["%t.35","%sv.29"],"output":"%tc.36"},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0x20","%c.34","%c.33"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x02"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%tc.36"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"copy","val":"%c.33","output":"%degraded.37"},
+    {"op":"transient_hash","inputs":["%degraded.37","%tc.36"],"output":"%hash.38"},
+    {"op":"div_mod_power_of_two","val":"%hash.38","bits":248,"outputs":["%tmp.39","%upgraded.40"]},
+    {"op":"copy","val":"0x00","output":"%upgraded.41"},
+    {"op":"copy","val":"%upgraded.40","output":"%t.42"},
+    {"op":"test_eq","a":"%t.42","b":"%degraded.37","output":"%t.43"},
+    {"op":"cond_select","bit":"%t.43","a":"0x00","b":"0x01","output":"%t.44"},
+    {"op":"cond_select","bit":"%t.43","a":"0x01","b":"0x01","output":"%t.45"},
+    {"op":"assert","cond":"%t.45"},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0e","0x02"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa1"]},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0f","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa1"]},
+    {"op":"cond_select","bit":"%flag.7","a":"%t.15","b":"0x00","output":"%t.46"},
+    {"op":"cond_select","bit":"%flag.7","a":"0x00","b":"%flag.7","output":"%t.47"},
+    {"op":"output","vals":["%t.15","%t.8","%t.9","%t.16","%t.28","%flag.7","%t.46","%t.47"]}
+  ]
+}

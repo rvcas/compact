@@ -101,13 +101,17 @@ pub enum TokenTag {
     Comma,
     Dot,
     DotDot,
+    DotDotDot,
     Hash,
     Question,
     Plus,
+    PlusEq,
     Minus,
+    MinusEq,
     Star,
     Eq,
     EqEq,
+    FatArrow,
     BangEq,
     Bang,
     AmpAmp,
@@ -168,13 +172,17 @@ impl TokenTag {
             Self::Comma => ",",
             Self::Dot => ".",
             Self::DotDot => "..",
+            Self::DotDotDot => "...",
             Self::Hash => "#",
             Self::Question => "?",
             Self::Plus => "+",
+            Self::PlusEq => "+=",
             Self::Minus => "-",
+            Self::MinusEq => "-=",
             Self::Star => "*",
             Self::Eq => "=",
             Self::EqEq => "==",
+            Self::FatArrow => "=>",
             Self::BangEq => "!=",
             Self::Bang => "!",
             Self::AmpAmp => "&&",
@@ -307,11 +315,20 @@ pub enum NodeTag {
     /// `main_token = for`, `data = (extra_start, 0)`,
     /// `extra_data[extra_start..+3] = [name_tok, iter_expr, body_node]`.
     ForEachStmt,
-    /// `const <name>[: <type>] = <expr>;`
+    /// `const <pat>[: <type>] = <expr>;`
     /// `main_token = const`, `data = (extra_start, semi_tok)`,
-    /// `extra_data[extra_start..+3] = [name_tok, opt_type_node, init_expr]`.
+    /// `extra_data[extra_start..+3] = [pat_node, opt_type_node, init_expr]`.
     ConstStmt,
-    /// `<lhs> = <rhs>;` — `main_token = '='`, `data = (extra_start, semi_tok)`,
+    /// Identifier pattern `<name>` — `main_token = name_tok`.
+    PatIdent,
+    /// Tuple/vector destructuring pattern `[<pat?>, ...]` — `main_token = '['`, `data = (extra_start, extra_end)`.
+    /// Elements may be `NodeIndex::NONE` for ignored slots (e.g. `[a, , c]`).
+    PatTuple,
+    /// Struct destructuring pattern `{ <field>[: <pat>], ... }` — `main_token = '{'`, `data = (extra_start, extra_end)`.
+    PatStruct,
+    /// Struct pattern field `<name>[: <pat>]` — `main_token = name_tok`, `data = (opt_pat_node, 0)`.
+    PatStructField,
+    /// `<lhs> (= | += | -=) <rhs>;` — `main_token = op_tok`, `data = (extra_start, semi_tok)`,
     /// `extra_data[extra_start..+2] = [lhs_node, rhs_node]`.
     AssignStmt,
     /// Expression statement `<expr>;` — `data = (expr_node, semi_tok)`.
@@ -359,12 +376,22 @@ pub enum NodeTag {
     AssertExpr,
     /// `disclose(<expr>)` — `main_token = disclose`, `data = (expr_node, rparen_tok)`.
     DiscloseExpr,
-    /// Struct literal `<Type> { <field>: <expr>, ... }`
+    /// Struct literal `<Type> { (<field>: <expr> | ...<expr>), ... }`
     /// `main_token = '{'`, `data = (extra_start, rbrace_tok)`,
     /// `extra_data[extra_start..+3] = [type_node, fields_start, fields_end]`.
     StructLitExpr,
     /// Struct literal field `<name>: <expr>` — `main_token = name_tok`, `data = (value_expr, 0)`.
     StructLitField,
+    /// Spread element `...<expr>` inside tuple/vector/bytes/struct literals — `main_token = '...'`, `data = (expr_node, 0)`.
+    SpreadExpr,
+    /// Byte array literal `Bytes[<elem>, ...]`
+    /// `main_token = 'Bytes'`, `data = (extra_start, rbracket_tok)`,
+    /// `extra_data[extra_start..+2] = [elems_start, elems_end]`.
+    BytesLitExpr,
+    /// Anonymous arrow circuit `(<params>)[: <ret_type>] => (<expr> | <block>)`
+    /// `main_token = '=>'`, `data = (extra_start, lparen_tok)`,
+    /// `extra_data[extra_start..+4] = [params_start, params_end, opt_ret_type_node, body_node]`.
+    ArrowExpr,
 }
 
 /// Fixed-width payload stored alongside every AST node (Zig-style two-word `Data`).
@@ -588,10 +615,34 @@ pub struct Param {
 #[derive(Debug, Clone, Copy)]
 pub struct ConstStmt {
     pub const_token: TokenIndex,
-    pub name_token: TokenIndex,
+    pub pat: NodeIndex,
     pub ty: Option<NodeIndex>,
     pub init: NodeIndex,
     pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PatStructField {
+    pub name_token: TokenIndex,
+    pub pat: Option<NodeIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BytesLitExpr {
+    pub bytes_token: TokenIndex,
+    pub rbracket_token: TokenIndex,
+    pub elems_start: u32,
+    pub elems_end: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArrowExpr {
+    pub arrow_token: TokenIndex,
+    pub lparen_token: TokenIndex,
+    pub params_start: u32,
+    pub params_end: u32,
+    pub ret_type: Option<NodeIndex>,
+    pub body: NodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1014,10 +1065,45 @@ impl Ast {
         let base = data.lhs as usize;
         ConstStmt {
             const_token: self.node_main_token(node),
-            name_token: TokenIndex(self.extra_data[base]),
+            pat: NodeIndex(self.extra_data[base]),
             ty: NodeIndex(self.extra_data[base + 1]).into_option(),
             init: NodeIndex(self.extra_data[base + 2]),
             semi_token: TokenIndex(data.rhs),
+        }
+    }
+
+    pub fn pat_struct_field(&self, node: NodeIndex) -> PatStructField {
+        debug_assert_eq!(self.node_tag(node), NodeTag::PatStructField);
+        let data = self.node_data(node);
+        PatStructField {
+            name_token: self.node_main_token(node),
+            pat: NodeIndex(data.lhs).into_option(),
+        }
+    }
+
+    pub fn bytes_lit_expr(&self, node: NodeIndex) -> BytesLitExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::BytesLitExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        BytesLitExpr {
+            bytes_token: self.node_main_token(node),
+            rbracket_token: TokenIndex(data.rhs),
+            elems_start: self.extra_data[base],
+            elems_end: self.extra_data[base + 1],
+        }
+    }
+
+    pub fn arrow_expr(&self, node: NodeIndex) -> ArrowExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ArrowExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ArrowExpr {
+            arrow_token: self.node_main_token(node),
+            lparen_token: TokenIndex(data.rhs),
+            params_start: self.extra_data[base],
+            params_end: self.extra_data[base + 1],
+            ret_type: NodeIndex(self.extra_data[base + 2]).into_option(),
+            body: NodeIndex(self.extra_data[base + 3]),
         }
     }
 
@@ -1163,8 +1249,15 @@ impl Ast {
                 }
                 span
             }
-            NodeTag::StructField | NodeTag::Param | NodeTag::StructLitField => {
+            NodeTag::StructField | NodeTag::StructLitField => {
                 main.merge(self.node_span(NodeIndex(data.lhs)))
+            }
+            NodeTag::Param => {
+                if let Some(ty) = NodeIndex(data.lhs).into_option() {
+                    main.merge(self.node_span(ty))
+                } else {
+                    main
+                }
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ledger_decl(node);
@@ -1185,10 +1278,27 @@ impl Ast {
             NodeTag::TypeNamed
             | NodeTag::TypeNat
             | NodeTag::TypeString
+            | NodeTag::PatIdent
             | NodeTag::IdentExpr
             | NodeTag::IntLitExpr
             | NodeTag::BoolLitExpr
             | NodeTag::StringLitExpr => main,
+            NodeTag::PatTuple | NodeTag::PatStruct => {
+                let mut span = main;
+                for item in self.extra_nodes(data.lhs, data.rhs) {
+                    if item.is_some() {
+                        span = span.merge(self.node_span(item));
+                    }
+                }
+                span
+            }
+            NodeTag::PatStructField => {
+                if let Some(pat) = NodeIndex(data.lhs).into_option() {
+                    main.merge(self.node_span(pat))
+                } else {
+                    main
+                }
+            }
             NodeTag::TypeGeneric | NodeTag::TypeTuple | NodeTag::TupleExpr | NodeTag::Block => {
                 let mut span = main;
                 if let Some(last) = self.extra_nodes(data.lhs, data.rhs).last() {
@@ -1267,6 +1377,13 @@ impl Ast {
                 let lit = self.struct_lit_expr(node);
                 self.node_span(lit.type_node)
                     .merge(self.token_span(lit.rbrace_token))
+            }
+            NodeTag::SpreadExpr => main.merge(self.node_span(NodeIndex(data.lhs))),
+            NodeTag::BytesLitExpr => main.merge(self.token_span(TokenIndex(data.rhs))),
+            NodeTag::ArrowExpr => {
+                let arrow = self.arrow_expr(node);
+                self.token_span(arrow.lparen_token)
+                    .merge(self.node_span(arrow.body))
             }
         }
     }
@@ -1564,7 +1681,9 @@ impl Ast {
                     self.token_text(param.name_token, source)
                 )
                 .unwrap();
-                self.dump_node(param.type_node, source, indent + 1, out);
+                if param.type_node.is_some() {
+                    self.dump_node(param.type_node, source, indent + 1, out);
+                }
             }
             NodeTag::TypeNamed => {
                 writeln!(
@@ -1647,20 +1766,57 @@ impl Ast {
             }
             NodeTag::ConstStmt => {
                 let stmt = self.const_stmt(node);
-                writeln!(
-                    out,
-                    "{pad}ConstStmt {}",
-                    self.token_text(stmt.name_token, source)
-                )
-                .unwrap();
+                writeln!(out, "{pad}ConstStmt").unwrap();
+                self.dump_node(stmt.pat, source, indent + 1, out);
                 if let Some(ty) = stmt.ty {
                     self.dump_node(ty, source, indent + 1, out);
                 }
                 self.dump_node(stmt.init, source, indent + 1, out);
             }
+            NodeTag::PatIdent => {
+                writeln!(
+                    out,
+                    "{pad}PatIdent {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+            }
+            NodeTag::PatTuple => {
+                writeln!(out, "{pad}PatTuple").unwrap();
+                for elem in self.extra_nodes(data.lhs, data.rhs) {
+                    if elem.is_some() {
+                        self.dump_node(elem, source, indent + 1, out);
+                    } else {
+                        writeln!(out, "{pad}  _").unwrap();
+                    }
+                }
+            }
+            NodeTag::PatStruct => {
+                writeln!(out, "{pad}PatStruct").unwrap();
+                for field in self.extra_nodes(data.lhs, data.rhs) {
+                    self.dump_node(field, source, indent + 1, out);
+                }
+            }
+            NodeTag::PatStructField => {
+                let f = self.pat_struct_field(node);
+                writeln!(
+                    out,
+                    "{pad}PatStructField {}",
+                    self.token_text(f.name_token, source)
+                )
+                .unwrap();
+                if let Some(p) = f.pat {
+                    self.dump_node(p, source, indent + 1, out);
+                }
+            }
             NodeTag::AssignStmt => {
                 let stmt = self.assign_stmt(node);
-                writeln!(out, "{pad}AssignStmt").unwrap();
+                writeln!(
+                    out,
+                    "{pad}AssignStmt {}",
+                    self.token_text(stmt.eq_token, source)
+                )
+                .unwrap();
                 self.dump_node(stmt.lhs, source, indent + 1, out);
                 self.dump_node(stmt.rhs, source, indent + 1, out);
             }
@@ -1809,6 +1965,29 @@ impl Ast {
                 )
                 .unwrap();
                 self.dump_node(field.value, source, indent + 1, out);
+            }
+            NodeTag::SpreadExpr => {
+                writeln!(out, "{pad}SpreadExpr").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
+            NodeTag::BytesLitExpr => {
+                let lit = self.bytes_lit_expr(node);
+                writeln!(out, "{pad}BytesLitExpr").unwrap();
+                for elem in self.extra_nodes(lit.elems_start, lit.elems_end) {
+                    self.dump_node(elem, source, indent + 1, out);
+                }
+            }
+            NodeTag::ArrowExpr => {
+                let arrow = self.arrow_expr(node);
+                writeln!(out, "{pad}ArrowExpr").unwrap();
+                for p in self.extra_nodes(arrow.params_start, arrow.params_end) {
+                    self.dump_node(p, source, indent + 1, out);
+                }
+                if let Some(ret) = arrow.ret_type {
+                    writeln!(out, "{pad}  ReturnType").unwrap();
+                    self.dump_node(ret, source, indent + 2, out);
+                }
+                self.dump_node(arrow.body, source, indent + 1, out);
             }
         }
     }

@@ -67,6 +67,7 @@ impl AlignmentAtom {
                 .collect(),
             Type::Struct(_)
             | Type::Maybe(_)
+            | Type::Either(_, _)
             | Type::MerkleTreeDigest
             | Type::MerkleTreePathEntry
             | Type::MerkleTreePath(_, _) => program
@@ -99,6 +100,7 @@ pub fn wire_count(program: &Program, ty: &Type) -> usize {
         Type::Tuple(elems) => elems.iter().map(|e| wire_count(program, e)).sum(),
         Type::Struct(_)
         | Type::Maybe(_)
+        | Type::Either(_, _)
         | Type::MerkleTreeDigest
         | Type::MerkleTreePathEntry
         | Type::MerkleTreePath(_, _) => program
@@ -170,6 +172,7 @@ fn wire_constraints(program: &Program, ty: &Type) -> Vec<WireConstraint> {
             .collect(),
         Type::Struct(_)
         | Type::Maybe(_)
+        | Type::Either(_, _)
         | Type::MerkleTreeDigest
         | Type::MerkleTreePathEntry
         | Type::MerkleTreePath(_, _) => program
@@ -713,6 +716,77 @@ impl<'a> CircuitLowerer<'a> {
         out
     }
 
+    fn pack_bytes_wires(&mut self, byte_vals: &[CircuitVal]) -> Vec<CircuitVal> {
+        if byte_vals.is_empty() {
+            return Vec::new();
+        }
+        let mut chunks: Vec<&[CircuitVal]> = byte_vals.chunks(FIELD_BYTES as usize).collect();
+        chunks.reverse();
+        let mut wires = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            if chunk.iter().all(|v| matches!(v, CircuitVal::Imm(_))) {
+                let raw: Vec<u8> = chunk
+                    .iter()
+                    .map(|v| match v {
+                        CircuitVal::Imm(n) => *n as u8,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                wires.extend(bytes_to_wires(&raw));
+                continue;
+            }
+            let k = chunk.len();
+            let mut acc = chunk[k - 1].clone();
+            for b in chunk[..k - 1].iter().rev() {
+                let shifted = self.fresh_var("t");
+                self.instructions.push(CircuitInstr::Mul {
+                    a: acc,
+                    b: CircuitVal::Imm(256),
+                    output: shifted,
+                });
+                let added = self.fresh_var("t");
+                self.instructions.push(CircuitInstr::Add {
+                    a: CircuitVal::Var(shifted),
+                    b: b.clone(),
+                    output: added,
+                });
+                acc = CircuitVal::Var(added);
+            }
+            wires.push(acc);
+        }
+        wires
+    }
+
+    fn unpack_bytes_wires(&mut self, wires: &[CircuitVal], total_len: u32) -> Vec<CircuitVal> {
+        if total_len == 0 {
+            return Vec::new();
+        }
+        let full = total_len / FIELD_BYTES;
+        let rem = total_len % FIELD_BYTES;
+        let mut chunk_sizes: Vec<u32> = vec![FIELD_BYTES; full as usize];
+        if rem > 0 {
+            chunk_sizes.push(rem);
+        }
+        let mut out = Vec::with_capacity(total_len as usize);
+        for (wire, k) in wires.iter().rev().zip(chunk_sizes) {
+            let mut cur = wire.clone();
+            for _ in 0..(k - 1) {
+                let q = self.fresh_var("quo");
+                let b = self.fresh_var("byte");
+                self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                    val: cur,
+                    bits: 8,
+                    quotient: q,
+                    remainder: b,
+                });
+                out.push(CircuitVal::Var(b));
+                cur = CircuitVal::Var(q);
+            }
+            out.push(cur);
+        }
+        out
+    }
+
     fn lower_root_circuit(mut self, circuit: &Circuit) -> ProofCircuit {
         let mut inputs = Vec::new();
         let mut param_vals: Vec<Vec<CircuitVal>> = Vec::with_capacity(circuit.params.len());
@@ -1053,8 +1127,39 @@ impl<'a> CircuitLowerer<'a> {
                 out.extend(vec![CircuitVal::Imm(0); wire_count(self.program, inner_ty)]);
                 out
             }
-            ExprKind::Disclose(inner) | ExprKind::Cast { expr: inner, .. } => {
+            ExprKind::Disclose(inner) => {
                 self.lower_expr_with_hint(inner, param_vals, locals, guard, hint)
+            }
+            ExprKind::Cast {
+                expr: inner,
+                target,
+            } => {
+                let src_u = self.program.underlying_type(&inner.ty);
+                let dst_u = self.program.underlying_type(target);
+                match (src_u, dst_u) {
+                    (Type::Bytes(n), Type::Vector(_, _)) => {
+                        let wires = self.lower_expr(inner, param_vals, locals, guard);
+                        self.unpack_bytes_wires(&wires, *n)
+                    }
+                    (Type::Vector(_, _), Type::Bytes(_)) => {
+                        let byte_vals = self.lower_expr(inner, param_vals, locals, guard);
+                        self.pack_bytes_wires(&byte_vals)
+                    }
+                    _ => self.lower_expr_with_hint(inner, param_vals, locals, guard, hint),
+                }
+            }
+            ExprKind::BytesPack(elems) => {
+                let mut byte_vals = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let vals = self.lower_expr(e, param_vals, locals, guard);
+                    byte_vals.push(vals.into_iter().next().unwrap_or(CircuitVal::Imm(0)));
+                }
+                self.pack_bytes_wires(&byte_vals)
+            }
+            ExprKind::Block { stmts, tail } => {
+                let mut block_locals = locals.clone();
+                let _ = self.lower_stmts(stmts, param_vals, &mut block_locals, guard);
+                self.lower_expr_with_hint(tail, param_vals, &block_locals, guard, hint)
             }
             ExprKind::Unary { op, operand } => {
                 let vals = self.lower_expr(operand, param_vals, locals, guard);
@@ -1295,6 +1400,86 @@ impl<'a> CircuitLowerer<'a> {
                 self.instructions.push(CircuitInstr::BytesIntoNatives {
                     bytes: bytes_var,
                     outputs: vec![lo, hi],
+                });
+                vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+            }
+            ExprKind::TransientHash { arg, .. } => {
+                let inputs = self.lower_expr(arg, param_vals, locals, guard);
+                let out = self.fresh_var(hint.unwrap_or("hash"));
+                self.instructions.push(CircuitInstr::TransientHash {
+                    inputs,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::PersistentCommit {
+                input_ty,
+                value,
+                rand,
+            } => {
+                // Upstream swaps `(value, rand)` so `rand` (`Bytes<32>`) comes first in `persistent_hash`.
+                let val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let rand_wires = self.lower_expr(rand, param_vals, locals, guard);
+                let mut alignment = vec![AlignmentAtom::Bytes(32)];
+                alignment.extend(AlignmentAtom::alignment_of(self.program, input_ty));
+                let mut inputs = rand_wires;
+                inputs.extend(val_wires);
+                let bytes_var = self.fresh_var("bytes");
+                self.instructions.push(CircuitInstr::PersistentHash {
+                    alignment,
+                    inputs,
+                    output: bytes_var,
+                });
+                let out_hint = hint.unwrap_or("commit");
+                let lo = self.fresh_var(out_hint);
+                let hi = self.fresh_var(out_hint);
+                self.instructions.push(CircuitInstr::BytesIntoNatives {
+                    bytes: bytes_var,
+                    outputs: vec![lo, hi],
+                });
+                vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+            }
+            ExprKind::TransientCommit { value, rand, .. } => {
+                // Upstream moves `rand` (`Field`) first before `value` wires in `transient_hash`.
+                let val_wires = self.lower_expr(value, param_vals, locals, guard);
+                let rand_wires = self.lower_expr(rand, param_vals, locals, guard);
+                let mut inputs = rand_wires;
+                inputs.extend(val_wires);
+                let out = self.fresh_var(hint.unwrap_or("commit"));
+                self.instructions.push(CircuitInstr::TransientHash {
+                    inputs,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::DegradeToTransient(inner) => {
+                let wires = self.lower_expr(inner, param_vals, locals, guard);
+                let lo = wires.get(1).cloned().unwrap_or(CircuitVal::Imm(0));
+                let out = self.fresh_var(hint.unwrap_or("t"));
+                self.instructions.push(CircuitInstr::Copy {
+                    val: lo,
+                    output: out,
+                });
+                vec![CircuitVal::Var(out)]
+            }
+            ExprKind::UpgradeFromTransient(inner) => {
+                let x = self
+                    .lower_expr(inner, param_vals, locals, guard)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CircuitVal::Imm(0));
+                let tmp = self.fresh_var("tmp");
+                let lo = self.fresh_var(hint.unwrap_or("t"));
+                self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                    val: x,
+                    bits: 248,
+                    quotient: tmp,
+                    remainder: lo,
+                });
+                let hi = self.fresh_var(hint.unwrap_or("t"));
+                self.instructions.push(CircuitInstr::Copy {
+                    val: CircuitVal::Imm(0),
+                    output: hi,
                 });
                 vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
             }
@@ -2573,18 +2758,28 @@ fn expr_has_effects(expr: &Expr, program: &Program) -> bool {
         ExprKind::CircuitCall { circuit, args } => {
             !program.circuit(*circuit).pure || args.iter().any(|a| expr_has_effects(a, program))
         }
-        ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
+        ExprKind::Tuple(elems) | ExprKind::Vector(elems) | ExprKind::BytesPack(elems) => {
             elems.iter().any(|e| expr_has_effects(e, program))
+        }
+        ExprKind::Block { stmts, tail } => {
+            stmts_have_effects(stmts, program) || expr_has_effects(tail, program)
         }
         ExprKind::StructLit { fields } => fields.iter().any(|(_, e)| expr_has_effects(e, program)),
         ExprKind::Unary { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::Disclose(operand)
         | ExprKind::PersistentHash { arg: operand, .. }
+        | ExprKind::TransientHash { arg: operand, .. }
+        | ExprKind::DegradeToTransient(operand)
+        | ExprKind::UpgradeFromTransient(operand)
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
         | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_has_effects(operand, program),
+        ExprKind::PersistentCommit { value, rand, .. }
+        | ExprKind::TransientCommit { value, rand, .. } => {
+            expr_has_effects(value, program) || expr_has_effects(rand, program)
+        }
         ExprKind::Index { base, index } => {
             expr_has_effects(base, program) || expr_has_effects(index, program)
         }

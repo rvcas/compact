@@ -119,11 +119,13 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             return type_to_json(program, &program.new_type_decl(*id).inner);
         }
         Type::Maybe(_)
+        | Type::Either(_, _)
         | Type::MerkleTreeDigest
         | Type::MerkleTreePathEntry
         | Type::MerkleTreePath(_, _) => {
             let name = match ty {
                 Type::Maybe(_) => "Maybe",
+                Type::Either(_, _) => "Either",
                 Type::MerkleTreeDigest => "MerkleTreeDigest",
                 Type::MerkleTreePathEntry => "MerkleTreePathEntry",
                 Type::MerkleTreePath(_, _) => "MerkleTreePath",

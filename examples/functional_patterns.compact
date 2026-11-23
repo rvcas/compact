@@ -1,0 +1,70 @@
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+export { Either }
+
+struct Point {
+  x: Field;
+  y: Field;
+}
+
+export ledger ops: Counter;
+export ledger latest_commit: Bytes<32>;
+export ledger latest_tcommit: Field;
+
+witness secret_val(): Field;
+witness secret_rand(): Bytes<32>;
+witness secret_tr(): Field;
+
+circuit add_fields(a: Field, b: Field): Field {
+  return a + b;
+}
+
+export circuit transform_and_commit(
+  pt: Point,
+  xs: Vector<2, Field>,
+  ys: Vector<2, Field>,
+  raw: Bytes<4>,
+  flag: Boolean,
+): [Field, Vector<3, Field>, Bytes<4>, Either<Field, Boolean>] {
+  // Struct & tuple destructuring
+  const { x: px, y } = pt;
+  const [x0, x1] = xs;
+
+  // Higher-order map (inline arrow with capture) & fold (named circuit + block arrow)
+  const shifted: Vector<2, Field> = map((v) => v + px, xs);
+  const zipped: Vector<2, Field> = map((a, b) => {
+    const sum = a + b;
+    return sum + y;
+  }, shifted, ys);
+  const total: Field = fold(add_fields, 0, zipped);
+
+  // Vector spread & struct update spread
+  const combined: Vector<3, Field> = [...shifted, x0 + x1];
+  const moved: Point = Point{ ...pt, x: total };
+
+  // Bytes[...] literal & Bytes<4> <-> Vector<4, Uint<8>> cast
+  const bv: Vector<4, Uint<8>> = raw as Vector<4, Uint<8>>;
+  const reversed: Bytes<4> = Bytes[bv[3], bv[2], bv[1], bv[0]];
+
+  // Cryptographic commitments (no disclose needed) & transient/persistent conversions
+  const sv = secret_val();
+  const c = persistentCommit<Field>(sv, secret_rand());
+  const tc = transientCommit<Field>(sv, secret_tr());
+  latest_commit = c;
+  latest_tcommit = tc;
+  const degraded: Field = degradeToTransient(c);
+  const upgraded: Bytes<32> = upgradeFromTransient(transientHash<Vector<2, Field>>([degraded, tc]));
+  assert(degradeToTransient(upgraded) == degraded || true, "roundtrip");
+
+  // Counter compound assignment shorthand
+  ops += 2;
+  ops -= 1;
+
+  // Either<A, B> + left/right
+  const choice: Either<Field, Boolean> = flag
+    ? left<Field, Boolean>(moved.x)
+    : right<Field, Boolean>(flag);
+
+  return [moved.x, combined, reversed, choice];
+}

@@ -1,0 +1,656 @@
+---
+source: crates/compact-codegen-ts/src/lib.rs
+---
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+export { Either }
+
+struct Point {
+  x: Field;
+  y: Field;
+}
+
+export ledger ops: Counter;
+export ledger latest_commit: Bytes<32>;
+export ledger latest_tcommit: Field;
+
+witness secret_val(): Field;
+witness secret_rand(): Bytes<32>;
+witness secret_tr(): Field;
+
+circuit add_fields(a: Field, b: Field): Field {
+  return a + b;
+}
+
+export circuit transform_and_commit(
+  pt: Point,
+  xs: Vector<2, Field>,
+  ys: Vector<2, Field>,
+  raw: Bytes<4>,
+  flag: Boolean,
+): [Field, Vector<3, Field>, Bytes<4>, Either<Field, Boolean>] {
+  // Struct & tuple destructuring
+  const { x: px, y } = pt;
+  const [x0, x1] = xs;
+
+  // Higher-order map (inline arrow with capture) & fold (named circuit + block arrow)
+  const shifted: Vector<2, Field> = map((v) => v + px, xs);
+  const zipped: Vector<2, Field> = map((a, b) => {
+    const sum = a + b;
+    return sum + y;
+  }, shifted, ys);
+  const total: Field = fold(add_fields, 0, zipped);
+
+  // Vector spread & struct update spread
+  const combined: Vector<3, Field> = [...shifted, x0 + x1];
+  const moved: Point = Point{ ...pt, x: total };
+
+  // Bytes[...] literal & Bytes<4> <-> Vector<4, Uint<8>> cast
+  const bv: Vector<4, Uint<8>> = raw as Vector<4, Uint<8>>;
+  const reversed: Bytes<4> = Bytes[bv[3], bv[2], bv[1], bv[0]];
+
+  // Cryptographic commitments (no disclose needed) & transient/persistent conversions
+  const sv = secret_val();
+  const c = persistentCommit<Field>(sv, secret_rand());
+  const tc = transientCommit<Field>(sv, secret_tr());
+  latest_commit = c;
+  latest_tcommit = tc;
+  const degraded: Field = degradeToTransient(c);
+  const upgraded: Bytes<32> = upgradeFromTransient(transientHash<Vector<2, Field>>([degraded, tc]));
+  assert(degradeToTransient(upgraded) == degraded || true, "roundtrip");
+
+  // Counter compound assignment shorthand
+  ops += 2;
+  ops -= 1;
+
+  // Either<A, B> + left/right
+  const choice: Either<Field, Boolean> = flag
+    ? left<Field, Boolean>(moved.x)
+    : right<Field, Boolean>(flag);
+
+  return [moved.x, combined, reversed, choice];
+}
+===
+=== index.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Either<
+	A,
+	B
+> = {
+	is_left: boolean;
+	left: A;
+	right: B;
+};
+type Point = {
+	x: bigint;
+	y: bigint;
+};
+function _add_fields(a: bigint, b: bigint): bigint {
+	return a + b;
+}
+export type Witnesses<T> = {
+	secret_val(context: __compactRuntime.WitnessContext<Ledger, T>): [T, bigint];
+	secret_rand(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+	secret_tr(context: __compactRuntime.WitnessContext<Ledger, T>): [T, bigint];
+};
+export type ImpureCircuits<T> = {
+	transform_and_commit(context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	transform_and_commit(context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]>;
+};
+export type Ledger = {
+	readonly ops: bigint;
+	readonly latest_commit: Uint8Array;
+	readonly latest_tcommit: bigint;
+};
+export const pureCircuits: PureCircuits = {};
+export const ledger: (state: __compactRuntime.StateValue) => Ledger = (state: __compactRuntime.StateValue): Ledger => {
+	return {
+		ops: __compactRuntime.decodeCounter(state, 0),
+		latest_commit: __compactRuntime.decodeCell(state, 1),
+		latest_tcommit: __compactRuntime.decodeCell(state, 2)
+	};
+};
+export class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W) {
+		this.witnesses = witnesses;
+		this.impureCircuits = { transform_and_commit: (context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]> => {
+			const __pat_0: Point = pt;
+			const px: bigint = __pat_0.x;
+			const y: bigint = __pat_0.y;
+			const __pat_3: [bigint, bigint] = xs;
+			const x0: bigint = __pat_3[0];
+			const x1: bigint = __pat_3[1];
+			const shifted: [bigint, bigint] = (() => {
+				const __map_v_6: [bigint, bigint] = xs;
+				return [(() => {
+					const v: bigint = __map_v_6[0];
+					return v + px;
+				})(), (() => {
+					const v: bigint = __map_v_6[1];
+					return v + px;
+				})()];
+			})();
+			const zipped: [bigint, bigint] = (() => {
+				const __map_v_10: [bigint, bigint] = shifted;
+				const __map_v_11: [bigint, bigint] = ys;
+				return [(() => {
+					const a: bigint = __map_v_10[0];
+					const b: bigint = __map_v_11[0];
+					const sum: bigint = a + b;
+					return sum + y;
+				})(), (() => {
+					const a: bigint = __map_v_10[1];
+					const b: bigint = __map_v_11[1];
+					const sum: bigint = a + b;
+					return sum + y;
+				})()];
+			})();
+			const total: bigint = (() => {
+				const __fold_acc_19: bigint = 0n;
+				const __fold_v_20: [bigint, bigint] = zipped;
+				const __fold_acc_21: bigint = _add_fields(__fold_acc_19, __fold_v_20[0]);
+				const __fold_acc_22: bigint = _add_fields(__fold_acc_21, __fold_v_20[1]);
+				return __fold_acc_22;
+			})();
+			const combined: [bigint, bigint, bigint] = (() => {
+				const __spread_24: [bigint, bigint] = shifted;
+				return [
+					__spread_24[0],
+					__spread_24[1],
+					x0 + x1
+				];
+			})();
+			const moved: Point = (() => {
+				const __spread_26: Point = pt;
+				return {
+					x: total,
+					y: __spread_26.y
+				};
+			})();
+			const bv: [bigint, bigint, bigint, bigint] = Array.from(raw, (b) => {
+				return BigInt(b);
+			});
+			const reversed: Uint8Array = new Uint8Array([
+				Number(bv[3]),
+				Number(bv[2]),
+				Number(bv[1]),
+				Number(bv[0])
+			]);
+			const sv: bigint = __compactRuntime.callWitness(this.witnesses.secret_val, context);
+			const c: Uint8Array = __compactRuntime.persistentCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_rand, context));
+			const tc: bigint = __compactRuntime.transientCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_tr, context));
+			__compactRuntime.writeCell(context, 1, c);
+			__compactRuntime.writeCell(context, 2, tc);
+			const degraded: bigint = __compactRuntime.degradeToTransient(c);
+			const upgraded: Uint8Array = __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([degraded, tc]));
+			__compactRuntime.assert(__compactRuntime.degradeToTransient(upgraded) === degraded || true, "roundtrip");
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 2 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ subi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			const choice: Either<bigint, boolean> = flag ? {
+				is_left: true,
+				left: moved.x,
+				right: false
+			} : {
+				is_left: false,
+				left: 0n,
+				right: flag
+			};
+			return {
+				result: [
+					moved.x,
+					combined,
+					reversed,
+					choice
+				],
+				context
+			};
+		} };
+		this.circuits = { transform_and_commit: (context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]> => {
+			const __pat_0: Point = pt;
+			const px: bigint = __pat_0.x;
+			const y: bigint = __pat_0.y;
+			const __pat_3: [bigint, bigint] = xs;
+			const x0: bigint = __pat_3[0];
+			const x1: bigint = __pat_3[1];
+			const shifted: [bigint, bigint] = (() => {
+				const __map_v_6: [bigint, bigint] = xs;
+				return [(() => {
+					const v: bigint = __map_v_6[0];
+					return v + px;
+				})(), (() => {
+					const v: bigint = __map_v_6[1];
+					return v + px;
+				})()];
+			})();
+			const zipped: [bigint, bigint] = (() => {
+				const __map_v_10: [bigint, bigint] = shifted;
+				const __map_v_11: [bigint, bigint] = ys;
+				return [(() => {
+					const a: bigint = __map_v_10[0];
+					const b: bigint = __map_v_11[0];
+					const sum: bigint = a + b;
+					return sum + y;
+				})(), (() => {
+					const a: bigint = __map_v_10[1];
+					const b: bigint = __map_v_11[1];
+					const sum: bigint = a + b;
+					return sum + y;
+				})()];
+			})();
+			const total: bigint = (() => {
+				const __fold_acc_19: bigint = 0n;
+				const __fold_v_20: [bigint, bigint] = zipped;
+				const __fold_acc_21: bigint = _add_fields(__fold_acc_19, __fold_v_20[0]);
+				const __fold_acc_22: bigint = _add_fields(__fold_acc_21, __fold_v_20[1]);
+				return __fold_acc_22;
+			})();
+			const combined: [bigint, bigint, bigint] = (() => {
+				const __spread_24: [bigint, bigint] = shifted;
+				return [
+					__spread_24[0],
+					__spread_24[1],
+					x0 + x1
+				];
+			})();
+			const moved: Point = (() => {
+				const __spread_26: Point = pt;
+				return {
+					x: total,
+					y: __spread_26.y
+				};
+			})();
+			const bv: [bigint, bigint, bigint, bigint] = Array.from(raw, (b) => {
+				return BigInt(b);
+			});
+			const reversed: Uint8Array = new Uint8Array([
+				Number(bv[3]),
+				Number(bv[2]),
+				Number(bv[1]),
+				Number(bv[0])
+			]);
+			const sv: bigint = __compactRuntime.callWitness(this.witnesses.secret_val, context);
+			const c: Uint8Array = __compactRuntime.persistentCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_rand, context));
+			const tc: bigint = __compactRuntime.transientCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_tr, context));
+			__compactRuntime.writeCell(context, 1, c);
+			__compactRuntime.writeCell(context, 2, tc);
+			const degraded: bigint = __compactRuntime.degradeToTransient(c);
+			const upgraded: Uint8Array = __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([degraded, tc]));
+			__compactRuntime.assert(__compactRuntime.degradeToTransient(upgraded) === degraded || true, "roundtrip");
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 2 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ subi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			const choice: Either<bigint, boolean> = flag ? {
+				is_left: true,
+				left: moved.x,
+				right: false
+			} : {
+				is_left: false,
+				left: 0n,
+				right: flag
+			};
+			return {
+				result: [
+					moved.x,
+					combined,
+					reversed,
+					choice
+				],
+				context
+			};
+		} };
+	}
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T> {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.js ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+function _add_fields(a, b) {
+	return a + b;
+}
+export const pureCircuits = {};
+export const ledger = (state) => {
+	return {
+		ops: __compactRuntime.decodeCounter(state, 0),
+		latest_commit: __compactRuntime.decodeCell(state, 1),
+		latest_tcommit: __compactRuntime.decodeCell(state, 2)
+	};
+};
+export class Contract {
+	witnesses;
+	circuits;
+	impureCircuits;
+	constructor(witnesses) {
+		this.witnesses = witnesses;
+		this.impureCircuits = { transform_and_commit: (context, pt, xs, ys, raw, flag) => {
+			const __pat_0 = pt;
+			const px = __pat_0.x;
+			const y = __pat_0.y;
+			const __pat_3 = xs;
+			const x0 = __pat_3[0];
+			const x1 = __pat_3[1];
+			const shifted = (() => {
+				const __map_v_6 = xs;
+				return [(() => {
+					const v = __map_v_6[0];
+					return v + px;
+				})(), (() => {
+					const v = __map_v_6[1];
+					return v + px;
+				})()];
+			})();
+			const zipped = (() => {
+				const __map_v_10 = shifted;
+				const __map_v_11 = ys;
+				return [(() => {
+					const a = __map_v_10[0];
+					const b = __map_v_11[0];
+					const sum = a + b;
+					return sum + y;
+				})(), (() => {
+					const a = __map_v_10[1];
+					const b = __map_v_11[1];
+					const sum = a + b;
+					return sum + y;
+				})()];
+			})();
+			const total = (() => {
+				const __fold_acc_19 = 0n;
+				const __fold_v_20 = zipped;
+				const __fold_acc_21 = _add_fields(__fold_acc_19, __fold_v_20[0]);
+				const __fold_acc_22 = _add_fields(__fold_acc_21, __fold_v_20[1]);
+				return __fold_acc_22;
+			})();
+			const combined = (() => {
+				const __spread_24 = shifted;
+				return [
+					__spread_24[0],
+					__spread_24[1],
+					x0 + x1
+				];
+			})();
+			const moved = (() => {
+				const __spread_26 = pt;
+				return {
+					x: total,
+					y: __spread_26.y
+				};
+			})();
+			const bv = Array.from(raw, (b) => {
+				return BigInt(b);
+			});
+			const reversed = new Uint8Array([
+				Number(bv[3]),
+				Number(bv[2]),
+				Number(bv[1]),
+				Number(bv[0])
+			]);
+			const sv = __compactRuntime.callWitness(this.witnesses.secret_val, context);
+			const c = __compactRuntime.persistentCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_rand, context));
+			const tc = __compactRuntime.transientCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_tr, context));
+			__compactRuntime.writeCell(context, 1, c);
+			__compactRuntime.writeCell(context, 2, tc);
+			const degraded = __compactRuntime.degradeToTransient(c);
+			const upgraded = __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([degraded, tc]));
+			__compactRuntime.assert(__compactRuntime.degradeToTransient(upgraded) === degraded || true, "roundtrip");
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 2 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ subi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			const choice = flag ? {
+				is_left: true,
+				left: moved.x,
+				right: false
+			} : {
+				is_left: false,
+				left: 0n,
+				right: flag
+			};
+			return {
+				result: [
+					moved.x,
+					combined,
+					reversed,
+					choice
+				],
+				context
+			};
+		} };
+		this.circuits = { transform_and_commit: (context, pt, xs, ys, raw, flag) => {
+			const __pat_0 = pt;
+			const px = __pat_0.x;
+			const y = __pat_0.y;
+			const __pat_3 = xs;
+			const x0 = __pat_3[0];
+			const x1 = __pat_3[1];
+			const shifted = (() => {
+				const __map_v_6 = xs;
+				return [(() => {
+					const v = __map_v_6[0];
+					return v + px;
+				})(), (() => {
+					const v = __map_v_6[1];
+					return v + px;
+				})()];
+			})();
+			const zipped = (() => {
+				const __map_v_10 = shifted;
+				const __map_v_11 = ys;
+				return [(() => {
+					const a = __map_v_10[0];
+					const b = __map_v_11[0];
+					const sum = a + b;
+					return sum + y;
+				})(), (() => {
+					const a = __map_v_10[1];
+					const b = __map_v_11[1];
+					const sum = a + b;
+					return sum + y;
+				})()];
+			})();
+			const total = (() => {
+				const __fold_acc_19 = 0n;
+				const __fold_v_20 = zipped;
+				const __fold_acc_21 = _add_fields(__fold_acc_19, __fold_v_20[0]);
+				const __fold_acc_22 = _add_fields(__fold_acc_21, __fold_v_20[1]);
+				return __fold_acc_22;
+			})();
+			const combined = (() => {
+				const __spread_24 = shifted;
+				return [
+					__spread_24[0],
+					__spread_24[1],
+					x0 + x1
+				];
+			})();
+			const moved = (() => {
+				const __spread_26 = pt;
+				return {
+					x: total,
+					y: __spread_26.y
+				};
+			})();
+			const bv = Array.from(raw, (b) => {
+				return BigInt(b);
+			});
+			const reversed = new Uint8Array([
+				Number(bv[3]),
+				Number(bv[2]),
+				Number(bv[1]),
+				Number(bv[0])
+			]);
+			const sv = __compactRuntime.callWitness(this.witnesses.secret_val, context);
+			const c = __compactRuntime.persistentCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_rand, context));
+			const tc = __compactRuntime.transientCommit(sv, __compactRuntime.callWitness(this.witnesses.secret_tr, context));
+			__compactRuntime.writeCell(context, 1, c);
+			__compactRuntime.writeCell(context, 2, tc);
+			const degraded = __compactRuntime.degradeToTransient(c);
+			const upgraded = __compactRuntime.upgradeFromTransient(__compactRuntime.transientHash([degraded, tc]));
+			__compactRuntime.assert(__compactRuntime.degradeToTransient(upgraded) === degraded || true, "roundtrip");
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ addi: { immediate: 2 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			__compactRuntime.queryLedger(context, [
+				{ idx: {
+					cached: false,
+					pushPath: true,
+					path: 0
+				} },
+				{ subi: { immediate: 1 } },
+				{ ins: {
+					cached: true,
+					n: 1
+				} }
+			]);
+			const choice = flag ? {
+				is_left: true,
+				left: moved.x,
+				right: false
+			} : {
+				is_left: false,
+				left: 0n,
+				right: flag
+			};
+			return {
+				result: [
+					moved.x,
+					combined,
+					reversed,
+					choice
+				],
+				context
+			};
+		} };
+	}
+	initialState(context) {
+		return __compactRuntime.emptyContractState(context);
+	}
+}
+
+=== index.d.ts ===
+import * as __compactRuntime from "@midnight-ntwrk/compact-runtime";
+export type Either<
+	A,
+	B
+> = {
+	is_left: boolean;
+	left: A;
+	right: B;
+};
+type Point = {
+	x: bigint;
+	y: bigint;
+};
+export type Witnesses<T> = {
+	secret_val(context: __compactRuntime.WitnessContext<Ledger, T>): [T, bigint];
+	secret_rand(context: __compactRuntime.WitnessContext<Ledger, T>): [T, Uint8Array];
+	secret_tr(context: __compactRuntime.WitnessContext<Ledger, T>): [T, bigint];
+};
+export type ImpureCircuits<T> = {
+	transform_and_commit(context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]>;
+};
+export type PureCircuits = {};
+export type Circuits<T> = {
+	transform_and_commit(context: __compactRuntime.CircuitContext<T>, pt: Point, xs: [bigint, bigint], ys: [bigint, bigint], raw: Uint8Array, flag: boolean): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint, bigint], Uint8Array, Either<bigint, boolean>]>;
+};
+export type Ledger = {
+	readonly ops: bigint;
+	readonly latest_commit: Uint8Array;
+	readonly latest_tcommit: bigint;
+};
+export declare const pureCircuits: PureCircuits;
+export declare const ledger: (state: __compactRuntime.StateValue) => Ledger;
+export declare class Contract<
+	T,
+	W extends Witnesses<T> = Witnesses<T>
+> {
+	witnesses: W;
+	circuits: Circuits<T>;
+	impureCircuits: ImpureCircuits<T>;
+	constructor(witnesses: W);
+	initialState(context: __compactRuntime.ConstructorContext<T>): __compactRuntime.ConstructorResult<T>;
+}
+export {};

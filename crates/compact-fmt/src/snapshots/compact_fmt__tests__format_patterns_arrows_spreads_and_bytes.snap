@@ -1,0 +1,45 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+import CompactStandardLibrary;
+export ledger ops:Counter;
+struct Point{x:Field;y:Field;}
+export circuit demo(pt:Point,v:Vector<2,Field>,raw:Bytes<4>):[Field,Bytes<4>]{
+  const {x:px,y}=pt;
+  const [a,b]=v;
+  const doubled=map((n)=>n+px,v);
+  const sum=fold((acc:Field,n:Field):Field=>{const t=acc+n;return t;},0,doubled);
+  const next=Point{...pt,x:sum};
+  const ext:Vector<3,Field> = [...doubled,a+b];
+  const bv=raw as Vector<4,Uint<8>>;
+  const rev=Bytes[bv[3],bv[2],bv[1],bv[0]];
+  ops+=2;
+  ops-=1;
+  return [next.x+ext[2],rev];
+}
+===
+import CompactStandardLibrary;
+
+export ledger ops: Counter;
+
+struct Point {
+  x: Field;
+  y: Field;
+}
+
+export circuit demo(pt: Point, v: Vector<2, Field>, raw: Bytes<4>): [Field, Bytes<4>] {
+  const { x: px, y } = pt;
+  const [a, b] = v;
+  const doubled = map((n) => n + px, v);
+  const sum = fold((acc: Field, n: Field): Field => {
+    const t = acc + n;
+    return t;
+  }, 0, doubled);
+  const next = Point{ ...pt, x: sum };
+  const ext: Vector<3, Field> = [...doubled, a + b];
+  const bv = raw as Vector<4, Uint<8>>;
+  const rev = Bytes[bv[3], bv[2], bv[1], bv[0]];
+  ops += 2;
+  ops -= 1;
+  return [next.x + ext[2], rev];
+}

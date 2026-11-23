@@ -797,4 +797,12 @@ mod tests {
             compile_all_zkir
         );
     }
+
+    #[test]
+    fn zkir_patterns_map_fold_and_commits() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/functional_patterns.compact"),
+            compile_all_zkir
+        );
+    }
 }
