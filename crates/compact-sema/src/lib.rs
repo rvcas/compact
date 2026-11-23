@@ -52,7 +52,12 @@ pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
     };
 
     witness::reject_recursive_circuits(file, &program, &mut analyzer.diagnostics);
-    propagate_purity(file, &mut program, &analyzer.circuit_sigs, &mut analyzer.diagnostics);
+    propagate_purity(
+        file,
+        &mut program,
+        &analyzer.circuit_sigs,
+        &mut analyzer.diagnostics,
+    );
     if !analyzer.diagnostics.has_errors() {
         witness::check_witness_disclosure(file, &program, &mut analyzer.diagnostics);
     }
@@ -220,7 +225,10 @@ impl<'a> Analyzer<'a> {
             return;
         }
         let mut variants = Vec::new();
-        for vtok in self.ast.extra_tokens(decl.variants_start, decl.variants_end) {
+        for vtok in self
+            .ast
+            .extra_tokens(decl.variants_start, decl.variants_end)
+        {
             let vname = self.text(vtok).to_owned();
             if variants.contains(&vname) {
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -337,7 +345,10 @@ impl<'a> Analyzer<'a> {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.file,
                                 self.ast.node_span(node),
-                                format!("`List` expects 1 type argument, found {}", arg_nodes.len()),
+                                format!(
+                                    "`List` expects 1 type argument, found {}",
+                                    arg_nodes.len()
+                                ),
                             ));
                             return None;
                         }
@@ -567,11 +578,13 @@ impl<'a> Analyzer<'a> {
                 let arg_nodes: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
                 match name {
                     "Bytes" => {
-                        let len = self.expect_type_nat(&arg_nodes, 0, "Bytes", self.ast.node_span(node))?;
+                        let len =
+                            self.expect_type_nat(&arg_nodes, 0, "Bytes", self.ast.node_span(node))?;
                         Some(Type::Bytes(len))
                     }
                     "Uint" => {
-                        let bits = self.expect_type_nat(&arg_nodes, 0, "Uint", self.ast.node_span(node))?;
+                        let bits =
+                            self.expect_type_nat(&arg_nodes, 0, "Uint", self.ast.node_span(node))?;
                         Some(Type::Uint(bits))
                     }
                     "Opaque" => {
@@ -594,11 +607,19 @@ impl<'a> Analyzer<'a> {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.file,
                                 self.ast.node_span(node),
-                                format!("`Vector` expects 2 type arguments, found {}", arg_nodes.len()),
+                                format!(
+                                    "`Vector` expects 2 type arguments, found {}",
+                                    arg_nodes.len()
+                                ),
                             ));
                             return None;
                         }
-                        let len = self.expect_type_nat(&arg_nodes, 0, "Vector", self.ast.node_span(node))?;
+                        let len = self.expect_type_nat(
+                            &arg_nodes,
+                            0,
+                            "Vector",
+                            self.ast.node_span(node),
+                        )?;
                         let elem = self.resolve_type(arg_nodes[1])?;
                         Some(Type::Vector(len, Box::new(elem)))
                     }
@@ -607,7 +628,10 @@ impl<'a> Analyzer<'a> {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.file,
                                 self.ast.node_span(node),
-                                format!("`Maybe` expects 1 type argument, found {}", arg_nodes.len()),
+                                format!(
+                                    "`Maybe` expects 1 type argument, found {}",
+                                    arg_nodes.len()
+                                ),
                             ));
                             return None;
                         }
@@ -915,8 +939,7 @@ impl<'a> Analyzer<'a> {
                 *next_local += 1;
                 let mut loop_scope = scope.clone();
                 loop_scope.insert(var_name.clone(), ValueBinding::Local(local, Type::Uint(64)));
-                let body =
-                    self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
+                let body = self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
                 Some(Stmt::ForRange {
                     local,
                     name: var_name,
@@ -932,7 +955,9 @@ impl<'a> Analyzer<'a> {
                 let iter = self.check_expr(stmt.iter, scope, None)?;
                 let (len, elem_ty) = match &iter.ty {
                     Type::Vector(len, elem) => (*len, (**elem).clone()),
-                    Type::Tuple(elems) if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) => {
+                    Type::Tuple(elems)
+                        if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) =>
+                    {
                         (elems.len() as u32, elems[0].clone())
                     }
                     other => {
@@ -950,9 +975,11 @@ impl<'a> Analyzer<'a> {
                 let local = LocalId(*next_local);
                 *next_local += 1;
                 let mut loop_scope = scope.clone();
-                loop_scope.insert(var_name.clone(), ValueBinding::Local(local, elem_ty.clone()));
-                let body =
-                    self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
+                loop_scope.insert(
+                    var_name.clone(),
+                    ValueBinding::Local(local, elem_ty.clone()),
+                );
+                let body = self.check_stmt_list(stmt.body, &loop_scope, next_local, expected_ret);
                 Some(Stmt::ForEach {
                     local,
                     name: var_name,
@@ -1303,10 +1330,7 @@ impl<'a> Analyzer<'a> {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.file,
                             self.ast.token_span(sf.name_token),
-                            format!(
-                                "struct `{}` has no field `{fname}`",
-                                self.format_type(&ty)
-                            ),
+                            format!("struct `{}` has no field `{fname}`", self.format_type(&ty)),
                         ));
                         return None;
                     };
@@ -1520,8 +1544,10 @@ impl<'a> Analyzer<'a> {
                         return None;
                     }
                 }
-                if matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
-                    && !matches!(lhs.ty, Type::Uint(_))
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) && !matches!(lhs.ty, Type::Uint(_))
                 {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.file,
@@ -1772,7 +1798,10 @@ impl<'a> Analyzer<'a> {
             self.diagnostics.push(CompactDiagnostic::error(
                 self.file,
                 call_span,
-                format!("`pad` expects 2 arguments (length, string), found {}", arg_nodes.len()),
+                format!(
+                    "`pad` expects 2 arguments (length, string), found {}",
+                    arg_nodes.len()
+                ),
             ));
             return None;
         }
@@ -1921,8 +1950,7 @@ impl<'a> Analyzer<'a> {
                     ));
                     return None;
                 }
-                let depth =
-                    self.expect_type_nat(targ_nodes, 0, "merkleTreePathRoot", call_span)?;
+                let depth = self.expect_type_nat(targ_nodes, 0, "merkleTreePathRoot", call_span)?;
                 let leaf_ty = self.resolve_type(targ_nodes[1])?;
                 let expected_path_ty = Type::MerkleTreePath(depth, Box::new(leaf_ty.clone()));
                 let mut path = self.check_expr(arg_nodes[0], scope, Some(&expected_path_ty))?;
@@ -2363,7 +2391,12 @@ impl<'a> Analyzer<'a> {
                         ));
                         return None;
                     }
-                    make_call(LedgerOp::ListPushFront, vec![elem], Type::unit(), target_adt)
+                    make_call(
+                        LedgerOp::ListPushFront,
+                        vec![elem],
+                        Type::unit(),
+                        target_adt,
+                    )
                 }
                 other => {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -3035,13 +3068,18 @@ mod tests {
     #[test]
     fn rejects_out_of_range_counter_increment() {
         let mut sm = SourceMap::new();
-        let src = "export ledger round: Counter; export circuit inc(): [] { round.increment(70000); }";
+        let src =
+            "export ledger round: Counter; export circuit inc(): [] { round.increment(70000); }";
         let id = sm.add_file("test.compact", src);
         let file = sm.get(id);
         let parsed = parse(file);
         let checked = check(file, &parsed.ast);
         assert!(checked.diagnostics.has_errors());
-        assert!(checked.diagnostics.diagnostics[0].message.contains("Uint<16>"));
+        assert!(
+            checked.diagnostics.diagnostics[0]
+                .message
+                .contains("Uint<16>")
+        );
     }
 
     #[test]

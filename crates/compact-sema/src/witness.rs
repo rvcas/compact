@@ -166,8 +166,12 @@ impl<'a> WitnessChecker<'a> {
                 Stmt::ForRange { local, body, .. } => {
                     let mut loop_locals = locals.clone();
                     loop_locals.insert(*local, Taint::clean());
-                    let bt =
-                        self.check_stmts_in_scope(body, param_taints, &mut loop_locals, guard_taint);
+                    let bt = self.check_stmts_in_scope(
+                        body,
+                        param_taints,
+                        &mut loop_locals,
+                        guard_taint,
+                    );
                     ret_taint = ret_taint.merge(&bt);
                 }
                 Stmt::ForEach {
@@ -176,14 +180,20 @@ impl<'a> WitnessChecker<'a> {
                     let it = self.check_expr(iter, param_taints, locals, guard_taint);
                     let mut loop_locals = locals.clone();
                     loop_locals.insert(*local, it);
-                    let bt =
-                        self.check_stmts_in_scope(body, param_taints, &mut loop_locals, guard_taint);
+                    let bt = self.check_stmts_in_scope(
+                        body,
+                        param_taints,
+                        &mut loop_locals,
+                        guard_taint,
+                    );
                     ret_taint = ret_taint.merge(&bt);
                 }
                 Stmt::Expr(expr) => {
                     let _ = self.check_expr(expr, param_taints, locals, guard_taint);
                 }
-                Stmt::Return { value: Some(expr), .. } => {
+                Stmt::Return {
+                    value: Some(expr), ..
+                } => {
                     let t = self.check_expr(expr, param_taints, locals, guard_taint);
                     ret_taint = ret_taint.merge(&t);
                 }
@@ -327,7 +337,14 @@ pub fn reject_recursive_circuits(
     let mut state = vec![0u8; n];
     for id in 0..n {
         if state[id] == 0 {
-            dfs_cycle(CircuitId(id as u32), &adj, &mut state, file, program, diagnostics);
+            dfs_cycle(
+                CircuitId(id as u32),
+                &adj,
+                &mut state,
+                file,
+                program,
+                diagnostics,
+            );
         }
     }
 }

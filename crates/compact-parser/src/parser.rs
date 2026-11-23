@@ -72,7 +72,11 @@ impl<'a> Parser<'a> {
             self.diagnostics.push(CompactDiagnostic::error(
                 self.file,
                 self.ast.token_span(tok),
-                format!("expected `{}`, found `{}`", expected.as_str(), found.as_str()),
+                format!(
+                    "expected `{}`, found `{}`",
+                    expected.as_str(),
+                    found.as_str()
+                ),
             ));
             None
         }
@@ -290,7 +294,9 @@ impl<'a> Parser<'a> {
         let params = self.parse_param_list()?;
         let body = self.parse_block()?;
         let (params_start, params_end) = self.ast.push_extra_slice(&params);
-        let (extra_start, _) = self.ast.push_extra_slice(&[params_start, params_end, body.0]);
+        let (extra_start, _) = self
+            .ast
+            .push_extra_slice(&[params_start, params_end, body.0]);
         Some(self.ast.push_node(
             NodeTag::ConstructorDecl,
             ctor_tok,
@@ -307,13 +313,9 @@ impl<'a> Parser<'a> {
         let body = self.parse_block()?;
 
         let (params_start, params_end) = self.ast.push_extra_slice(&params);
-        let (extra_start, _) = self.ast.push_extra_slice(&[
-            name_tok.0,
-            params_start,
-            params_end,
-            ret_type.0,
-            body.0,
-        ]);
+        let (extra_start, _) =
+            self.ast
+                .push_extra_slice(&[name_tok.0, params_start, params_end, ret_type.0, body.0]);
         Some(self.ast.push_node(
             NodeTag::CircuitDecl,
             circuit_tok,
@@ -341,11 +343,10 @@ impl<'a> Parser<'a> {
         let name_tok = self.expect(TokenTag::Ident)?;
         self.expect(TokenTag::Colon)?;
         let type_node = self.parse_type()?;
-        Some(self.ast.push_node(
-            NodeTag::Param,
-            name_tok,
-            NodeData::new(type_node.0, 0),
-        ))
+        Some(
+            self.ast
+                .push_node(NodeTag::Param, name_tok, NodeData::new(type_node.0, 0)),
+        )
     }
 
     fn parse_type(&mut self) -> Option<NodeIndex> {
@@ -431,7 +432,10 @@ impl<'a> Parser<'a> {
             if let Some(stmt) = self.parse_stmt() {
                 stmts.push(stmt.0);
             } else {
-                while !matches!(self.peek(), TokenTag::Semi | TokenTag::RBrace | TokenTag::Eof) {
+                while !matches!(
+                    self.peek(),
+                    TokenTag::Semi | TokenTag::RBrace | TokenTag::Eof
+                ) {
                     self.advance();
                 }
                 if self.peek() == TokenTag::Semi {
@@ -530,14 +534,13 @@ impl<'a> Parser<'a> {
         } else {
             NodeIndex::NONE
         };
-        let (extra_start, _) =
+        let (extra_start, _) = self
+            .ast
+            .push_extra_slice(&[cond.0, then_branch.0, else_branch.0]);
+        Some(
             self.ast
-                .push_extra_slice(&[cond.0, then_branch.0, else_branch.0]);
-        Some(self.ast.push_node(
-            NodeTag::IfStmt,
-            if_tok,
-            NodeData::new(extra_start, 0),
-        ))
+                .push_node(NodeTag::IfStmt, if_tok, NodeData::new(extra_start, 0)),
+        )
     }
 
     fn parse_for_stmt(&mut self) -> Option<NodeIndex> {
@@ -587,14 +590,13 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_stmt()?
             };
-            let (extra_start, _) =
+            let (extra_start, _) = self
+                .ast
+                .push_extra_slice(&[name_tok.0, first_expr.0, body.0]);
+            Some(
                 self.ast
-                    .push_extra_slice(&[name_tok.0, first_expr.0, body.0]);
-            Some(self.ast.push_node(
-                NodeTag::ForEachStmt,
-                for_tok,
-                NodeData::new(extra_start, 0),
-            ))
+                    .push_node(NodeTag::ForEachStmt, for_tok, NodeData::new(extra_start, 0)),
+            )
         }
     }
 
@@ -612,11 +614,10 @@ impl<'a> Parser<'a> {
             let (extra_start, _) =
                 self.ast
                     .push_extra_slice(&[cond.0, then_branch.0, else_branch.0]);
-            Some(self.ast.push_node(
-                NodeTag::TernaryExpr,
-                q_tok,
-                NodeData::new(extra_start, 0),
-            ))
+            Some(
+                self.ast
+                    .push_node(NodeTag::TernaryExpr, q_tok, NodeData::new(extra_start, 0)),
+            )
         } else {
             Some(cond)
         }
@@ -627,11 +628,9 @@ impl<'a> Parser<'a> {
         while self.peek() == TokenTag::PipePipe {
             let op_tok = self.advance();
             let rhs = self.parse_and_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }
@@ -641,11 +640,9 @@ impl<'a> Parser<'a> {
         while self.peek() == TokenTag::AmpAmp {
             let op_tok = self.advance();
             let rhs = self.parse_equality_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }
@@ -655,11 +652,9 @@ impl<'a> Parser<'a> {
         while matches!(self.peek(), TokenTag::EqEq | TokenTag::BangEq) {
             let op_tok = self.advance();
             let rhs = self.parse_relational_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }
@@ -672,11 +667,9 @@ impl<'a> Parser<'a> {
         ) {
             let op_tok = self.advance();
             let rhs = self.parse_additive_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }
@@ -686,11 +679,9 @@ impl<'a> Parser<'a> {
         while matches!(self.peek(), TokenTag::Plus | TokenTag::Minus) {
             let op_tok = self.advance();
             let rhs = self.parse_multiplicative_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }
@@ -700,11 +691,9 @@ impl<'a> Parser<'a> {
         while self.peek() == TokenTag::Star {
             let op_tok = self.advance();
             let rhs = self.parse_cast_expr()?;
-            lhs = self.ast.push_node(
-                NodeTag::BinaryExpr,
-                op_tok,
-                NodeData::new(lhs.0, rhs.0),
-            );
+            lhs = self
+                .ast
+                .push_node(NodeTag::BinaryExpr, op_tok, NodeData::new(lhs.0, rhs.0));
         }
         Some(lhs)
     }

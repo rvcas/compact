@@ -676,12 +676,9 @@ impl Program {
                     )
                     .unwrap(),
                     Stmt::Expr(e) => writeln!(out, "    ExprStmt {:?}", e.kind).unwrap(),
-                    Stmt::Return { value, .. } => writeln!(
-                        out,
-                        "    Return {:?}",
-                        value.as_ref().map(|v| &v.kind)
-                    )
-                    .unwrap(),
+                    Stmt::Return { value, .. } => {
+                        writeln!(out, "    Return {:?}", value.as_ref().map(|v| &v.kind)).unwrap()
+                    }
                 }
             }
         }

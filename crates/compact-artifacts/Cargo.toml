@@ -2,6 +2,7 @@
 name = "compact-artifacts"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 compact-hir.workspace = true

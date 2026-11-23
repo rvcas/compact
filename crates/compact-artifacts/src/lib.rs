@@ -65,7 +65,10 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
         }
         Type::Uint(bits) => {
             map.insert("type-name".into(), Value::String("Uint".into()));
-            map.insert("maxval".into(), Value::String(((1u128 << bits) - 1).to_string()));
+            map.insert(
+                "maxval".into(),
+                Value::String(((1u128 << bits) - 1).to_string()),
+            );
         }
         Type::Bytes(len) => {
             map.insert("type-name".into(), Value::String("Bytes".into()));
@@ -142,7 +145,12 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
     Value::Object(map)
 }
 
-fn insert_adt_fields(program: &Program, adt: &LedgerAdt, tag_key: &str, map: &mut Map<String, Value>) {
+fn insert_adt_fields(
+    program: &Program,
+    adt: &LedgerAdt,
+    tag_key: &str,
+    map: &mut Map<String, Value>,
+) {
     match adt {
         LedgerAdt::Counter => {
             map.insert(tag_key.into(), Value::String("Counter".into()));
@@ -273,11 +281,26 @@ pub fn render_contract_info(program: &Program) -> String {
 /// with file sizes and SHA-256 hashes (matching upstream `save-manifest.ss`).
 pub fn render_contract_manifest(output_dir: &Path, subdirs: &[&str]) -> std::io::Result<String> {
     let mut root = Map::new();
-    root.insert("manifest-version".into(), Value::String(MANIFEST_VERSION.into()));
-    root.insert("compiler-version".into(), Value::String(COMPILER_VERSION.into()));
-    root.insert("compiler-commit".into(), Value::String(COMPILER_COMMIT.into()));
-    root.insert("language-version".into(), Value::String(LANGUAGE_VERSION.into()));
-    root.insert("runtime-version".into(), Value::String(RUNTIME_VERSION.into()));
+    root.insert(
+        "manifest-version".into(),
+        Value::String(MANIFEST_VERSION.into()),
+    );
+    root.insert(
+        "compiler-version".into(),
+        Value::String(COMPILER_VERSION.into()),
+    );
+    root.insert(
+        "compiler-commit".into(),
+        Value::String(COMPILER_COMMIT.into()),
+    );
+    root.insert(
+        "language-version".into(),
+        Value::String(LANGUAGE_VERSION.into()),
+    );
+    root.insert(
+        "runtime-version".into(),
+        Value::String(RUNTIME_VERSION.into()),
+    );
 
     for &subdir in subdirs {
         let dir_path = output_dir.join(subdir);
@@ -309,7 +332,10 @@ fn dir_entry(dir: &Path) -> std::io::Result<Value> {
             let mut file_obj = Map::new();
             file_obj.insert("type".into(), Value::String("file".into()));
             file_obj.insert("size".into(), Value::Number((bytes.len() as u64).into()));
-            file_obj.insert("hash".into(), Value::String(hex::encode(Sha256::digest(&bytes))));
+            file_obj.insert(
+                "hash".into(),
+                Value::String(hex::encode(Sha256::digest(&bytes))),
+            );
             files.insert(name, Value::Object(file_obj));
         }
     }

@@ -2,6 +2,7 @@
 name = "compact-diagnostics"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 compact-span.workspace = true

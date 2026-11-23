@@ -187,7 +187,11 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
 
     writeln!(out, "  \"inputs\": [").unwrap();
     for (idx, &inp) in circuit.inputs.iter().enumerate() {
-        let comma = if idx + 1 < circuit.inputs.len() { "," } else { "" };
+        let comma = if idx + 1 < circuit.inputs.len() {
+            ","
+        } else {
+            ""
+        };
         writeln!(
             out,
             "    {{ \"name\": \"{}\", \"type\": \"Scalar<BLS12-381>\" }}{comma}",
@@ -199,7 +203,11 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
 
     writeln!(out, "  \"outputs\": [").unwrap();
     for idx in 0..circuit.output_count {
-        let comma = if idx + 1 < circuit.output_count { "," } else { "" };
+        let comma = if idx + 1 < circuit.output_count {
+            ","
+        } else {
+            ""
+        };
         writeln!(out, "    \"Scalar<BLS12-381>\"{comma}").unwrap();
     }
     writeln!(out, "  ],").unwrap();

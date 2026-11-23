@@ -270,12 +270,16 @@ impl<'a> Formatter<'a> {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
             NodeTag::TypeNamed | NodeTag::TypeNat | NodeTag::TypeString => {
-                self.out
-                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.out.push_str(
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source),
+                );
             }
             NodeTag::TypeGeneric => {
-                self.out
-                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.out.push_str(
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source),
+                );
                 self.out.push('<');
                 let args: Vec<_> = self.ast.extra_nodes(data.lhs, data.rhs).collect();
                 for (i, arg) in args.into_iter().enumerate() {
@@ -423,8 +427,10 @@ impl<'a> Formatter<'a> {
             | NodeTag::IntLitExpr
             | NodeTag::BoolLitExpr
             | NodeTag::StringLitExpr => {
-                self.out
-                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.out.push_str(
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source),
+                );
             }
             NodeTag::TupleExpr => {
                 self.out.push('[');
@@ -487,8 +493,10 @@ impl<'a> Formatter<'a> {
                 self.out.push(')');
             }
             NodeTag::UnaryExpr => {
-                self.out
-                    .push_str(self.ast.token_text(self.ast.node_main_token(node), self.source));
+                self.out.push_str(
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source),
+                );
                 self.format_expr(NodeIndex(data.lhs));
             }
             NodeTag::BinaryExpr => {
@@ -496,7 +504,8 @@ impl<'a> Formatter<'a> {
                 write!(
                     self.out,
                     " {} ",
-                    self.ast.token_text(self.ast.node_main_token(node), self.source)
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source)
                 )
                 .unwrap();
                 self.format_expr(NodeIndex(data.rhs));

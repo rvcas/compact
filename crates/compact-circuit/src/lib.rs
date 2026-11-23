@@ -726,7 +726,8 @@ impl<'a> CircuitLowerer<'a> {
         let ret_vals = self.lower_circuit_body(circuit, &param_vals, &CircuitVal::TRUE);
         let output_count = wire_count(self.program, &circuit.ret_type);
         if output_count > 0 {
-            self.instructions.push(CircuitInstr::Output { vals: ret_vals });
+            self.instructions
+                .push(CircuitInstr::Output { vals: ret_vals });
         }
 
         ProofCircuit {
@@ -1006,11 +1007,8 @@ impl<'a> CircuitLowerer<'a> {
                         let mut eq_vars = Vec::with_capacity(lvals.len());
                         for (a, b) in lvals.into_iter().zip(rvals) {
                             let eq = self.fresh_var("t");
-                            self.instructions.push(CircuitInstr::TestEq {
-                                a,
-                                b,
-                                output: eq,
-                            });
+                            self.instructions
+                                .push(CircuitInstr::TestEq { a, b, output: eq });
                             eq_vars.push(CircuitVal::Var(eq));
                         }
                         let mut acc = eq_vars
@@ -1128,7 +1126,8 @@ impl<'a> CircuitLowerer<'a> {
                     .next()
                     .unwrap_or(CircuitVal::FALSE);
                 if guard.is_const_true() {
-                    self.instructions.push(CircuitInstr::Assert { cond: cond_val });
+                    self.instructions
+                        .push(CircuitInstr::Assert { cond: cond_val });
                 } else {
                     let guarded = self.fresh_var("t");
                     self.instructions.push(CircuitInstr::CondSelect {
@@ -1563,7 +1562,13 @@ impl<'a> CircuitLowerer<'a> {
                                 value: ImpactStateValue::Null,
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Ins {
@@ -1707,7 +1712,13 @@ impl<'a> CircuitLowerer<'a> {
                                 value: val_state,
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Ins {
@@ -1749,7 +1760,13 @@ impl<'a> CircuitLowerer<'a> {
                                 value: val_state,
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Ins {
@@ -2073,7 +2090,13 @@ impl<'a> CircuitLowerer<'a> {
                                 },
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
                         self.emit_impact(
                             guard,
@@ -2204,7 +2227,13 @@ impl<'a> CircuitLowerer<'a> {
                                 },
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
                         self.emit_impact(
                             guard,
@@ -2246,7 +2275,13 @@ impl<'a> CircuitLowerer<'a> {
                                 value: ImpactStateValue::Null,
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+                        self.emit_impact(
+                            guard,
+                            ImpactVmOp::Ins {
+                                cached: false,
+                                n: 1,
+                            },
+                        );
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Ins {
@@ -2376,7 +2411,13 @@ impl<'a> CircuitLowerer<'a> {
             );
             self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 2 });
         }
-        self.emit_impact(guard, ImpactVmOp::Ins { cached: false, n: 1 });
+        self.emit_impact(
+            guard,
+            ImpactVmOp::Ins {
+                cached: false,
+                n: 1,
+            },
+        );
         if len > 1 {
             self.emit_impact(
                 guard,
@@ -2418,8 +2459,7 @@ fn expr_has_effects(expr: &Expr, program: &Program) -> bool {
             true
         }
         ExprKind::CircuitCall { circuit, args } => {
-            !program.circuit(*circuit).pure
-                || args.iter().any(|a| expr_has_effects(a, program))
+            !program.circuit(*circuit).pure || args.iter().any(|a| expr_has_effects(a, program))
         }
         ExprKind::Tuple(elems) | ExprKind::Vector(elems) => {
             elems.iter().any(|e| expr_has_effects(e, program))

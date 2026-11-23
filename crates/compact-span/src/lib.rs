@@ -79,7 +79,12 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    pub fn new(id: FileId, name: impl Into<String>, path: Option<PathBuf>, text: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        id: FileId,
+        name: impl Into<String>,
+        path: Option<PathBuf>,
+        text: impl Into<Arc<str>>,
+    ) -> Self {
         let text: Arc<str> = text.into();
         let line_starts = compute_line_starts(&text);
         Self {

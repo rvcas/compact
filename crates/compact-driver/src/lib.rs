@@ -8,9 +8,7 @@ use std::time::Instant;
 use compact_artifacts::{render_contract_info, render_contract_manifest};
 use compact_circuit::lower_to_circuits;
 use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
-use compact_codegen_zkir::{
-    ZkirError, analyze_model, compile_keys_with_model, generate_zkir,
-};
+use compact_codegen_zkir::{ZkirError, analyze_model, compile_keys_with_model, generate_zkir};
 use compact_diagnostics::DiagnosticBag;
 use compact_fmt::{FormatOptions, format_ast};
 use compact_hir::Program as HirProgram;
@@ -125,7 +123,8 @@ pub fn build_with_reporter(
     for sub in OUTPUT_SUBDIRECTORIES {
         let dir = options.target.join(sub);
         if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|source| DriverError::PrepareDir { path: dir, source })?;
+            fs::remove_dir_all(&dir)
+                .map_err(|source| DriverError::PrepareDir { path: dir, source })?;
         }
     }
 
@@ -285,7 +284,10 @@ pub fn check_with_reporter(
 
     reporter.status(
         "Finished",
-        &format!("`{source_display}` in {:.2}s", started.elapsed().as_secs_f64()),
+        &format!(
+            "`{source_display}` in {:.2}s",
+            started.elapsed().as_secs_f64()
+        ),
     );
     Ok(hir)
 }
@@ -309,7 +311,11 @@ pub fn format_source(path: &Path, text: &str, line_length: usize) -> Result<Stri
     let file = sm.get(file_id);
     let parsed = parse(file);
     let ast = parsed.diagnostics.into_result(parsed.ast)?;
-    Ok(format_ast(&ast, file.text(), &FormatOptions { line_length }))
+    Ok(format_ast(
+        &ast,
+        file.text(),
+        &FormatOptions { line_length },
+    ))
 }
 
 fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), DriverError> {
@@ -379,9 +385,10 @@ mod tests {
         assert!(out_dir.join("compiler/contract-manifest.json").is_file());
 
         // Verify source map JSON references counter.compact
-        let map_json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(out_dir.join("contract/index.js.map")).unwrap())
-                .unwrap();
+        let map_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("contract/index.js.map")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(map_json["version"], 3);
         assert_eq!(map_json["sources"][0], "counter.compact");
 
@@ -459,7 +466,8 @@ mod tests {
 
     #[test]
     fn end_to_end_build_and_check_election() {
-        let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/election.compact");
+        let src_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/election.compact");
         let dir = tempdir().unwrap();
         let out_dir = dir.path().join("out");
 
@@ -527,7 +535,8 @@ mod tests {
 
     #[test]
     fn end_to_end_build_and_check_zerocash() {
-        let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/zerocash.compact");
+        let src_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/zerocash.compact");
         let dir = tempdir().unwrap();
         let out_dir = dir.path().join("out");
 

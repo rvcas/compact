@@ -59,9 +59,8 @@ pub fn generate_ts(input: &TsCodegenInput<'_>) -> Result<GeneratedTs, TsCodegenE
         .code;
 
     // 2. Derive `.d.ts` directly from the same TS AST via oxc_isolated_declarations.
-    let dts_ret =
-        IsolatedDeclarations::new(&allocator, IsolatedDeclarationsOptions::default())
-            .build(&ts_program);
+    let dts_ret = IsolatedDeclarations::new(&allocator, IsolatedDeclarationsOptions::default())
+        .build(&ts_program);
     if !dts_ret.diagnostics.is_empty() {
         let msgs: Vec<_> = dts_ret.diagnostics.iter().map(|d| d.to_string()).collect();
         return Err(TsCodegenError::IsolatedDeclarations(msgs));
@@ -72,7 +71,9 @@ pub fn generate_ts(input: &TsCodegenInput<'_>) -> Result<GeneratedTs, TsCodegenE
         .code;
 
     // 3. Strip TypeScript types in-place via oxc_semantic + oxc_transformer.
-    let sem_ret = SemanticBuilder::new().with_enum_eval(true).build(&ts_program);
+    let sem_ret = SemanticBuilder::new()
+        .with_enum_eval(true)
+        .build(&ts_program);
     let scoping = sem_ret.semantic.into_scoping();
     let tx_opts = TransformOptions::default();
     let tx_ret = Transformer::new(&allocator, Path::new("index.ts"), &tx_opts)
@@ -200,10 +201,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         );
         let type_arguments =
             type_args.map(|params| TSTypeParameterInstantiation::boxed(SPAN, params, self));
-        TSType::new_ts_type_reference(SPAN, TSTypeName::QualifiedName(qualified), type_arguments, self)
+        TSType::new_ts_type_reference(
+            SPAN,
+            TSTypeName::QualifiedName(qualified),
+            type_arguments,
+            self,
+        )
     }
 
-    fn ts_type_annotation(&self, ty: TSType<'a>) -> oxc_allocator::ArenaBox<'a, TSTypeAnnotation<'a>> {
+    fn ts_type_annotation(
+        &self,
+        ty: TSType<'a>,
+    ) -> oxc_allocator::ArenaBox<'a, TSTypeAnnotation<'a>> {
         TSTypeAnnotation::boxed(SPAN, ty, self)
     }
 
@@ -391,24 +400,18 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             .exported_stdlib_types
             .iter()
             .any(|s| s == "Maybe")
-            || self
-                .input
-                .program
-                .circuits
-                .iter()
-                .any(|c| ty_uses_maybe(&c.ret_type) || c.params.iter().any(|p| ty_uses_maybe(&p.ty)))
+            || self.input.program.circuits.iter().any(|c| {
+                ty_uses_maybe(&c.ret_type) || c.params.iter().any(|p| ty_uses_maybe(&p.ty))
+            })
             || self
                 .input
                 .program
                 .ledger_fields
                 .iter()
                 .any(|f| adt_uses_maybe(&f.adt, f.exported))
-            || self
-                .input
-                .program
-                .witnesses
-                .iter()
-                .any(|w| ty_uses_maybe(&w.ret_type) || w.params.iter().any(|p| ty_uses_maybe(&p.ty)))
+            || self.input.program.witnesses.iter().any(|w| {
+                ty_uses_maybe(&w.ret_type) || w.params.iter().any(|p| ty_uses_maybe(&p.ty))
+            })
     }
 
     fn build_maybe_type(&self, exported: bool) -> Statement<'a> {
@@ -556,7 +559,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         for (idx, variant) in decl.variants.iter().enumerate() {
             members.push(TSEnumMember::new(
                 SPAN,
-                TSEnumMemberName::Identifier(IdentifierName::boxed(SPAN, self.ident(variant), self)),
+                TSEnumMemberName::Identifier(IdentifierName::boxed(
+                    SPAN,
+                    self.ident(variant),
+                    self,
+                )),
                 Some(self.expr_num(SPAN, idx as f64)),
                 self,
             ));
@@ -620,7 +627,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 SPAN,
                 ArenaVec::new_in(self),
                 self.binding_ident(SPAN, "context"),
-                Some(self.ts_type_annotation(self.ts_runtime_type("CircuitContext", Some(ctx_targs)))),
+                Some(
+                    self.ts_type_annotation(
+                        self.ts_runtime_type("CircuitContext", Some(ctx_targs)),
+                    ),
+                ),
                 None,
                 false,
                 None,
@@ -655,7 +666,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
         let func = Declaration::new_function_declaration(
             span,
             FunctionType::FunctionDeclaration,
-            Some(BindingIdentifier::new(span, self.ident(&format!("_{}", circuit.name)), self)),
+            Some(BindingIdentifier::new(
+                span,
+                self.ident(&format!("_{}", circuit.name)),
+                self,
+            )),
             false,
             false,
             false,
@@ -722,7 +737,9 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 SPAN,
                 ArenaVec::new_in(self),
                 self.binding_ident(SPAN, "context"),
-                Some(self.ts_type_annotation(self.ts_runtime_type("WitnessContext", Some(ctx_args)))),
+                Some(
+                    self.ts_type_annotation(self.ts_runtime_type("WitnessContext", Some(ctx_args))),
+                ),
                 None,
                 false,
                 None,
@@ -744,13 +761,8 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     self,
                 ));
             }
-            let formal_params = FormalParameters::boxed(
-                SPAN,
-                FormalParameterKind::Signature,
-                params,
-                None,
-                self,
-            );
+            let formal_params =
+                FormalParameters::boxed(SPAN, FormalParameterKind::Signature, params, None, self);
             let mut ret_tuple = ArenaVec::with_capacity_in(2, self);
             ret_tuple.push(TSTupleElement::from(self.ts_type_ref("T", None)));
             ret_tuple.push(TSTupleElement::from(self.hir_type_to_ts(&w.ret_type)));
@@ -822,7 +834,9 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 SPAN,
                 ArenaVec::new_in(self),
                 self.binding_ident(SPAN, "context"),
-                Some(self.ts_type_annotation(self.ts_runtime_type("CircuitContext", Some(ctx_args)))),
+                Some(
+                    self.ts_type_annotation(self.ts_runtime_type("CircuitContext", Some(ctx_args))),
+                ),
                 None,
                 false,
                 None,
@@ -845,13 +859,8 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 self,
             ));
         }
-        let formal_params = FormalParameters::boxed(
-            SPAN,
-            FormalParameterKind::Signature,
-            params,
-            None,
-            self,
-        );
+        let formal_params =
+            FormalParameters::boxed(SPAN, FormalParameterKind::Signature, params, None, self);
         let ret_ty = if with_context {
             let mut res_args = ArenaVec::with_capacity_in(2, self);
             res_args.push(self.ts_type_ref("T", None));
@@ -1556,7 +1565,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             &mut else_locals,
                             wrap_circuit_results,
                         );
-                        (Some(Statement::new_block_statement(SPAN, else_stmts, self)), er)
+                        (
+                            Some(Statement::new_block_statement(SPAN, else_stmts, self)),
+                            er,
+                        )
                     };
                     if then_ret && else_ret {
                         returned = true;
@@ -1792,11 +1804,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             | Type::MerkleTreeDigest
             | Type::MerkleTreePathEntry
             | Type::MerkleTreePath(_, _) => {
-                let fields = self
-                    .input
-                    .program
-                    .struct_fields_of(ty)
-                    .unwrap_or_default();
+                let fields = self.input.program.struct_fields_of(ty).unwrap_or_default();
                 let mut props = ArenaVec::with_capacity_in(fields.len(), self);
                 for (fname, fty) in fields {
                     props.push(ObjectPropertyKind::new_object_property(
@@ -2173,7 +2181,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 };
                 match op {
                     LedgerOp::CounterIncrement | LedgerOp::CounterDecrement
-                        if key_path.is_empty() && matches!(args.first().map(|a| &a.kind), Some(ExprKind::IntLit(_))) =>
+                        if key_path.is_empty()
+                            && matches!(
+                                args.first().map(|a| &a.kind),
+                                Some(ExprKind::IntLit(_))
+                            ) =>
                     {
                         let amount = match args.first().map(|a| &a.kind) {
                             Some(ExprKind::IntLit(v)) => *v as f64,
@@ -2263,7 +2275,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         }
                         self.expr_call(
                             span,
-                            self.expr_member(span, self.expr_ident(span, "__compactRuntime"), rt_fn),
+                            self.expr_member(
+                                span,
+                                self.expr_ident(span, "__compactRuntime"),
+                                rt_fn,
+                            ),
                             call_args,
                         )
                     }
@@ -2310,9 +2326,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             SPAN,
             ArenaVec::new_in(self),
             self.binding_ident(SPAN, "context"),
-            Some(self.ts_type_annotation(
-                self.ts_runtime_type("ConstructorContext", Some(ctx_targs)),
-            )),
+            Some(
+                self.ts_type_annotation(
+                    self.ts_runtime_type("ConstructorContext", Some(ctx_targs)),
+                ),
+            ),
             None,
             false,
             None,
