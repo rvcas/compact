@@ -3,9 +3,11 @@ pub mod status;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use compact_artifacts::{render_contract_info, render_contract_manifest};
+use compact_ast::Ast;
 use compact_circuit::lower_to_circuits;
 use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
 use compact_codegen_zkir::{ZkirError, analyze_model, compile_keys_with_model, generate_zkir};
@@ -13,12 +15,57 @@ use compact_diagnostics::DiagnosticBag;
 use compact_fmt::{FormatOptions, format_ast};
 use compact_hir::Program as HirProgram;
 use compact_parser::parse;
-use compact_sema::check as sema_check;
-use compact_span::SourceMap;
+use compact_sema::{LoadError, ModuleLoader, check_with_loader};
+use compact_span::{FileId, SourceFile, SourceMap};
 use miette::Diagnostic;
 use rayon::prelude::*;
 use status::{StatusReporter, TermStatusReporter};
 use thiserror::Error;
+
+/// Filesystem-backed module & include loader resolving `.compact` files relative to the importer.
+struct FsModuleLoader {
+    next_file_id: AtomicU32,
+}
+
+impl FsModuleLoader {
+    fn new() -> Self {
+        Self {
+            next_file_id: AtomicU32::new(1),
+        }
+    }
+}
+
+impl ModuleLoader for FsModuleLoader {
+    fn load(
+        &self,
+        from_file: &SourceFile,
+        specifier: &str,
+    ) -> Result<(SourceFile, Ast), LoadError> {
+        let base_dir = from_file
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        let mut candidate = base_dir.join(specifier);
+        if candidate.extension().is_none() {
+            candidate.set_extension("compact");
+        }
+        let text = fs::read_to_string(&candidate).map_err(|_| {
+            LoadError::NotFound(format!(
+                "failed to locate file `{specifier}` (tried `{}`)",
+                candidate.display()
+            ))
+        })?;
+        let id = FileId(self.next_file_id.fetch_add(1, Ordering::Relaxed));
+        let display = candidate.display().to_string();
+        let sf = SourceFile::new(id, display, Some(candidate), text);
+        let parsed = parse(&sf);
+        if parsed.diagnostics.has_errors() {
+            return Err(LoadError::ParseFailed(parsed.diagnostics));
+        }
+        Ok((sf, parsed.ast))
+    }
+}
 
 pub const OUTPUT_SUBDIRECTORIES: &[&str] = &["compiler", "contract", "zkir", "keys"];
 
@@ -106,7 +153,8 @@ pub fn build_with_reporter(
     let ast = parsed.diagnostics.into_result(parsed.ast)?;
 
     reporter.status("Checking", &source_display);
-    let checked = sema_check(file, &ast);
+    let loader = FsModuleLoader::new();
+    let checked = check_with_loader(file, &ast, &loader);
     let hir = checked.diagnostics.into_result(checked.program)?;
 
     // Lower proof circuits.
@@ -279,7 +327,8 @@ pub fn check_with_reporter(
 
     let parsed = parse(file);
     let ast = parsed.diagnostics.into_result(parsed.ast)?;
-    let checked = sema_check(file, &ast);
+    let loader = FsModuleLoader::new();
+    let checked = check_with_loader(file, &ast, &loader);
     let hir = checked.diagnostics.into_result(checked.program)?;
 
     reporter.status(
@@ -653,5 +702,57 @@ mod tests {
         assert_eq!(info["ledger"][1]["storage"], "Map");
         assert_eq!(info["ledger"][1]["value"]["type-name"], "Map");
         assert_eq!(info["ledger"][1]["value"]["value"]["type-name"], "Counter");
+    }
+
+    #[test]
+    fn end_to_end_build_and_check_modular() {
+        let src_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/modular/main.compact");
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+
+        let check_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let hir = check_with_reporter(
+            &CheckOptions {
+                source: src_path.clone(),
+            },
+            &check_reporter,
+        )
+        .unwrap();
+        assert_eq!(hir.ledger_fields.len(), 2);
+        assert!(hir.new_types.iter().any(|nt| nt.name == "AccountId"));
+        assert!(hir.new_types.iter().any(|nt| nt.name == "Tag_4"));
+
+        let build_reporter = CaptureReporter(Mutex::new(Vec::new()));
+        let report = build_with_reporter(
+            &BuildOptions {
+                source: src_path.clone(),
+                target: out_dir.clone(),
+                skip_zk: true,
+            },
+            &build_reporter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.proof_circuits,
+            vec!["V_init_key", "bump_three", "deposit"]
+        );
+        for name in ["V_init_key", "bump_three", "deposit"] {
+            assert!(out_dir.join(format!("zkir/{name}.zkir")).is_file());
+            assert!(out_dir.join(format!("zkir/{name}.bzkir")).is_file());
+        }
+        assert!(out_dir.join("contract/index.js").is_file());
+        assert!(out_dir.join("contract/index.d.ts").is_file());
+        assert!(out_dir.join("contract/index.js.map").is_file());
+        assert!(out_dir.join("compiler/contract-info.json").is_file());
+        assert!(out_dir.join("compiler/contract-manifest.json").is_file());
+
+        let info: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("compiler/contract-info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info["circuits"].as_array().unwrap().len(), 3);
+        assert_eq!(info["ledger"].as_array().unwrap().len(), 2);
     }
 }

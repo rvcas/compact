@@ -1,0 +1,13 @@
+import CompactStandardLibrary;
+
+module vault<K> {
+  export ledger balances: Map<K, Counter>;
+
+  export circuit init_key(k: K): [] {
+    balances.insertDefault(disclose(k));
+  }
+
+  export circuit bump(k: K, amount: Uint<16>): [] {
+    balances.lookup(disclose(k)).increment(disclose(amount));
+  }
+}

@@ -115,6 +115,9 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             map.insert("name".into(), Value::String(decl.name.clone()));
             map.insert("elements".into(), Value::Array(elements));
         }
+        Type::NewType(id) => {
+            return type_to_json(program, &program.new_type_decl(*id).inner);
+        }
         Type::Maybe(_)
         | Type::MerkleTreeDigest
         | Type::MerkleTreePathEntry

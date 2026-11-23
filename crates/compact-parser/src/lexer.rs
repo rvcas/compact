@@ -209,6 +209,10 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
                     TokenTag::Dot
                 }
             }
+            b'#' => {
+                pos += 1;
+                TokenTag::Hash
+            }
             b'?' => {
                 pos += 1;
                 TokenTag::Question
@@ -291,6 +295,11 @@ fn keyword_or_ident(text: &str) -> TokenTag {
     match text {
         "import" => TokenTag::Import,
         "export" => TokenTag::Export,
+        "include" => TokenTag::Include,
+        "from" => TokenTag::From,
+        "prefix" => TokenTag::Prefix,
+        "type" => TokenTag::Type,
+        "new" => TokenTag::New,
         "ledger" => TokenTag::Ledger,
         "sealed" => TokenTag::Sealed,
         "circuit" => TokenTag::Circuit,

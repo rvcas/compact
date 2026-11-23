@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use compact_hir::{
-    BinaryOp, Circuit, CircuitId, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId, Param,
-    Program as HirProgram, Stmt, StructDecl, Type, UnaryOp,
+    BinaryOp, Circuit, CircuitId, EnumDecl, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
+    NewTypeDecl, Param, Program as HirProgram, Stmt, StructDecl, Type, UnaryOp,
 };
 use compact_span::Span as CompactSpan;
 use oxc_allocator::{Allocator, ArenaVec, GetAllocator};
@@ -253,6 +253,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 let decl = self.input.program.struct_decl(*id);
                 self.ts_type_ref(&decl.name, None)
             }
+            Type::NewType(id) => {
+                let decl = self.input.program.new_type_decl(*id);
+                self.ts_type_ref(&decl.name, None)
+            }
             Type::Maybe(inner) => {
                 let mut targs = ArenaVec::with_capacity_in(1, self);
                 targs.push(self.hir_type_to_ts(inner));
@@ -295,7 +299,12 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 | ExprKind::PersistentHash { arg: operand, .. }
                 | ExprKind::MerkleTreePathRoot { path: operand, .. }
                 | ExprKind::FieldAccess { base: operand, .. }
+                | ExprKind::Slice { base: operand, .. }
                 | ExprKind::MaybeSome(operand) => visit_expr(operand, out),
+                ExprKind::Index { base, index } => {
+                    visit_expr(base, out);
+                    visit_expr(index, out);
+                }
                 ExprKind::StructLit { fields } => {
                     for (_, e) in fields {
                         visit_expr(e, out);
@@ -480,6 +489,11 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             body.push(self.build_struct_decl(struct_decl));
         }
 
+        // Emit nominal `new type` aliases.
+        for nt_decl in &self.input.program.new_types {
+            body.push(self.build_new_type_decl(nt_decl));
+        }
+
         // Emit helper functions for non-exported circuits and any circuit called by another circuit/constructor.
         let called_circuits = self.collect_called_circuits();
         for circuit in &self.input.program.circuits {
@@ -607,6 +621,22 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             BindingIdentifier::new(SPAN, self.ident(&decl.name), self),
             None,
             obj,
+            false,
+            self,
+        );
+        if decl.exported {
+            Statement::new_export_declaration(SPAN, td, self)
+        } else {
+            Statement::from(td)
+        }
+    }
+
+    fn build_new_type_decl(&self, decl: &NewTypeDecl) -> Statement<'a> {
+        let td = Declaration::new_ts_type_alias_declaration(
+            self.oxc_span(decl.span),
+            BindingIdentifier::new(SPAN, self.ident(&decl.name), self),
+            None,
+            self.hir_type_to_ts(&decl.inner),
             false,
             self,
         );
@@ -1799,6 +1829,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 }
                 Expression::new_array_expression(span, arr, self)
             }
+            Type::NewType(id) => {
+                let inner = &self.input.program.new_type_decl(*id).inner;
+                self.default_expr_for_type(span, inner)
+            }
             Type::Struct(_)
             | Type::Maybe(_)
             | Type::MerkleTreeDigest
@@ -2074,6 +2108,27 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
             }
             ExprKind::FieldAccess { base, field } => {
                 self.expr_member(span, self.lower_expr(params, base, locals), field)
+            }
+            ExprKind::Index { base, index } => {
+                let obj = self.lower_expr(params, base, locals);
+                let idx_expr = match &index.kind {
+                    ExprKind::IntLit(v) => self.expr_num(span, *v as f64),
+                    _ => {
+                        let mut nargs = ArenaVec::with_capacity_in(1, self);
+                        nargs.push(Argument::from(self.lower_expr(params, index, locals)));
+                        self.expr_call(span, self.expr_ident(span, "Number"), nargs)
+                    }
+                };
+                Expression::ComputedMemberExpression(ComputedMemberExpression::boxed(
+                    span, obj, idx_expr, false, self,
+                ))
+            }
+            ExprKind::Slice { base, start, len } => {
+                let obj = self.lower_expr(params, base, locals);
+                let mut sargs = ArenaVec::with_capacity_in(2, self);
+                sargs.push(Argument::from(self.expr_num(span, *start as f64)));
+                sargs.push(Argument::from(self.expr_num(span, (*start + *len) as f64)));
+                self.expr_call(span, self.expr_member(span, obj, "slice"), sargs)
             }
             ExprKind::MaybeSome(inner) => {
                 let mut props = ArenaVec::with_capacity_in(2, self);
@@ -2607,6 +2662,46 @@ mod tests {
     fn codegen_adt_showcase_contract() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/adt_showcase.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_modules_and_generics() {
+        assert_compact_snapshot!(
+            r#"
+            pragma language_version >= 0.16.0;
+
+            import CompactStandardLibrary;
+
+            export new type AccountId = Bytes<32>;
+            struct Pair<A, B> {
+              first: A;
+              second: B;
+            }
+
+            module CounterMod<#N> {
+              export ledger count: Counter;
+              export circuit bump(): [] {
+                for (const i of 0..N) {
+                  count.increment(1);
+                }
+              }
+            }
+
+            import { bump as bump_two } from CounterMod<2>;
+            export { bump_two }
+
+            circuit first<A, B>(p: Pair<A, B>): A {
+              return p.first;
+            }
+
+            export circuit sample(acct: AccountId, v: Vector<3, Field>, idx: Uint<8>): [Field, Vector<2, Field>] {
+              const p: Pair<Field, AccountId> = Pair<Field, AccountId>{ first: v[0], second: acct };
+              bump_two();
+              return [first<Field, AccountId>(p) + v[idx], slice<2>(v, 1)];
+            }
+            "#,
             compile_ts_bundle
         );
     }

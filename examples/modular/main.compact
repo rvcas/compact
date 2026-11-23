@@ -1,0 +1,42 @@
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+include "types";
+import "vault"<Field> prefix V_;
+
+module CounterBurst<#N> {
+  export ledger ticks: Counter;
+
+  export circuit bump_all(): [] {
+    for (const i of 0..N) {
+      ticks.increment(1);
+    }
+  }
+}
+
+import { bump_all as bump_three } from CounterBurst<3>;
+export { V_init_key, bump_three }
+
+circuit pick_first<A, B>(p: Pair<A, B>): A {
+  return p.first;
+}
+
+circuit head_two<#N>(v: Vector<N, Field>): Vector<2, Field> {
+  return slice<2>(v, 0);
+}
+
+export circuit deposit(
+  acct: AccountId,
+  key: Field,
+  batch: Vector<3, Field>,
+  idx: Uint<8>,
+): [Field, Vector<2, Field>, Tag<4>] {
+  const raw: Bytes<32> = acct as Bytes<32>;
+  const tag: Tag<4> = slice<4>(raw, 0) as Tag<4>;
+  const pair: Pair<Field, AccountId> = Pair<Field, AccountId>{ first: disclose(key), second: acct };
+  const k = pick_first<Field, AccountId>(pair);
+  const amt: Amount = 5;
+  V_bump(k, amt);
+  const picked = batch[0] + batch[idx];
+  return [picked, head_two<3>(batch), tag];
+}

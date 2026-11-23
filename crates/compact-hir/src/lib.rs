@@ -9,6 +9,9 @@ pub struct EnumId(pub u32);
 pub struct StructId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NewTypeId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LedgerFieldId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +184,9 @@ pub enum Type {
     Tuple(Vec<Type>),
     Enum(EnumId),
     Struct(StructId),
+    /// Nominal user-defined `new type Name = Inner;` distinct during type checking,
+    /// with the same wire representation as `Inner`.
+    NewType(NewTypeId),
     /// Standard-library `Maybe<T> { is_some: Boolean, value: T }`.
     Maybe(Box<Type>),
     /// Standard-library `MerkleTreeDigest { field: Field }`.
@@ -222,6 +228,15 @@ pub struct StructDecl {
     pub id: StructId,
     pub name: String,
     pub fields: Vec<StructField>,
+    pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTypeDecl {
+    pub id: NewTypeId,
+    pub name: String,
+    pub inner: Type,
     pub exported: bool,
     pub span: Span,
 }
@@ -361,6 +376,17 @@ pub enum ExprKind {
         base: Box<Expr>,
         field: String,
     },
+    /// Tuple or vector indexing (`base[index]`).
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Fixed-length slice (`slice<len>(base, start)`) over `Vector`, `Tuple`, or `Bytes`.
+    Slice {
+        base: Box<Expr>,
+        start: u32,
+        len: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +454,7 @@ pub struct Circuit {
 pub struct Program {
     pub enums: Vec<EnumDecl>,
     pub structs: Vec<StructDecl>,
+    pub new_types: Vec<NewTypeDecl>,
     pub ledger_fields: Vec<LedgerField>,
     pub witnesses: Vec<WitnessDecl>,
     pub constructor: Option<Constructor>,
@@ -445,9 +472,21 @@ impl Program {
         &self.structs[id.0 as usize]
     }
 
+    pub fn new_type_decl(&self, id: NewTypeId) -> &NewTypeDecl {
+        &self.new_types[id.0 as usize]
+    }
+
+    /// Peel any layers of nominal `new type` wrappers to obtain the representation type.
+    pub fn underlying_type<'a>(&'a self, mut ty: &'a Type) -> &'a Type {
+        while let Type::NewType(id) = ty {
+            ty = &self.new_type_decl(*id).inner;
+        }
+        ty
+    }
+
     /// Return ordered `(field_name, field_type)` pairs for any user-defined or stdlib struct type.
     pub fn struct_fields_of(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
-        match ty {
+        match self.underlying_type(ty) {
             Type::Struct(id) => Some(
                 self.struct_decl(*id)
                     .fields
@@ -505,6 +544,7 @@ impl Program {
             }
             Type::Enum(id) => self.enum_decl(*id).name.clone(),
             Type::Struct(id) => self.struct_decl(*id).name.clone(),
+            Type::NewType(id) => self.new_type_decl(*id).name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
             Type::MerkleTreeDigest => "MerkleTreeDigest".into(),
             Type::MerkleTreePathEntry => "MerkleTreePathEntry".into(),
@@ -562,6 +602,17 @@ impl Program {
                 if s.exported { "export " } else { "" },
                 s.name,
                 fields.join(", ")
+            )
+            .unwrap();
+        }
+        for nt in &self.new_types {
+            writeln!(
+                out,
+                "  NewType #{} {}{} = {}",
+                nt.id.0,
+                if nt.exported { "export " } else { "" },
+                nt.name,
+                self.format_type(&nt.inner)
             )
             .unwrap();
         }

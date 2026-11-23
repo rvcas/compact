@@ -61,7 +61,7 @@ impl<'a> Formatter<'a> {
             }
             let first_tok = self.decl_first_token(decl);
             self.emit_comments_before(first_tok, 0);
-            self.format_decl(decl);
+            self.format_decl(decl, 0);
             self.out.push('\n');
         }
     }
@@ -69,6 +69,25 @@ impl<'a> Formatter<'a> {
     fn decl_first_token(&self, node: NodeIndex) -> TokenIndex {
         let main = self.ast.node_main_token(node);
         match self.ast.node_tag(node) {
+            NodeTag::ModuleDecl => {
+                let d = self.ast.module_decl(node);
+                if d.exported {
+                    TokenIndex(main.0.saturating_sub(1))
+                } else {
+                    main
+                }
+            }
+            NodeTag::TypeDecl => {
+                let d = self.ast.type_decl(node);
+                let mut offset = 0u32;
+                if d.exported {
+                    offset += 1;
+                }
+                if d.is_new {
+                    offset += 1;
+                }
+                TokenIndex(main.0.saturating_sub(offset))
+            }
             NodeTag::EnumDecl => {
                 let d = self.ast.enum_decl(node);
                 if d.exported {
@@ -119,16 +138,162 @@ impl<'a> Formatter<'a> {
         }
     }
 
-    fn format_decl(&mut self, node: NodeIndex) {
+    fn format_generic_params(&mut self, start: u32, end: u32) {
+        if start == end {
+            return;
+        }
+        self.out.push('<');
+        let gps: Vec<_> = self.ast.extra_nodes(start, end).collect();
+        for (i, gp_node) in gps.into_iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(", ");
+            }
+            let gp = self.ast.generic_param(gp_node);
+            if gp.is_nat {
+                self.out.push('#');
+            }
+            self.out
+                .push_str(self.ast.token_text(gp.name_token, self.source));
+        }
+        self.out.push('>');
+    }
+
+    fn format_version_expr(&mut self, node: NodeIndex) {
+        let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
-            NodeTag::ImportDecl => {
-                let decl = self.ast.import_decl(node);
+            NodeTag::VersionAtom => {
+                self.out
+                    .push_str(self.ast.node_span(node).slice(self.source));
+            }
+            NodeTag::VersionUnary => {
+                let op = self
+                    .ast
+                    .token_text(self.ast.node_main_token(node), self.source);
+                self.out.push_str(op);
+                if op != "!" {
+                    self.out.push(' ');
+                }
+                self.format_version_expr(NodeIndex(data.lhs));
+            }
+            NodeTag::VersionBinary => {
+                self.format_version_expr(NodeIndex(data.lhs));
                 write!(
                     self.out,
-                    "import {};",
+                    " {} ",
+                    self.ast
+                        .token_text(self.ast.node_main_token(node), self.source)
+                )
+                .unwrap();
+                self.format_version_expr(NodeIndex(data.rhs));
+            }
+            _ => {}
+        }
+    }
+
+    fn format_decl(&mut self, node: NodeIndex, indent: usize) {
+        let pad = "  ".repeat(indent);
+        match self.ast.node_tag(node) {
+            NodeTag::PragmaDecl => {
+                let decl = self.ast.pragma_decl(node);
+                write!(
+                    self.out,
+                    "{pad}pragma {} ",
                     self.ast.token_text(decl.name_token, self.source)
                 )
                 .unwrap();
+                self.format_version_expr(decl.expr);
+                self.out.push(';');
+            }
+            NodeTag::IncludeDecl => {
+                let decl = self.ast.include_decl(node);
+                write!(
+                    self.out,
+                    "{pad}include {};",
+                    self.ast.token_text(decl.path_token, self.source)
+                )
+                .unwrap();
+            }
+            NodeTag::ModuleDecl => {
+                let decl = self.ast.module_decl(node);
+                self.out.push_str(&pad);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                write!(
+                    self.out,
+                    "module {}",
+                    self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+                self.format_generic_params(decl.gparams_start, decl.gparams_end);
+                let inner: Vec<_> = self
+                    .ast
+                    .extra_nodes(decl.decls_start, decl.decls_end)
+                    .collect();
+                if inner.is_empty() {
+                    self.out.push_str(" {}");
+                } else {
+                    self.out.push_str(" {\n");
+                    for (i, d) in inner.into_iter().enumerate() {
+                        if i > 0 {
+                            self.out.push('\n');
+                        }
+                        let first_tok = self.decl_first_token(d);
+                        self.emit_comments_before(first_tok, indent + 1);
+                        self.format_decl(d, indent + 1);
+                        self.out.push('\n');
+                    }
+                    write!(self.out, "{pad}}}").unwrap();
+                }
+            }
+            NodeTag::ImportDecl => {
+                let decl = self.ast.import_decl(node);
+                write!(self.out, "{pad}import ").unwrap();
+                let items: Vec<_> = self
+                    .ast
+                    .extra_nodes(decl.items_start, decl.items_end)
+                    .collect();
+                if !items.is_empty() {
+                    self.out.push_str("{ ");
+                    for (i, item_node) in items.into_iter().enumerate() {
+                        if i > 0 {
+                            self.out.push_str(", ");
+                        }
+                        let item = self.ast.import_item(item_node);
+                        self.out
+                            .push_str(self.ast.token_text(item.name_token, self.source));
+                        if let Some(alias) = item.alias_token {
+                            write!(self.out, " as {}", self.ast.token_text(alias, self.source))
+                                .unwrap();
+                        }
+                    }
+                    self.out.push_str(" } from ");
+                }
+                self.out
+                    .push_str(self.ast.token_text(decl.name_token, self.source));
+                let gargs: Vec<_> = self
+                    .ast
+                    .extra_nodes(decl.gargs_start, decl.gargs_end)
+                    .collect();
+                if !gargs.is_empty() {
+                    self.out.push('<');
+                    for (i, garg) in gargs.into_iter().enumerate() {
+                        if i > 0 {
+                            self.out.push_str(", ");
+                        }
+                        self.format_type(garg);
+                    }
+                    self.out.push('>');
+                }
+                if let Some(prefix) = decl.prefix_token {
+                    write!(
+                        self.out,
+                        " prefix {}",
+                        self.ast.token_text(prefix, self.source)
+                    )
+                    .unwrap();
+                }
+                self.out.push(';');
             }
             NodeTag::ExportListDecl => {
                 let decl = self.ast.export_list_decl(node);
@@ -137,10 +302,31 @@ impl<'a> Formatter<'a> {
                     .extra_tokens(decl.names_start, decl.names_end)
                     .map(|t| self.ast.token_text(t, self.source))
                     .collect();
-                write!(self.out, "export {{ {} }};", names.join(", ")).unwrap();
+                write!(self.out, "{pad}export {{ {} }};", names.join(", ")).unwrap();
+            }
+            NodeTag::TypeDecl => {
+                let decl = self.ast.type_decl(node);
+                self.out.push_str(&pad);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                if decl.is_new {
+                    self.out.push_str("new ");
+                }
+                write!(
+                    self.out,
+                    "type {}",
+                    self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+                self.format_generic_params(decl.gparams_start, decl.gparams_end);
+                self.out.push_str(" = ");
+                self.format_type(decl.target_type);
+                self.out.push(';');
             }
             NodeTag::EnumDecl => {
                 let decl = self.ast.enum_decl(node);
+                self.out.push_str(&pad);
                 if decl.exported {
                     self.out.push_str("export ");
                 }
@@ -159,15 +345,18 @@ impl<'a> Formatter<'a> {
             }
             NodeTag::StructDecl => {
                 let decl = self.ast.struct_decl(node);
+                self.out.push_str(&pad);
                 if decl.exported {
                     self.out.push_str("export ");
                 }
-                writeln!(
+                write!(
                     self.out,
-                    "struct {} {{",
+                    "struct {}",
                     self.ast.token_text(decl.name_token, self.source)
                 )
                 .unwrap();
+                self.format_generic_params(decl.gparams_start, decl.gparams_end);
+                self.out.push_str(" {\n");
                 let fields: Vec<_> = self
                     .ast
                     .extra_nodes(decl.fields_start, decl.fields_end)
@@ -176,17 +365,18 @@ impl<'a> Formatter<'a> {
                     let sf = self.ast.struct_field(f);
                     write!(
                         self.out,
-                        "  {}: ",
+                        "{pad}  {}: ",
                         self.ast.token_text(sf.name_token, self.source)
                     )
                     .unwrap();
                     self.format_type(sf.type_node);
                     self.out.push_str(";\n");
                 }
-                self.out.push('}');
+                write!(self.out, "{pad}}}").unwrap();
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ast.ledger_decl(node);
+                self.out.push_str(&pad);
                 if decl.exported {
                     self.out.push_str("export ");
                 }
@@ -204,15 +394,18 @@ impl<'a> Formatter<'a> {
             }
             NodeTag::WitnessDecl => {
                 let decl = self.ast.witness_decl(node);
+                self.out.push_str(&pad);
                 if decl.exported {
                     self.out.push_str("export ");
                 }
                 write!(
                     self.out,
-                    "witness {}(",
+                    "witness {}",
                     self.ast.token_text(decl.name_token, self.source)
                 )
                 .unwrap();
+                self.format_generic_params(decl.gparams_start, decl.gparams_end);
+                self.out.push('(');
                 self.format_params(decl.params_start, decl.params_end);
                 self.out.push_str("): ");
                 self.format_type(decl.ret_type);
@@ -220,13 +413,14 @@ impl<'a> Formatter<'a> {
             }
             NodeTag::ConstructorDecl => {
                 let decl = self.ast.constructor_decl(node);
-                self.out.push_str("constructor(");
+                write!(self.out, "{pad}constructor(").unwrap();
                 self.format_params(decl.params_start, decl.params_end);
                 self.out.push_str(") ");
-                self.format_block(decl.body, 0);
+                self.format_block(decl.body, indent);
             }
             NodeTag::CircuitDecl => {
                 let decl = self.ast.circuit_decl(node);
+                self.out.push_str(&pad);
                 if decl.exported {
                     self.out.push_str("export ");
                 }
@@ -235,15 +429,17 @@ impl<'a> Formatter<'a> {
                 }
                 write!(
                     self.out,
-                    "circuit {}(",
+                    "circuit {}",
                     self.ast.token_text(decl.name_token, self.source)
                 )
                 .unwrap();
+                self.format_generic_params(decl.gparams_start, decl.gparams_end);
+                self.out.push('(');
                 self.format_params(decl.params_start, decl.params_end);
                 self.out.push_str("): ");
                 self.format_type(decl.ret_type);
                 self.out.push(' ');
-                self.format_block(decl.body, 0);
+                self.format_block(decl.body, indent);
             }
             _ => {}
         }
@@ -449,6 +645,13 @@ impl<'a> Formatter<'a> {
                 self.out
                     .push_str(self.ast.token_text(TokenIndex(data.rhs), self.source));
             }
+            NodeTag::IndexExpr => {
+                let idx = self.ast.index_expr(node);
+                self.format_expr(idx.base);
+                self.out.push('[');
+                self.format_expr(idx.index);
+                self.out.push(']');
+            }
             NodeTag::CallExpr => {
                 let call = self.ast.call_expr(node);
                 self.format_expr(call.callee);
@@ -581,7 +784,11 @@ mod tests {
         let mut sm = SourceMap::new();
         let id = sm.add_file("test.compact", src);
         let parsed = parse(sm.get(id));
-        assert!(!parsed.diagnostics.has_errors());
+        assert!(
+            !parsed.diagnostics.has_errors(),
+            "unexpected parse errors: {:?}",
+            parsed.diagnostics
+        );
         format_ast(&parsed.ast, src, &FormatOptions::default())
     }
 
@@ -656,6 +863,23 @@ mod tests {
             export ledger nested:Map<Boolean,Map<Field,Counter>>;
             export ledger queue:List<Field>;
             export circuit run(xs:Vector<3,Field>,a:Uint<32>,b:Uint<32>):Boolean{for(const i of 0..3){nested.lookup(true).insert(i as Field,default<Counter>);}for(const x of xs){queue.pushFront(disclose(x));}return a*b<=100&&a<b&&b>=a&&b>0;}
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_modules_pragma_generics_and_types() {
+        assert_compact_snapshot!(
+            r#"
+            pragma language_version >= 0.16.0 && <= 1.0.0;
+            import CompactStandardLibrary;
+            include "types";
+            export new type Tag<#N> = Bytes<N>;
+            struct Pair<A,B>{first:A;second:B;}
+            module Vault<K>{export ledger m:Map<K,Counter>;export circuit bump(k:K):[]{m.lookup(k).increment(1);}}
+            import {bump as bump_field} from Vault<Field> prefix V_;
+            export circuit pick<T>(v:Vector<3,T>,i:Uint<8>):T{const x:T=v[i];return x;}
             "#,
             fmt
         );

@@ -1,0 +1,10 @@
+type Amount = Uint<16>;
+
+export new type AccountId = Bytes<32>;
+
+export new type Tag<#N> = Bytes<N>;
+
+struct Pair<A, B> {
+  first: A;
+  second: B;
+}

@@ -342,6 +342,21 @@ fn format_circuit_zkir(circuit: &ProofCircuit) -> String {
                 )
                 .unwrap();
             }
+            CircuitInstr::DivModPowerOfTwo {
+                val,
+                bits,
+                quotient,
+                remainder,
+            } => {
+                writeln!(
+                    out,
+                    "    {{ \"op\": \"div_mod_power_of_two\", \"outputs\": [\"{}\", \"{}\"], \"val\": {}, \"bits\": {bits} }}{comma}",
+                    var_name(circuit, *quotient),
+                    var_name(circuit, *remainder),
+                    format_val(circuit, val)
+                )
+                .unwrap();
+            }
             CircuitInstr::TestEq { a, b, output } => {
                 writeln!(
                     out,
@@ -817,6 +832,51 @@ mod tests {
               }
               const prod = a * b;
               return a < b && a <= b && b > a && b >= a && prod <= limit;
+            }
+            "#,
+            compile_all_zkir
+        );
+    }
+
+    #[test]
+    fn zkir_modules_generics_and_slicing() {
+        assert_compact_snapshot!(
+            r#"
+            pragma language_version >= 0.16.0 && <= 1.0.0;
+
+            import CompactStandardLibrary;
+
+            type Step = Uint<16>;
+            export new type Tag<#N> = Bytes<N>;
+
+            struct Pair<A, B> {
+              first: A;
+              second: B;
+            }
+
+            module Burst<#N> {
+              export ledger counter: Counter;
+
+              export circuit run(step: Step): [] {
+                for (const i of 0..N) {
+                  counter.increment(disclose(step));
+                }
+              }
+            }
+
+            import Burst<2> prefix B_;
+            export { B_run }
+
+            circuit first_of<A, B>(p: Pair<A, B>): A {
+              return p.first;
+            }
+
+            export circuit inspect(v: Vector<3, Field>, idx: Uint<8>, raw: Bytes<8>): [Field, Vector<2, Field>, Tag<4>] {
+              const p: Pair<Field, Field> = Pair<Field, Field>{ first: v[0], second: v[idx] };
+              const head = slice<2>(v, 0);
+              const tag: Tag<4> = slice<4>(raw, 2) as Tag<4>;
+              B_run(1);
+              return [first_of<Field, Field>(p), head, tag];
             }
             "#,
             compile_all_zkir

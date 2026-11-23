@@ -231,8 +231,14 @@ impl<'a> WitnessChecker<'a> {
             | ExprKind::PersistentHash { arg: operand, .. }
             | ExprKind::MerkleTreePathRoot { path: operand, .. }
             | ExprKind::FieldAccess { base: operand, .. }
+            | ExprKind::Slice { base: operand, .. }
             | ExprKind::MaybeSome(operand) => {
                 self.check_expr(operand, param_taints, locals, guard_taint)
+            }
+            ExprKind::Index { base, index } => {
+                let bt = self.check_expr(base, param_taints, locals, guard_taint);
+                let it = self.check_expr(index, param_taints, locals, guard_taint);
+                bt.merge(&it)
             }
             ExprKind::StructLit { fields } => fields.iter().fold(Taint::clean(), |acc, (_, e)| {
                 acc.merge(&self.check_expr(e, param_taints, locals, guard_taint))
@@ -438,7 +444,12 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
         | ExprKind::PersistentHash { arg: operand, .. }
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
+        | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => collect_calls_expr(operand, out),
+        ExprKind::Index { base, index } => {
+            collect_calls_expr(base, out);
+            collect_calls_expr(index, out);
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, out);
             collect_calls_expr(rhs, out);

@@ -1,0 +1,39 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+pragma language_version >= 0.16.0 && <= 1.0.0;
+import CompactStandardLibrary;
+include "types";
+export new type Tag<#N> = Bytes<N>;
+struct Pair<A,B>{first:A;second:B;}
+module Vault<K>{export ledger m:Map<K,Counter>;export circuit bump(k:K):[]{m.lookup(k).increment(1);}}
+import {bump as bump_field} from Vault<Field> prefix V_;
+export circuit pick<T>(v:Vector<3,T>,i:Uint<8>):T{const x:T=v[i];return x;}
+===
+pragma language_version >= 0.16.0 && <= 1.0.0;
+
+import CompactStandardLibrary;
+
+include "types";
+
+export new type Tag<#N> = Bytes<N>;
+
+struct Pair<A, B> {
+  first: A;
+  second: B;
+}
+
+module Vault<K> {
+  export ledger m: Map<K, Counter>;
+
+  export circuit bump(k: K): [] {
+    m.lookup(k).increment(1);
+  }
+}
+
+import { bump as bump_field } from Vault<Field> prefix V_;
+
+export circuit pick<T>(v: Vector<3, T>, i: Uint<8>): T {
+  const x: T = v[i];
+  return x;
+}

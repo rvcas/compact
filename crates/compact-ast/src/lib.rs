@@ -52,6 +52,11 @@ pub enum TokenTag {
     // Keywords
     Import,
     Export,
+    Include,
+    From,
+    Prefix,
+    Type,
+    New,
     Ledger,
     Sealed,
     Circuit,
@@ -96,6 +101,7 @@ pub enum TokenTag {
     Comma,
     Dot,
     DotDot,
+    Hash,
     Question,
     Plus,
     Minus,
@@ -117,6 +123,11 @@ impl TokenTag {
         match self {
             Self::Import => "import",
             Self::Export => "export",
+            Self::Include => "include",
+            Self::From => "from",
+            Self::Prefix => "prefix",
+            Self::Type => "type",
+            Self::New => "new",
             Self::Ledger => "ledger",
             Self::Sealed => "sealed",
             Self::Circuit => "circuit",
@@ -157,6 +168,7 @@ impl TokenTag {
             Self::Comma => ",",
             Self::Dot => ".",
             Self::DotDot => "..",
+            Self::Hash => "#",
             Self::Question => "?",
             Self::Plus => "+",
             Self::Minus => "-",
@@ -203,6 +215,7 @@ pub mod decl_flags {
     pub const EXPORT: u32 = 1 << 0;
     pub const SEALED: u32 = 1 << 1;
     pub const PURE: u32 = 1 << 2;
+    pub const NEW_TYPE: u32 = 1 << 3;
 }
 
 /// Tag identifying the syntactic form of an AST node.
@@ -211,17 +224,43 @@ pub mod decl_flags {
 pub enum NodeTag {
     /// Program root: `data = (extra_start, extra_end)` listing top-level declarations.
     Root,
-    /// `import <ident>;` — `main_token = import`, `data = (name_tok, 0)`.
+    /// `pragma <name> <version_expr>;`
+    /// `main_token = pragma`, `data = (extra_start, semi_tok)`,
+    /// `extra_data[extra_start..+2] = [name_tok, expr_node]`.
+    PragmaDecl,
+    /// Version atom `0.16.0` — `main_token = first_nat`, `data = (last_nat, 0)`.
+    VersionAtom,
+    /// Version unary `<`, `<=`, `>`, `>=`, `!` — `main_token = op_tok`, `data = (operand_node, 0)`.
+    VersionUnary,
+    /// Version binary `&&`, `||` — `main_token = op_tok`, `data = (lhs_node, rhs_node)`.
+    VersionBinary,
+    /// `include "<path>";` — `main_token = include`, `data = (path_str_tok, semi_tok)`.
+    IncludeDecl,
+    /// Generic parameter `T` or `#N` — `main_token = name_tok`, `data = (is_nat, hash_tok_or_NONE)`.
+    GenericParam,
+    /// `[export] module <name>[<gparams>] { <decls>* }`
+    /// `main_token = module`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+6] = [name_tok, gp_start, gp_end, decls_start, decls_end, rbrace_tok]`.
+    ModuleDecl,
+    /// `import [{ <item>, ... } from] (<name> | "<path>")[<gargs>] [prefix <p>];`
+    /// `main_token = import`, `data = (extra_start, semi_tok)`,
+    /// `extra_data[extra_start..+6] = [name_tok, gargs_start, gargs_end, prefix_tok_or_NONE, items_start, items_end]`.
     ImportDecl,
+    /// `<name> [as <alias>]` inside an import selection — `main_token = name_tok`, `data = (alias_tok_or_NONE, 0)`.
+    ImportItem,
     /// `export { <name>, ... }[;]` — `main_token = export`, `data = (names_start, names_end)`.
     ExportListDecl,
+    /// `[export] [new] type <name>[<gparams>] = <type>;`
+    /// `main_token = type`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+5] = [name_tok, gp_start, gp_end, target_type_node, semi_tok]`.
+    TypeDecl,
     /// `[export] enum <name> { <variant>, ... }`
     /// `main_token = enum`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+3] = [name_tok, variants_start, variants_end]`.
     EnumDecl,
-    /// `[export] struct <name> { <field>: <type>; ... }`
+    /// `[export] struct <name>[<gparams>] { <field>: <type>; ... }`
     /// `main_token = struct`, `data = (extra_start, flags)`,
-    /// `extra_data[extra_start..+3] = [name_tok, fields_start, fields_end]`.
+    /// `extra_data[extra_start..+5] = [name_tok, gp_start, gp_end, fields_start, fields_end]`.
     StructDecl,
     /// `<name>: <type>` inside a struct declaration — `main_token = name_tok`, `data = (type_node, 0)`.
     StructField,
@@ -229,17 +268,17 @@ pub enum NodeTag {
     /// `main_token = ledger`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+2] = [name_tok, type_node]`.
     LedgerDecl,
-    /// `[export] witness <name>(<params>): <ret_type>;`
+    /// `[export] witness <name>[<gparams>](<params>): <ret_type>;`
     /// `main_token = witness`, `data = (extra_start, flags)`,
-    /// `extra_data[extra_start..+4] = [name_tok, params_start, params_end, ret_type_node]`.
+    /// `extra_data[extra_start..+6] = [name_tok, gp_start, gp_end, params_start, params_end, ret_type_node]`.
     WitnessDecl,
     /// `constructor(<params>) <block>`
     /// `main_token = constructor`, `data = (extra_start, 0)`,
     /// `extra_data[extra_start..+3] = [params_start, params_end, body_node]`.
     ConstructorDecl,
-    /// `[export] [pure] circuit <name>(<params>): <ret_type> <block>`
+    /// `[export] [pure] circuit <name>[<gparams>](<params>): <ret_type> <block>`
     /// `main_token = circuit`, `data = (extra_start, flags)`,
-    /// `extra_data[extra_start..+5] = [name_tok, params_start, params_end, ret_type_node, body_node]`.
+    /// `extra_data[extra_start..+7] = [name_tok, gp_start, gp_end, params_start, params_end, ret_type_node, body_node]`.
     CircuitDecl,
     /// `<name>: <type>` — `main_token = name_tok`, `data = (type_node, 0)`.
     Param,
@@ -291,6 +330,10 @@ pub enum NodeTag {
     TupleExpr,
     /// Member access `<lhs>.<field>` — `main_token = '.'`, `data = (lhs_node, field_tok)`.
     MemberExpr,
+    /// Tuple/vector indexing `<base>[<index>]`
+    /// `main_token = '['`, `data = (extra_start, rbracket_tok)`,
+    /// `extra_data[extra_start..+2] = [base_node, index_node]`.
+    IndexExpr,
     /// Call expression `<callee>(<args>)`
     /// `main_token = '('`, `data = (extra_start, rparen_tok)`,
     /// `extra_data[extra_start..+3] = [callee_node, args_start, args_end]`.
@@ -349,9 +392,67 @@ pub struct Node {
 
 /// Typed views decoded from [`Ast`] for ergonomic downstream traversal.
 #[derive(Debug, Clone, Copy)]
+pub struct PragmaDecl {
+    pub pragma_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub expr: NodeIndex,
+    pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IncludeDecl {
+    pub include_token: TokenIndex,
+    pub path_token: TokenIndex,
+    pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GenericParam {
+    pub name_token: TokenIndex,
+    pub is_nat: bool,
+    pub hash_token: Option<TokenIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleDecl {
+    pub module_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub gparams_start: u32,
+    pub gparams_end: u32,
+    pub decls_start: u32,
+    pub decls_end: u32,
+    pub rbrace_token: TokenIndex,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImportDecl {
     pub import_token: TokenIndex,
     pub name_token: TokenIndex,
+    pub gargs_start: u32,
+    pub gargs_end: u32,
+    pub prefix_token: Option<TokenIndex>,
+    pub items_start: u32,
+    pub items_end: u32,
+    pub semi_token: TokenIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImportItem {
+    pub name_token: TokenIndex,
+    pub alias_token: Option<TokenIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TypeDecl {
+    pub type_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub gparams_start: u32,
+    pub gparams_end: u32,
+    pub target_type: NodeIndex,
+    pub semi_token: TokenIndex,
+    pub exported: bool,
+    pub is_new: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -374,6 +475,8 @@ pub struct EnumDecl {
 pub struct StructDecl {
     pub struct_token: TokenIndex,
     pub name_token: TokenIndex,
+    pub gparams_start: u32,
+    pub gparams_end: u32,
     pub fields_start: u32,
     pub fields_end: u32,
     pub exported: bool,
@@ -438,6 +541,8 @@ pub struct LedgerDecl {
 pub struct WitnessDecl {
     pub witness_token: TokenIndex,
     pub name_token: TokenIndex,
+    pub gparams_start: u32,
+    pub gparams_end: u32,
     pub params_start: u32,
     pub params_end: u32,
     pub ret_type: NodeIndex,
@@ -456,12 +561,22 @@ pub struct ConstructorDecl {
 pub struct CircuitDecl {
     pub circuit_token: TokenIndex,
     pub name_token: TokenIndex,
+    pub gparams_start: u32,
+    pub gparams_end: u32,
     pub params_start: u32,
     pub params_end: u32,
     pub ret_type: NodeIndex,
     pub body: NodeIndex,
     pub exported: bool,
     pub pure: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IndexExpr {
+    pub lbracket_token: TokenIndex,
+    pub rbracket_token: TokenIndex,
+    pub base: NodeIndex,
+    pub index: NodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -615,12 +730,95 @@ impl Ast {
         self.extra_nodes(data.lhs, data.rhs)
     }
 
+    pub fn pragma_decl(&self, node: NodeIndex) -> PragmaDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::PragmaDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        PragmaDecl {
+            pragma_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            expr: NodeIndex(self.extra_data[base + 1]),
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
+    pub fn include_decl(&self, node: NodeIndex) -> IncludeDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::IncludeDecl);
+        let data = self.node_data(node);
+        IncludeDecl {
+            include_token: self.node_main_token(node),
+            path_token: TokenIndex(data.lhs),
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
+    pub fn generic_param(&self, node: NodeIndex) -> GenericParam {
+        debug_assert_eq!(self.node_tag(node), NodeTag::GenericParam);
+        let data = self.node_data(node);
+        let hash_tok = TokenIndex(data.rhs);
+        GenericParam {
+            name_token: self.node_main_token(node),
+            is_nat: data.lhs != 0,
+            hash_token: hash_tok.is_some().then_some(hash_tok),
+        }
+    }
+
+    pub fn module_decl(&self, node: NodeIndex) -> ModuleDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ModuleDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ModuleDecl {
+            module_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            gparams_start: self.extra_data[base + 1],
+            gparams_end: self.extra_data[base + 2],
+            decls_start: self.extra_data[base + 3],
+            decls_end: self.extra_data[base + 4],
+            rbrace_token: TokenIndex(self.extra_data[base + 5]),
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
+        }
+    }
+
     pub fn import_decl(&self, node: NodeIndex) -> ImportDecl {
         debug_assert_eq!(self.node_tag(node), NodeTag::ImportDecl);
         let data = self.node_data(node);
+        let base = data.lhs as usize;
+        let prefix = TokenIndex(self.extra_data[base + 3]);
         ImportDecl {
             import_token: self.node_main_token(node),
-            name_token: TokenIndex(data.lhs),
+            name_token: TokenIndex(self.extra_data[base]),
+            gargs_start: self.extra_data[base + 1],
+            gargs_end: self.extra_data[base + 2],
+            prefix_token: prefix.is_some().then_some(prefix),
+            items_start: self.extra_data[base + 4],
+            items_end: self.extra_data[base + 5],
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
+    pub fn import_item(&self, node: NodeIndex) -> ImportItem {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ImportItem);
+        let data = self.node_data(node);
+        let alias = TokenIndex(data.lhs);
+        ImportItem {
+            name_token: self.node_main_token(node),
+            alias_token: alias.is_some().then_some(alias),
+        }
+    }
+
+    pub fn type_decl(&self, node: NodeIndex) -> TypeDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::TypeDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        TypeDecl {
+            type_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            gparams_start: self.extra_data[base + 1],
+            gparams_end: self.extra_data[base + 2],
+            target_type: NodeIndex(self.extra_data[base + 3]),
+            semi_token: TokenIndex(self.extra_data[base + 4]),
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
+            is_new: (data.rhs & decl_flags::NEW_TYPE) != 0,
         }
     }
 
@@ -654,8 +852,10 @@ impl Ast {
         StructDecl {
             struct_token: self.node_main_token(node),
             name_token: TokenIndex(self.extra_data[base]),
-            fields_start: self.extra_data[base + 1],
-            fields_end: self.extra_data[base + 2],
+            gparams_start: self.extra_data[base + 1],
+            gparams_end: self.extra_data[base + 2],
+            fields_start: self.extra_data[base + 3],
+            fields_end: self.extra_data[base + 4],
             exported: (data.rhs & decl_flags::EXPORT) != 0,
         }
     }
@@ -748,9 +948,11 @@ impl Ast {
         WitnessDecl {
             witness_token: self.node_main_token(node),
             name_token: TokenIndex(self.extra_data[base]),
-            params_start: self.extra_data[base + 1],
-            params_end: self.extra_data[base + 2],
-            ret_type: NodeIndex(self.extra_data[base + 3]),
+            gparams_start: self.extra_data[base + 1],
+            gparams_end: self.extra_data[base + 2],
+            params_start: self.extra_data[base + 3],
+            params_end: self.extra_data[base + 4],
+            ret_type: NodeIndex(self.extra_data[base + 5]),
             exported: (data.rhs & decl_flags::EXPORT) != 0,
         }
     }
@@ -774,12 +976,26 @@ impl Ast {
         CircuitDecl {
             circuit_token: self.node_main_token(node),
             name_token: TokenIndex(self.extra_data[base]),
-            params_start: self.extra_data[base + 1],
-            params_end: self.extra_data[base + 2],
-            ret_type: NodeIndex(self.extra_data[base + 3]),
-            body: NodeIndex(self.extra_data[base + 4]),
+            gparams_start: self.extra_data[base + 1],
+            gparams_end: self.extra_data[base + 2],
+            params_start: self.extra_data[base + 3],
+            params_end: self.extra_data[base + 4],
+            ret_type: NodeIndex(self.extra_data[base + 5]),
+            body: NodeIndex(self.extra_data[base + 6]),
             exported: (data.rhs & decl_flags::EXPORT) != 0,
             pure: (data.rhs & decl_flags::PURE) != 0,
+        }
+    }
+
+    pub fn index_expr(&self, node: NodeIndex) -> IndexExpr {
+        debug_assert_eq!(self.node_tag(node), NodeTag::IndexExpr);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        IndexExpr {
+            lbracket_token: self.node_main_token(node),
+            rbracket_token: TokenIndex(data.rhs),
+            base: NodeIndex(self.extra_data[base]),
+            index: NodeIndex(self.extra_data[base + 1]),
         }
     }
 
@@ -883,7 +1099,44 @@ impl Ast {
                 let last = iter.last().unwrap_or(first);
                 self.node_span(first).merge(self.node_span(last))
             }
-            NodeTag::ImportDecl => main.merge(self.token_span(TokenIndex(data.lhs))),
+            NodeTag::PragmaDecl => {
+                let decl = self.pragma_decl(node);
+                main.merge(self.token_span(decl.semi_token))
+            }
+            NodeTag::VersionAtom => main.merge(self.token_span(TokenIndex(data.lhs))),
+            NodeTag::VersionUnary => main.merge(self.node_span(NodeIndex(data.lhs))),
+            NodeTag::VersionBinary => self
+                .node_span(NodeIndex(data.lhs))
+                .merge(self.node_span(NodeIndex(data.rhs))),
+            NodeTag::IncludeDecl => main.merge(self.token_span(TokenIndex(data.rhs))),
+            NodeTag::GenericParam => {
+                let gp = self.generic_param(node);
+                if let Some(hash) = gp.hash_token {
+                    self.token_span(hash).merge(main)
+                } else {
+                    main
+                }
+            }
+            NodeTag::ModuleDecl => {
+                let decl = self.module_decl(node);
+                main.merge(self.token_span(decl.rbrace_token))
+            }
+            NodeTag::ImportDecl => {
+                let decl = self.import_decl(node);
+                main.merge(self.token_span(decl.semi_token))
+            }
+            NodeTag::ImportItem => {
+                let item = self.import_item(node);
+                if let Some(alias) = item.alias_token {
+                    main.merge(self.token_span(alias))
+                } else {
+                    main
+                }
+            }
+            NodeTag::TypeDecl => {
+                let decl = self.type_decl(node);
+                main.merge(self.token_span(decl.semi_token))
+            }
             NodeTag::ExportListDecl => {
                 let mut span = main;
                 if let Some(last) = self.extra_tokens(data.lhs, data.rhs).last() {
@@ -978,6 +1231,11 @@ impl Ast {
             NodeTag::MemberExpr => self
                 .node_span(NodeIndex(data.lhs))
                 .merge(self.token_span(TokenIndex(data.rhs))),
+            NodeTag::IndexExpr => {
+                let idx = self.index_expr(node);
+                self.node_span(idx.base)
+                    .merge(self.token_span(idx.rbracket_token))
+            }
             NodeTag::CallExpr => {
                 let call = self.call_expr(node);
                 self.node_span(call.callee)
@@ -1031,14 +1289,136 @@ impl Ast {
                     self.dump_node(child, source, indent + 1, out);
                 }
             }
-            NodeTag::ImportDecl => {
-                let decl = self.import_decl(node);
+            NodeTag::PragmaDecl => {
+                let decl = self.pragma_decl(node);
                 writeln!(
                     out,
-                    "{pad}ImportDecl {}",
+                    "{pad}PragmaDecl {}",
                     self.token_text(decl.name_token, source)
                 )
                 .unwrap();
+                self.dump_node(decl.expr, source, indent + 1, out);
+            }
+            NodeTag::VersionAtom => {
+                let span = self.node_span(node);
+                writeln!(out, "{pad}VersionAtom {}", span.slice(source)).unwrap();
+            }
+            NodeTag::VersionUnary => {
+                writeln!(
+                    out,
+                    "{pad}VersionUnary {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
+            NodeTag::VersionBinary => {
+                writeln!(
+                    out,
+                    "{pad}VersionBinary {}",
+                    self.token_text(self.node_main_token(node), source)
+                )
+                .unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+                self.dump_node(NodeIndex(data.rhs), source, indent + 1, out);
+            }
+            NodeTag::IncludeDecl => {
+                let decl = self.include_decl(node);
+                writeln!(
+                    out,
+                    "{pad}IncludeDecl {}",
+                    self.token_text(decl.path_token, source)
+                )
+                .unwrap();
+            }
+            NodeTag::GenericParam => {
+                let gp = self.generic_param(node);
+                let prefix = if gp.is_nat { "#" } else { "" };
+                writeln!(
+                    out,
+                    "{pad}GenericParam {prefix}{}",
+                    self.token_text(gp.name_token, source)
+                )
+                .unwrap();
+            }
+            NodeTag::ModuleDecl => {
+                let decl = self.module_decl(node);
+                let mods_str = if decl.exported { "[export] " } else { "" };
+                writeln!(
+                    out,
+                    "{pad}ModuleDecl {mods_str}{}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                for gp in self.extra_nodes(decl.gparams_start, decl.gparams_end) {
+                    self.dump_node(gp, source, indent + 1, out);
+                }
+                for child in self.extra_nodes(decl.decls_start, decl.decls_end) {
+                    self.dump_node(child, source, indent + 1, out);
+                }
+            }
+            NodeTag::ImportDecl => {
+                let decl = self.import_decl(node);
+                let mut suffix = String::new();
+                if let Some(prefix) = decl.prefix_token {
+                    write!(suffix, " prefix {}", self.token_text(prefix, source)).unwrap();
+                }
+                writeln!(
+                    out,
+                    "{pad}ImportDecl {}{suffix}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                for item in self.extra_nodes(decl.items_start, decl.items_end) {
+                    self.dump_node(item, source, indent + 1, out);
+                }
+                for garg in self.extra_nodes(decl.gargs_start, decl.gargs_end) {
+                    self.dump_node(garg, source, indent + 1, out);
+                }
+            }
+            NodeTag::ImportItem => {
+                let item = self.import_item(node);
+                if let Some(alias) = item.alias_token {
+                    writeln!(
+                        out,
+                        "{pad}ImportItem {} as {}",
+                        self.token_text(item.name_token, source),
+                        self.token_text(alias, source)
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        out,
+                        "{pad}ImportItem {}",
+                        self.token_text(item.name_token, source)
+                    )
+                    .unwrap();
+                }
+            }
+            NodeTag::TypeDecl => {
+                let decl = self.type_decl(node);
+                let mut mods = Vec::new();
+                if decl.exported {
+                    mods.push("export");
+                }
+                if decl.is_new {
+                    mods.push("new");
+                }
+                let mods_str = if mods.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}] ", mods.join(" "))
+                };
+                writeln!(
+                    out,
+                    "{pad}TypeDecl {mods_str}{}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                for gp in self.extra_nodes(decl.gparams_start, decl.gparams_end) {
+                    self.dump_node(gp, source, indent + 1, out);
+                }
+                self.dump_node(decl.target_type, source, indent + 1, out);
             }
             NodeTag::ExportListDecl => {
                 let decl = self.export_list_decl(node);
@@ -1340,6 +1720,12 @@ impl Ast {
                 )
                 .unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
+            NodeTag::IndexExpr => {
+                let idx = self.index_expr(node);
+                writeln!(out, "{pad}IndexExpr").unwrap();
+                self.dump_node(idx.base, source, indent + 1, out);
+                self.dump_node(idx.index, source, indent + 1, out);
             }
             NodeTag::CallExpr => {
                 let call = self.call_expr(node);

@@ -47,7 +47,7 @@ pub enum AlignmentAtom {
 impl AlignmentAtom {
     /// Flatten a Compact type into its Impact/ZKIR alignment atom sequence.
     pub fn alignment_of(program: &Program, ty: &Type) -> Vec<Self> {
-        match ty {
+        match program.underlying_type(ty) {
             Type::Field => vec![Self::Field],
             Type::Boolean | Type::Enum(_) => vec![Self::Bytes(1)],
             Type::Uint(bits) => vec![Self::Bytes((*bits).div_ceil(8))],
@@ -75,6 +75,7 @@ impl AlignmentAtom {
                 .iter()
                 .flat_map(|(_, fty)| Self::alignment_of(program, fty))
                 .collect(),
+            Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
         }
     }
 
@@ -90,7 +91,7 @@ impl AlignmentAtom {
 
 /// Number of native scalar field wires representing a Compact type in ZKIR.
 pub fn wire_count(program: &Program, ty: &Type) -> usize {
-    match ty {
+    match program.underlying_type(ty) {
         Type::Field | Type::Boolean | Type::Uint(_) | Type::Enum(_) | Type::Opaque(_) => 1,
         Type::Bytes(0) => 0,
         Type::Bytes(len) => (*len).div_ceil(FIELD_BYTES) as usize,
@@ -106,6 +107,7 @@ pub fn wire_count(program: &Program, ty: &Type) -> usize {
             .iter()
             .map(|(_, fty)| wire_count(program, fty))
             .sum(),
+        Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
     }
 }
 
@@ -120,7 +122,7 @@ enum WireConstraint {
 }
 
 fn wire_constraints(program: &Program, ty: &Type) -> Vec<WireConstraint> {
-    match ty {
+    match program.underlying_type(ty) {
         Type::Field | Type::Opaque(_) => vec![WireConstraint::None],
         Type::Boolean => vec![WireConstraint::Boolean],
         Type::Uint(bits) => vec![WireConstraint::Bits(*bits)],
@@ -176,6 +178,7 @@ fn wire_constraints(program: &Program, ty: &Type) -> Vec<WireConstraint> {
             .iter()
             .flat_map(|(_, fty)| wire_constraints(program, fty))
             .collect(),
+        Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
     }
 }
 
@@ -542,6 +545,12 @@ pub enum CircuitInstr {
     BytesIntoNatives {
         bytes: CircuitVar,
         outputs: Vec<CircuitVar>,
+    },
+    DivModPowerOfTwo {
+        val: CircuitVal,
+        bits: u32,
+        quotient: CircuitVar,
+        remainder: CircuitVar,
     },
     TestEq {
         a: CircuitVal,
@@ -930,6 +939,109 @@ impl<'a> CircuitLowerer<'a> {
                     offset += width;
                 }
                 unreachable!("sema validated struct field `{field}`")
+            }
+            ExprKind::Index { base, index } => {
+                let base_vals = self.lower_expr(base, param_vals, locals, guard);
+                match self.program.underlying_type(&base.ty) {
+                    Type::Vector(len, elem_ty) => {
+                        let elem_width = wire_count(self.program, elem_ty);
+                        if let Some(k) = eval_const_u128(index) {
+                            let off = (k as usize) * elem_width;
+                            return base_vals[off..off + elem_width].to_vec();
+                        }
+                        let idx_val = self
+                            .lower_expr(index, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let mut acc = base_vals[..elem_width].to_vec();
+                        for i in 1..(*len as usize) {
+                            let eq = self.fresh_var("t");
+                            self.instructions.push(CircuitInstr::TestEq {
+                                a: idx_val.clone(),
+                                b: CircuitVal::Imm(i as i128),
+                                output: eq,
+                            });
+                            let elem_slice =
+                                base_vals[i * elem_width..(i + 1) * elem_width].to_vec();
+                            acc = self.select_wires(&CircuitVal::Var(eq), elem_slice, acc);
+                        }
+                        acc
+                    }
+                    Type::Tuple(elems) => {
+                        let k = eval_const_u128(index).expect("sema validated constant tuple index")
+                            as usize;
+                        let mut offset = 0usize;
+                        for (i, ety) in elems.iter().enumerate() {
+                            let w = wire_count(self.program, ety);
+                            if i == k {
+                                return base_vals[offset..offset + w].to_vec();
+                            }
+                            offset += w;
+                        }
+                        unreachable!("sema validated tuple index")
+                    }
+                    _ => unreachable!("sema validated Index on Vector or Tuple"),
+                }
+            }
+            ExprKind::Slice { base, start, len } => {
+                let base_vals = self.lower_expr(base, param_vals, locals, guard);
+                match self.program.underlying_type(&base.ty) {
+                    Type::Vector(_, elem_ty) => {
+                        let elem_width = wire_count(self.program, elem_ty);
+                        let off = (*start as usize) * elem_width;
+                        let width = (*len as usize) * elem_width;
+                        base_vals[off..off + width].to_vec()
+                    }
+                    Type::Tuple(elems) => {
+                        let mut offset = 0usize;
+                        let mut out = Vec::new();
+                        for (i, ety) in elems.iter().enumerate() {
+                            let w = wire_count(self.program, ety);
+                            if i >= (*start as usize) && i < ((*start + *len) as usize) {
+                                out.extend_from_slice(&base_vals[offset..offset + w]);
+                            }
+                            offset += w;
+                        }
+                        out
+                    }
+                    Type::Bytes(blen) => {
+                        if *len == 0 {
+                            return Vec::new();
+                        }
+                        if *start == 0 && *len == *blen {
+                            return base_vals;
+                        }
+                        // Extract bytes `[start .. start + len]` within the low 31-byte chunk
+                        // using `div_mod_power_of_two` on the packed little-endian scalar wire.
+                        let mut wire = base_vals.last().cloned().unwrap_or(CircuitVal::Imm(0));
+                        let chunk_bytes = (*blen).min(FIELD_BYTES);
+                        if *start > 0 {
+                            let q = self.fresh_var("quo");
+                            let rem = self.fresh_var("rem");
+                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                val: wire,
+                                bits: *start * 8,
+                                quotient: q,
+                                remainder: rem,
+                            });
+                            wire = CircuitVal::Var(q);
+                        }
+                        if *start + *len < chunk_bytes {
+                            let q = self.fresh_var("quo");
+                            let rem = self.fresh_var("rem");
+                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                val: wire,
+                                bits: *len * 8,
+                                quotient: q,
+                                remainder: rem,
+                            });
+                            wire = CircuitVal::Var(rem);
+                        }
+                        vec![wire]
+                    }
+                    _ => unreachable!("sema validated Slice target"),
+                }
             }
             ExprKind::MaybeSome(inner) => {
                 let mut out = vec![CircuitVal::TRUE];
@@ -2471,7 +2583,11 @@ fn expr_has_effects(expr: &Expr, program: &Program) -> bool {
         | ExprKind::PersistentHash { arg: operand, .. }
         | ExprKind::MerkleTreePathRoot { path: operand, .. }
         | ExprKind::FieldAccess { base: operand, .. }
+        | ExprKind::Slice { base: operand, .. }
         | ExprKind::MaybeSome(operand) => expr_has_effects(operand, program),
+        ExprKind::Index { base, index } => {
+            expr_has_effects(base, program) || expr_has_effects(index, program)
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_has_effects(lhs, program) || expr_has_effects(rhs, program)
         }
