@@ -1,0 +1,18 @@
+[package]
+name = "compact-fixup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+compact-ast.workspace = true
+compact-diagnostics.workspace = true
+compact-fmt.workspace = true
+compact-parser.workspace = true
+compact-sema.workspace = true
+compact-span.workspace = true
+
+[dev-dependencies]
+compact-test-utils.workspace = true
+indoc.workspace = true
+insta.workspace = true

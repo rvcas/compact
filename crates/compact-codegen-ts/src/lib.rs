@@ -3188,6 +3188,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             LedgerOp::MapMember => "mapMember",
                             LedgerOp::MapLookup => "mapLookup",
                             LedgerOp::MapInsert => "mapInsert",
+                            LedgerOp::MapInsertCoin => "mapInsertCoin",
                             LedgerOp::MapInsertDefault => "mapInsertDefault",
                             LedgerOp::MapRemove => "mapRemove",
                             LedgerOp::MapIsEmpty => "mapIsEmpty",

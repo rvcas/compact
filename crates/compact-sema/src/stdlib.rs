@@ -42,6 +42,27 @@ export circuit nativeToken(): Bytes<32> {
   return pad(32, "");
 }
 
+circuit merkleTreePathEntryRoot(
+  recursiveDigest: Field,
+  entry: MerkleTreePathEntry
+): Field {
+  const left = entry.goes_left ? recursiveDigest : entry.sibling.field;
+  const right = entry.goes_left ? entry.sibling.field : recursiveDigest;
+  return transientHash<Vector<2, Field>>([left, right]);
+}
+
+export circuit merkleTreePathRootNoLeafHash<#n>(
+  path: MerkleTreePath<n, Bytes<32>>
+): MerkleTreeDigest {
+  return MerkleTreeDigest{
+    field: fold(
+      merkleTreePathEntryRoot,
+      degradeToTransient(path.leaf),
+      path.path
+    )
+  };
+}
+
 export circuit tokenType(domain_sep: Bytes<32>, contractAddress: ContractAddress): Bytes<32> {
   return persistentCommit<Vector<2, Bytes<32>>>(
     [domain_sep, contractAddress.bytes],

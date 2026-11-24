@@ -1,8 +1,9 @@
+pub mod aliases;
 mod pragma;
 mod stdlib;
 mod witness;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
@@ -47,6 +48,36 @@ pub struct CheckResult {
     pub diagnostics: DiagnosticBag,
 }
 
+/// A single source-token renaming discovered during `compact-fixup` analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixupRename {
+    pub span: Span,
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// Collects deprecated-identifier renamings and migration warnings during fixup analysis.
+#[derive(Debug, Default)]
+pub struct FixupCollector {
+    pub renamings: BTreeMap<Span, FixupRename>,
+    pub warnings: Vec<CompactDiagnostic>,
+}
+
+impl FixupCollector {
+    pub fn record_rename(
+        &mut self,
+        span: Span,
+        old_name: impl Into<String>,
+        new_name: impl Into<String>,
+    ) {
+        self.renamings.entry(span).or_insert_with(|| FixupRename {
+            span,
+            old_name: old_name.into(),
+            new_name: new_name.into(),
+        });
+    }
+}
+
 /// Lower a single-file AST into a type-checked, witness-checked [`Program`].
 pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
     check_with_loader(file, ast, &NoopLoader)
@@ -55,6 +86,27 @@ pub fn check(file: &SourceFile, ast: &Ast) -> CheckResult {
 /// Lower an AST (resolving `include "..."` and `import "..."` via `loader`) into a
 /// type-checked, witness-checked [`Program`].
 pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader) -> CheckResult {
+    check_impl(file, ast, loader, None)
+}
+
+/// Run module expansion and type inference in fixup mode, recording deprecated standard-library
+/// and ledger-operator renamings into `fixup` without failing on post-inference WPP checks.
+pub fn check_with_loader_for_fixup(
+    file: &SourceFile,
+    ast: &Ast,
+    loader: &dyn ModuleLoader,
+    fixup: &mut FixupCollector,
+) -> CheckResult {
+    check_impl(file, ast, loader, Some(fixup))
+}
+
+fn check_impl(
+    file: &SourceFile,
+    ast: &Ast,
+    loader: &dyn ModuleLoader,
+    fixup: Option<&mut FixupCollector>,
+) -> CheckResult {
+    let is_fixup = fixup.is_some();
     let mut analyzer = Analyzer {
         units: UnitArena::new(file, ast),
         loader,
@@ -92,7 +144,9 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         next_local: 0,
         next_ledger_slot: 0,
         stdlib_exports: None,
+        stdlib_unit: None,
         kernel_field_id: None,
+        fixup,
     };
     analyzer.run();
 
@@ -108,25 +162,27 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         exported_stdlib_types: analyzer.exported_stdlib_types,
     };
 
-    witness::reject_recursive_circuits(file, &program, &mut analyzer.diagnostics);
-    propagate_purity(
-        file,
-        &mut program,
-        &analyzer.circuit_sigs,
-        &mut analyzer.diagnostics,
-    );
-    check_contract_implements(
-        file,
-        &program,
-        &analyzer.pending_implements,
-        &mut analyzer.diagnostics,
-    );
-    reject_constructor_forbidden_ops(file, &program, &mut analyzer.diagnostics);
-    reject_sealed_mutations(file, &program, &mut analyzer.diagnostics);
-    check_returns_and_reachability(file, &program, &mut analyzer.diagnostics);
-    reject_case_insensitive_duplicate_exports(file, &program, &mut analyzer.diagnostics);
-    if !analyzer.diagnostics.has_errors() {
-        witness::check_witness_disclosure(file, &program, &mut analyzer.diagnostics);
+    if !is_fixup {
+        witness::reject_recursive_circuits(file, &program, &mut analyzer.diagnostics);
+        propagate_purity(
+            file,
+            &mut program,
+            &analyzer.circuit_sigs,
+            &mut analyzer.diagnostics,
+        );
+        check_contract_implements(
+            file,
+            &program,
+            &analyzer.pending_implements,
+            &mut analyzer.diagnostics,
+        );
+        reject_constructor_forbidden_ops(file, &program, &mut analyzer.diagnostics);
+        reject_sealed_mutations(file, &program, &mut analyzer.diagnostics);
+        check_returns_and_reachability(file, &program, &mut analyzer.diagnostics);
+        reject_case_insensitive_duplicate_exports(file, &program, &mut analyzer.diagnostics);
+        if !analyzer.diagnostics.has_errors() {
+            witness::check_witness_disclosure(file, &program, &mut analyzer.diagnostics);
+        }
     }
 
     CheckResult {
@@ -231,6 +287,7 @@ struct ScopeEnv {
     generic_circuits: HashMap<String, Vec<usize>>,
     modules: HashMap<String, usize>,
     stdlib_aliases: HashMap<String, String>,
+    stdlib_prefixes: Vec<String>,
     generics: GenericEnv,
     has_stdlib: bool,
 }
@@ -363,7 +420,9 @@ struct Analyzer<'a> {
     next_local: u32,
     next_ledger_slot: u32,
     stdlib_exports: Option<ScopeEnv>,
+    stdlib_unit: Option<UnitId>,
     kernel_field_id: Option<LedgerFieldId>,
+    fixup: Option<&'a mut FixupCollector>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -371,6 +430,149 @@ impl<'a> Analyzer<'a> {
         let id = LocalId(self.next_local);
         self.next_local += 1;
         id
+    }
+
+    /// Strip a known `CompactStandardLibrary` import prefix from `name`, returning the unprefixed name.
+    fn strip_stdlib_prefix<'b>(&self, name: &'b str) -> Option<(&str, &'b str)> {
+        if !self.scope.has_stdlib {
+            return None;
+        }
+        for p in &self.scope.stdlib_prefixes {
+            if let Some(rest) = name.strip_prefix(p.as_str()) {
+                return Some((p.as_str(), rest));
+            }
+        }
+        if self.scope.stdlib_prefixes.is_empty() {
+            return Some(("", name));
+        }
+        None
+    }
+
+    /// Returns `true` if `name` has a user-defined (non-stdlib) circuit or witness binding in scope.
+    fn has_user_callable(&self, name: &str) -> bool {
+        if self.scope.circuits.contains_key(name) || self.scope.witnesses.contains_key(name) {
+            return true;
+        }
+        if let Some(gids) = self.scope.generic_circuits.get(name) {
+            return gids
+                .iter()
+                .any(|&gid| Some(self.generic_circuits[gid].unit) != self.stdlib_unit);
+        }
+        false
+    }
+
+    /// Returns `true` if `name` matches a deprecated `CompactStandardLibrary` alias under any
+    /// active stdlib import prefix in the current scope.
+    fn is_deprecated_stdlib_alias(&self, name: &str) -> bool {
+        if !self.scope.has_stdlib {
+            return false;
+        }
+        if self.scope.stdlib_prefixes.is_empty() {
+            return aliases::lookup_stdlib_circuit_alias(name).is_some();
+        }
+        self.scope.stdlib_prefixes.iter().any(|p| {
+            name.strip_prefix(p.as_str())
+                .and_then(aliases::lookup_stdlib_circuit_alias)
+                .is_some()
+        })
+    }
+
+    /// If `name` refers to a deprecated `CompactStandardLibrary` circuit/builtin alias:
+    /// - In fixup mode: records the rename (unless `new_name` is shadowed by a user binding, in
+    ///   which case a warning is emitted) and returns `Some((canonical_unprefixed, prefixed_new))`.
+    /// - In normal compile mode: emits a diagnostic error pointing to the canonical name and
+    ///   returns `None`.
+    ///
+    /// Returns `None` without error if `name` is not a deprecated stdlib alias.
+    fn resolve_fixup_stdlib_alias(
+        &mut self,
+        name: &str,
+        name_span: Span,
+    ) -> Option<(String, String)> {
+        if !self.scope.has_stdlib {
+            return None;
+        }
+        let matched = self
+            .scope
+            .stdlib_prefixes
+            .iter()
+            .find_map(|p| {
+                let unprefixed = name.strip_prefix(p.as_str())?;
+                let canon = aliases::lookup_stdlib_circuit_alias(unprefixed)?;
+                Some((p.clone(), canon))
+            })
+            .or_else(|| {
+                if self.scope.stdlib_prefixes.is_empty() {
+                    let canon = aliases::lookup_stdlib_circuit_alias(name)?;
+                    Some((String::new(), canon))
+                } else {
+                    None
+                }
+            });
+        let (prefix, canon) = matched?;
+        let prefixed_new = format!("{prefix}{canon}");
+        let is_root = self.units.cur == UnitId(0);
+        let shadowed = self.has_user_callable(&prefixed_new);
+
+        if self.fixup.is_some() {
+            if shadowed {
+                let warn = CompactDiagnostic::warning(
+                    self.units.file(),
+                    name_span,
+                    format!(
+                        "not renaming reference of `{name}` to `{prefixed_new}` because `{prefixed_new}` has other bindings in scope"
+                    ),
+                );
+                if is_root && let Some(fixup) = self.fixup.as_deref_mut() {
+                    fixup.warnings.push(warn);
+                }
+            } else if is_root && let Some(fixup) = self.fixup.as_deref_mut() {
+                fixup.record_rename(name_span, name, &prefixed_new);
+            }
+            Some((canon.to_owned(), prefixed_new))
+        } else {
+            self.diagnostics.push(
+                CompactDiagnostic::error(
+                    self.units.file(),
+                    name_span,
+                    format!(
+                        "apparent use of an old standard-library / ledger operator name `{name}`: the new name is `{prefixed_new}`"
+                    ),
+                )
+                .with_help("run `compact fix` to automatically migrate deprecated names"),
+            );
+            None
+        }
+    }
+
+    /// Resolve a potentially deprecated ledger ADT method name.
+    fn resolve_ledger_op_name<'b>(
+        &mut self,
+        method_name: &'b str,
+        method_span: Span,
+    ) -> Option<&'b str> {
+        let Some(canon) = aliases::lookup_ledger_op_alias(method_name) else {
+            return Some(method_name);
+        };
+        let is_root = self.units.cur == UnitId(0);
+        if let Some(fixup) = self.fixup.as_deref_mut() {
+            if is_root {
+                fixup.record_rename(method_span, method_name, canon);
+            }
+            Some(canon)
+        } else {
+            self.diagnostics.push(
+                CompactDiagnostic::error(
+                    self.units.file(),
+                    method_span,
+                    format!(
+                        "apparent use of an old standard-library / ledger operator name `{method_name}`: the new name is `{canon}`"
+                    ),
+                )
+                .with_help("run `compact fix` to automatically migrate deprecated names"),
+            );
+            None
+        }
     }
 
     /// Lazily parse the embedded Compact standard library and register its structs, type aliases,
@@ -392,6 +594,7 @@ impl<'a> Analyzer<'a> {
             parsed.diagnostics
         );
         let std_unit = self.units.push_owned(std_file, parsed.ast);
+        self.stdlib_unit = Some(std_unit);
         let prev = self.units.switch(std_unit);
         let top_decls: Vec<_> = self.units.ast().root_decls().collect();
 
@@ -1285,6 +1488,15 @@ impl<'a> Analyzer<'a> {
                 if !self.exported_stdlib_types.iter().any(|s| s == &name) {
                     self.exported_stdlib_types.push(name);
                 }
+            } else if self.is_deprecated_stdlib_alias(&name) {
+                let tok_span = self.units.ast().token_span(tok);
+                if let Some((_canon, prefixed_new)) =
+                    self.resolve_fixup_stdlib_alias(&name, tok_span)
+                    && let Some(gids) = self.scope.generic_circuits.get(&prefixed_new).cloned()
+                    && is_module_instance
+                {
+                    exports.generic_circuits.insert(prefixed_new, gids);
+                }
             } else {
                 self.diagnostics.push(CompactDiagnostic::error(
                     self.units.file(),
@@ -1389,6 +1601,12 @@ impl<'a> Analyzer<'a> {
                 return;
             }
             self.scope.has_stdlib = true;
+            if selections.is_empty() {
+                let pref = prefix.clone().unwrap_or_default();
+                if !self.scope.stdlib_prefixes.contains(&pref) {
+                    self.scope.stdlib_prefixes.push(pref);
+                }
+            }
             let std_scope = self.ensure_stdlib_loaded();
             let apply_prefix = |name: &str| -> String {
                 match &prefix {
@@ -2479,6 +2697,9 @@ impl<'a> Analyzer<'a> {
         let existing_count = if let Some(existing) = self.scope.circuits.get(&local_name) {
             for &prev_cid in existing {
                 let prev = &self.circuit_sigs[prev_cid.0 as usize];
+                if prev.unit != self.units.cur {
+                    continue;
+                }
                 let prev_tys: Vec<Type> = prev.params.iter().map(|p| p.ty.clone()).collect();
                 if prev_tys == param_tys || (!is_module_instance && decl.exported && prev.exported)
                 {
@@ -5159,6 +5380,7 @@ impl<'a> Analyzer<'a> {
                 if self.units.ast().node_tag(call.callee) == NodeTag::IdentExpr {
                     let callee_tok = self.units.ast().node_main_token(call.callee);
                     let callee_name = self.text(callee_tok).to_owned();
+                    let callee_span = self.units.ast().token_span(callee_tok);
                     if let Some(gids) = self.scope.generic_circuits.get(&callee_name).cloned() {
                         return self.resolve_generic_circuit_overload(
                             &callee_name,
@@ -5169,9 +5391,61 @@ impl<'a> Analyzer<'a> {
                             scope,
                         );
                     }
+                    if !self.has_user_callable(&callee_name)
+                        && self.is_deprecated_stdlib_alias(&callee_name)
+                    {
+                        let (canon, prefixed_new) =
+                            self.resolve_fixup_stdlib_alias(&callee_name, callee_span)?;
+                        if let Some(gids) = self.scope.generic_circuits.get(&prefixed_new).cloned()
+                        {
+                            let std_gids: Vec<usize> = gids
+                                .into_iter()
+                                .filter(|&gid| {
+                                    Some(self.generic_circuits[gid].unit) == self.stdlib_unit
+                                })
+                                .collect();
+                            if !std_gids.is_empty() {
+                                return self.resolve_generic_circuit_overload(
+                                    &canon,
+                                    &std_gids,
+                                    &targ_nodes,
+                                    &arg_nodes,
+                                    span,
+                                    scope,
+                                );
+                            }
+                        }
+                        if let Some(std_gids) = self
+                            .stdlib_exports
+                            .as_ref()
+                            .and_then(|s| s.generic_circuits.get(&canon))
+                            .cloned()
+                        {
+                            return self.resolve_generic_circuit_overload(
+                                &canon,
+                                &std_gids,
+                                &targ_nodes,
+                                &arg_nodes,
+                                span,
+                                scope,
+                            );
+                        }
+                        return self.check_generic_builtin(
+                            &canon,
+                            callee_span,
+                            &targ_nodes,
+                            &arg_nodes,
+                            span,
+                            scope,
+                        );
+                    }
+                    let builtin_name = self
+                        .strip_stdlib_prefix(&callee_name)
+                        .map(|(_, rest)| rest.to_owned())
+                        .unwrap_or(callee_name);
                     return self.check_generic_builtin(
-                        &callee_name,
-                        self.units.ast().token_span(callee_tok),
+                        &builtin_name,
+                        callee_span,
                         &targ_nodes,
                         &arg_nodes,
                         span,
@@ -5197,7 +5471,22 @@ impl<'a> Analyzer<'a> {
                 // `upgradeFromTransient`), circuit call, or witness call.
                 if self.units.ast().node_tag(call.callee) == NodeTag::IdentExpr {
                     let callee_tok = self.units.ast().node_main_token(call.callee);
-                    let callee_name = self.text(callee_tok).to_owned();
+                    let raw_callee_name = self.text(callee_tok).to_owned();
+                    let callee_span = self.units.ast().token_span(callee_tok);
+                    let (callee_name, circuit_lookup_name, alias_canon) = if !self
+                        .has_user_callable(&raw_callee_name)
+                        && self.is_deprecated_stdlib_alias(&raw_callee_name)
+                    {
+                        let (canon, prefixed_new) =
+                            self.resolve_fixup_stdlib_alias(&raw_callee_name, callee_span)?;
+                        (canon.clone(), prefixed_new, Some(canon))
+                    } else {
+                        let stripped = self
+                            .strip_stdlib_prefix(&raw_callee_name)
+                            .map(|(_, rest)| rest.to_owned())
+                            .unwrap_or_else(|| raw_callee_name.clone());
+                        (stripped, raw_callee_name.clone(), None)
+                    };
                     match callee_name.as_str() {
                         "pad" => return self.check_pad_call(&arg_nodes, span),
                         "map" => return self.check_map_call(&arg_nodes, span, scope),
@@ -5667,37 +5956,53 @@ impl<'a> Analyzer<'a> {
                         }
                         _ => {}
                     }
-                    let mut candidates: Vec<CircuitId> = self
-                        .scope
-                        .circuits
-                        .get(&callee_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(gids) = self.scope.generic_circuits.get(&callee_name).cloned() {
-                        for gid in gids {
-                            if self.generic_circuits[gid].gparams.is_empty()
-                                && let Some(cid) = self.instantiate_generic_circuit(gid, &[], span)
-                            {
-                                candidates.push(cid);
-                            }
+                    let mut candidates: Vec<CircuitId> = if alias_canon.is_some() {
+                        Vec::new()
+                    } else {
+                        self.scope
+                            .circuits
+                            .get(&circuit_lookup_name)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    let generic_gids: Vec<usize> = if let Some(ref canon) = alias_canon {
+                        self.stdlib_exports
+                            .as_ref()
+                            .and_then(|s| s.generic_circuits.get(canon))
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        self.scope
+                            .generic_circuits
+                            .get(&circuit_lookup_name)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    for gid in generic_gids {
+                        if self.generic_circuits[gid].gparams.is_empty()
+                            && let Some(cid) = self.instantiate_generic_circuit(gid, &[], span)
+                        {
+                            candidates.push(cid);
                         }
                     }
                     if !candidates.is_empty() {
                         return self.resolve_circuit_overload(
-                            &callee_name,
+                            &circuit_lookup_name,
                             &candidates,
                             &arg_nodes,
                             span,
                             scope,
                         );
                     }
-                    if let Some(&wid) = self.scope.witnesses.get(&callee_name) {
+                    if alias_canon.is_none()
+                        && let Some(&wid) = self.scope.witnesses.get(&circuit_lookup_name)
+                    {
                         return self.check_witness_call(wid, &arg_nodes, span, scope);
                     }
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
-                        self.units.ast().token_span(callee_tok),
-                        format!("unknown circuit or witness `{callee_name}`"),
+                        callee_span,
+                        format!("unknown circuit or witness `{raw_callee_name}`"),
                     ));
                     return None;
                 }
@@ -5714,8 +6019,13 @@ impl<'a> Analyzer<'a> {
                     {
                         // If the ledger target is a Cell holding a Contract reference and the
                         // method is not a Cell operation, auto-read the cell and make a cross-contract call.
+                        let canonical_method = aliases::lookup_ledger_op_alias(&method_name)
+                            .unwrap_or(method_name.as_str());
                         if let LedgerAdt::Cell(ref cell_ty) = target_adt
-                            && !matches!(method_name.as_str(), "read" | "write" | "resetToDefault")
+                            && !matches!(
+                                canonical_method,
+                                "read" | "write" | "writeCoin" | "resetToDefault"
+                            )
                             && let Type::Contract(cid) = *self.underlying_type(cell_ty)
                         {
                             let recv_expr = Expr {
@@ -5911,15 +6221,50 @@ impl<'a> Analyzer<'a> {
         match self.units.ast().node_tag(fn_node) {
             NodeTag::IdentExpr => {
                 let tok = self.units.ast().node_main_token(fn_node);
-                let name = self.text(tok).to_owned();
-                let Some(cids) = self.scope.circuits.get(&name).cloned() else {
+                let raw_name = self.text(tok).to_owned();
+                let tok_span = self.units.ast().token_span(tok);
+                let (name, alias_canon) = if !self.has_user_callable(&raw_name)
+                    && self.is_deprecated_stdlib_alias(&raw_name)
+                {
+                    let (canon, prefixed_new) =
+                        self.resolve_fixup_stdlib_alias(&raw_name, tok_span)?;
+                    (prefixed_new, Some(canon))
+                } else {
+                    (raw_name.clone(), None)
+                };
+                let mut cids: Vec<CircuitId> = if alias_canon.is_some() {
+                    Vec::new()
+                } else {
+                    self.scope.circuits.get(&name).cloned().unwrap_or_default()
+                };
+                let generic_gids: Vec<usize> = if let Some(ref canon) = alias_canon {
+                    self.stdlib_exports
+                        .as_ref()
+                        .and_then(|s| s.generic_circuits.get(canon))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    self.scope
+                        .generic_circuits
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                for gid in generic_gids {
+                    if self.generic_circuits[gid].gparams.is_empty()
+                        && let Some(cid) = self.instantiate_generic_circuit(gid, &[], call_span)
+                    {
+                        cids.push(cid);
+                    }
+                }
+                if cids.is_empty() {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
-                        self.units.ast().token_span(tok),
-                        format!("unknown circuit `{name}` passed to higher-order builtin"),
+                        tok_span,
+                        format!("unknown circuit `{raw_name}` passed to higher-order builtin"),
                     ));
                     return None;
-                };
+                }
                 let cid = cids
                     .iter()
                     .copied()
@@ -7467,6 +7812,7 @@ impl<'a> Analyzer<'a> {
         call_span: Span,
         scope: &HashMap<String, ValueBinding>,
     ) -> Option<Expr> {
+        let method_name = self.resolve_ledger_op_name(method_name, method_span)?;
         let make_call = |op: LedgerOp, args: Vec<Expr>, ty: Type, target_adt: LedgerAdt| {
             Some(Expr {
                 kind: ExprKind::LedgerCall {
@@ -8128,6 +8474,63 @@ impl<'a> Analyzer<'a> {
                         }
                     };
                     make_call(LedgerOp::MapInsert, vec![k, v], Type::unit(), target_adt)
+                }
+                "insertCoin" => {
+                    if arg_nodes.len() != 3 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            call_span,
+                            "`Map.insertCoin` takes 3 arguments (key, coin, recipient)",
+                        ));
+                        return None;
+                    }
+                    let mut k = self.check_expr(arg_nodes[0], scope, Some(&key))?;
+                    if !self.coerce_or_check(&mut k, &key) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            k.span,
+                            format!(
+                                "`Map.insertCoin` expects key `{}`, found `{}`",
+                                self.format_type(&key),
+                                self.format_type(&k.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let coin_ty = self.resolve_stdlib_struct("ShieldedCoinInfo", call_span)?;
+                    let pk_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", call_span)?;
+                    let ca_ty = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                    let recip_ty = Type::Either(Box::new(pk_ty), Box::new(ca_ty));
+                    let mut coin = self.check_expr(arg_nodes[1], scope, Some(&coin_ty))?;
+                    if !self.coerce_or_check(&mut coin, &coin_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            coin.span,
+                            format!(
+                                "`Map.insertCoin` expects `ShieldedCoinInfo`, found `{}`",
+                                self.format_type(&coin.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let mut recip = self.check_expr(arg_nodes[2], scope, Some(&recip_ty))?;
+                    if !self.coerce_or_check(&mut recip, &recip_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            recip.span,
+                            format!(
+                                "`Map.insertCoin` expects recipient `Either<ZswapCoinPublicKey, ContractAddress>`, found `{}`",
+                                self.format_type(&recip.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(
+                        LedgerOp::MapInsertCoin,
+                        vec![k, coin, recip],
+                        Type::unit(),
+                        target_adt,
+                    )
                 }
                 other => {
                     self.diagnostics.push(CompactDiagnostic::error(

@@ -8,7 +8,7 @@ use miette::{NamedSource, SourceSpan};
 pub struct FileId(pub u32);
 
 /// Half-open byte offset range `[start, end)` within a single source file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Span {
     pub start: u32,
     pub end: u32,

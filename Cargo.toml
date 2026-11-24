@@ -16,6 +16,7 @@ compact-codegen-ts = { path = "crates/compact-codegen-ts" }
 compact-codegen-zkir = { path = "crates/compact-codegen-zkir" }
 compact-diagnostics = { path = "crates/compact-diagnostics" }
 compact-driver = { path = "crates/compact-driver" }
+compact-fixup = { path = "crates/compact-fixup" }
 compact-fmt = { path = "crates/compact-fmt" }
 compact-hir = { path = "crates/compact-hir" }
 compact-parser = { path = "crates/compact-parser" }

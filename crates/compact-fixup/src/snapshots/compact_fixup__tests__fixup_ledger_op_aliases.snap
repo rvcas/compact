@@ -1,0 +1,58 @@
+---
+source: crates/compact-fixup/src/lib.rs
+---
+import CompactStandardLibrary;
+
+export ledger counter: Counter;
+export ledger items: Set<QualifiedShieldedCoinInfo>;
+export ledger map_items: Map<Field, QualifiedShieldedCoinInfo>;
+export ledger list_items: List<QualifiedShieldedCoinInfo>;
+export ledger hmt: HistoricMerkleTree<2, Field>;
+
+constructor() {
+  kernel.claim_contract_call(default<Bytes<32>>, default<Bytes<32>>, default<Field>);
+  kernel.claim_zswap_nullifier(default<Bytes<32>>);
+  counter.less_than(10);
+  counter.reset_to_default();
+  items.insert_coin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  items.is_empty();
+  map_items.insert_coin(1 as Field, default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  map_items.insert_default(2 as Field);
+  list_items.push_front_coin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  list_items.pop_front();
+  hmt.check_root(default<MerkleTreeDigest>);
+  hmt.insert_hash(default<Bytes<32>>);
+  hmt.is_full();
+  hmt.reset_history();
+  hmt.reset_to_default();
+}
+===
+import CompactStandardLibrary;
+
+export ledger counter: Counter;
+
+export ledger items: Set<QualifiedShieldedCoinInfo>;
+
+export ledger map_items: Map<Field, QualifiedShieldedCoinInfo>;
+
+export ledger list_items: List<QualifiedShieldedCoinInfo>;
+
+export ledger hmt: HistoricMerkleTree<2, Field>;
+
+constructor() {
+  kernel.claimContractCall(default<Bytes<32>>, default<Bytes<32>>, default<Field>);
+  kernel.claimZswapNullifier(default<Bytes<32>>);
+  counter.lessThan(10);
+  counter.resetToDefault();
+  items.insertCoin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  items.isEmpty();
+  map_items.insertCoin(1 as Field, default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  map_items.insertDefault(2 as Field);
+  list_items.pushFrontCoin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  list_items.popFront();
+  hmt.checkRoot(default<MerkleTreeDigest>);
+  hmt.insertHash(default<Bytes<32>>);
+  hmt.isFull();
+  hmt.resetHistory();
+  hmt.resetToDefault();
+}

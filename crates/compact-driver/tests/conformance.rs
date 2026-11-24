@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use compact_driver::{
-    BuildOptions, FormatFileOptions, build_with_reporter, format_file, status::StatusReporter,
+    BuildOptions, FixupFileOptions, FixupOptions, FormatFileOptions, build_with_reporter,
+    fixup_file, fixup_source, format_file, status::StatusReporter,
 };
 use rayon::prelude::*;
 use tempfile::tempdir;
@@ -320,6 +321,79 @@ fn conformance_real_world_contracts_halo2_analyze_model() {
                 model.k,
                 model.rows
             );
+        }
+    }
+}
+
+#[test]
+fn conformance_fixup_corpus() {
+    let root = corpus_root().join("fixup");
+    let cases: &[(&str, bool)] = &[
+        ("camelCase/old/coracle.compact", true),
+        ("camelCase/old/counter.compact", false),
+        ("camelCase/old/ledger.compact", true),
+        ("camelCase/old/standard.compact", true),
+        ("fixup/bugs/structured/main.compact", false),
+    ];
+
+    for &(rel, expect_edits) in cases {
+        let path = root.join(rel);
+        assert!(path.is_file(), "missing fixup case: {}", path.display());
+
+        let first = fixup_file(&FixupFileOptions {
+            source: path.clone(),
+            target: None,
+            line_length: 100,
+            update_uint_ranges: false,
+            compact_path: Vec::new(),
+        })
+        .unwrap_or_else(|e| panic!("fixup failed for {rel}: {e:?}"));
+
+        if expect_edits {
+            assert!(
+                first.edits_applied > 0,
+                "expected migration edits for {rel}, got 0"
+            );
+        }
+
+        // Fixup must be idempotent: running again produces zero edits and identical output.
+        let second = fixup_source(&path, &first.formatted, &FixupOptions::default(), &[])
+            .unwrap_or_else(|e| panic!("second fixup pass failed for {rel}: {e:?}"));
+        assert_eq!(
+            second.edits_applied, 0,
+            "second fixup pass unexpectedly applied {} edits on {rel}",
+            second.edits_applied
+        );
+        assert_eq!(
+            first.formatted, second.formatted,
+            "fixup not idempotent on {rel}"
+        );
+
+        // Fixed output must contain zero deprecated names when checked in normal compiler mode.
+        if rel.starts_with("fixup/bugs/structured/") {
+            continue;
+        }
+        let dir = tempdir().unwrap();
+        let fixed_path = dir.path().join("fixed.compact");
+        std::fs::write(&fixed_path, &first.formatted).unwrap();
+        let check_res = compact_driver::check_with_reporter(
+            &compact_driver::CheckOptions { source: fixed_path },
+            &SilentReporter,
+        );
+        if rel == "camelCase/old/coracle.compact" {
+            // `coracle.compact` is an older pre-WPP contract (lacks `disclose(...)` annotations),
+            // so assert no deprecated-name errors remain even when WPP diagnostics fire.
+            if let Err(compact_driver::DriverError::Diagnostics(bag)) = check_res {
+                assert!(
+                    bag.diagnostics
+                        .iter()
+                        .all(|d| !d.message.contains("old standard-library")),
+                    "deprecated names remained after fixup of {rel}: {bag:?}"
+                );
+            }
+        } else {
+            check_res
+                .unwrap_or_else(|e| panic!("fixed output failed normal check for {rel}: {e:?}"));
         }
     }
 }

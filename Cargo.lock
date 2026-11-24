@@ -558,6 +558,7 @@ dependencies = [
  "compact-codegen-ts",
  "compact-codegen-zkir",
  "compact-diagnostics",
+ "compact-fixup",
  "compact-fmt",
  "compact-hir",
  "compact-parser",
@@ -568,6 +569,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "compact-fixup"
+version = "0.1.0"
+dependencies = [
+ "compact-ast",
+ "compact-diagnostics",
+ "compact-fmt",
+ "compact-parser",
+ "compact-sema",
+ "compact-span",
+ "compact-test-utils",
+ "indoc",
+ "insta",
 ]
 
 [[package]]

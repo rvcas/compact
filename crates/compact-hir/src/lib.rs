@@ -104,6 +104,7 @@ pub enum LedgerOp {
     MapMember,
     MapLookup,
     MapInsert,
+    MapInsertCoin,
     MapInsertDefault,
     MapRemove,
     MapIsEmpty,
@@ -167,7 +168,7 @@ impl LedgerOp {
             | Self::MapInsert
             | Self::MerkleTreeInsert
             | Self::HistoricMerkleTreeInsert => "insert",
-            Self::SetInsertCoin => "insertCoin",
+            Self::SetInsertCoin | Self::MapInsertCoin => "insertCoin",
             Self::MapInsertDefault => "insertDefault",
             Self::SetRemove | Self::MapRemove => "remove",
             Self::SetIsEmpty | Self::MapIsEmpty | Self::ListIsEmpty => "isEmpty",
@@ -229,6 +230,7 @@ impl LedgerOp {
                 | Self::SetRemove
                 | Self::SetResetToDefault
                 | Self::MapInsert
+                | Self::MapInsertCoin
                 | Self::MapInsertDefault
                 | Self::MapRemove
                 | Self::MapResetToDefault

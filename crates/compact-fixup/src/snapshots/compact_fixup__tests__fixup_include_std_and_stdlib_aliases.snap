@@ -1,0 +1,27 @@
+---
+source: crates/compact-fixup/src/lib.rs
+---
+pragma language_version >= 0.14.0;
+include "std";
+
+export circuit hash_pair(a: Field, b: Bytes<32>): [Field, Bytes<32>, Bytes<32>] {
+  const h1 = transient_hash<Field>(a);
+  const h2 = persistent_hash<Bytes<32>>(b);
+  const t = native_token();
+  const pk = own_public_key();
+  const back = upgrade_from_transient(degrade_to_transient(pk.bytes));
+  return [h1, h2, back];
+}
+===
+pragma language_version >= 0.14.0;
+
+import CompactStandardLibrary;
+
+export circuit hash_pair(a: Field, b: Bytes<32>): [Field, Bytes<32>, Bytes<32>] {
+  const h1 = transientHash<Field>(a);
+  const h2 = persistentHash<Bytes<32>>(b);
+  const t = nativeToken();
+  const pk = ownPublicKey();
+  const back = upgradeFromTransient(degradeToTransient(pk.bytes));
+  return [h1, h2, back];
+}

@@ -12,6 +12,8 @@ use compact_circuit::lower_to_circuits;
 use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
 use compact_codegen_zkir::{ZkirError, analyze_model, compile_keys_with_model, generate_zkir};
 use compact_diagnostics::DiagnosticBag;
+use compact_fixup::fixup_source as run_fixup_source;
+pub use compact_fixup::{FixupOptions, FixupOutput};
 use compact_fmt::{FormatOptions, format_ast};
 use compact_hir::Program as HirProgram;
 use compact_parser::parse;
@@ -22,15 +24,22 @@ use rayon::prelude::*;
 use status::{StatusReporter, TermStatusReporter};
 use thiserror::Error;
 
-/// Filesystem-backed module & include loader resolving `.compact` files relative to the importer.
+/// Filesystem-backed module & include loader resolving `.compact` files relative to the importer,
+/// falling back to optional search directories (`--compact-path` / `COMPACT_PATH`).
 struct FsModuleLoader {
     next_file_id: AtomicU32,
+    search_paths: Vec<PathBuf>,
 }
 
 impl FsModuleLoader {
     fn new() -> Self {
+        Self::with_search_paths(Vec::new())
+    }
+
+    fn with_search_paths(search_paths: Vec<PathBuf>) -> Self {
         Self {
             next_file_id: AtomicU32::new(1),
+            search_paths,
         }
     }
 }
@@ -46,9 +55,22 @@ impl ModuleLoader for FsModuleLoader {
             .as_deref()
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new("."));
-        let mut candidate = base_dir.join(specifier);
-        if candidate.extension().is_none() {
-            candidate.set_extension("compact");
+        let resolve_in = |dir: &Path| {
+            let mut candidate = dir.join(specifier);
+            if candidate.extension().is_none() {
+                candidate.set_extension("compact");
+            }
+            candidate
+        };
+        let mut candidate = resolve_in(base_dir);
+        if !candidate.is_file() {
+            for dir in &self.search_paths {
+                let alt = resolve_in(dir);
+                if alt.is_file() {
+                    candidate = alt;
+                    break;
+                }
+            }
         }
         let text = fs::read_to_string(&candidate).map_err(|_| {
             LoadError::NotFound(format!(
@@ -117,6 +139,15 @@ pub struct FormatFileOptions {
     pub source: PathBuf,
     pub target: Option<PathBuf>,
     pub line_length: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixupFileOptions {
+    pub source: PathBuf,
+    pub target: Option<PathBuf>,
+    pub line_length: usize,
+    pub update_uint_ranges: bool,
+    pub compact_path: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +396,41 @@ pub fn format_source(path: &Path, text: &str, line_length: usize) -> Result<Stri
         file.text(),
         &FormatOptions { line_length },
     ))
+}
+
+/// Apply Compact language migrations and formatting to a file on disk, optionally writing to `target`.
+pub fn fixup_file(options: &FixupFileOptions) -> Result<FixupOutput, DriverError> {
+    let text = fs::read_to_string(&options.source).map_err(|source| DriverError::ReadFile {
+        path: options.source.clone(),
+        source,
+    })?;
+    let output = fixup_source(
+        &options.source,
+        &text,
+        &FixupOptions {
+            line_length: options.line_length,
+            update_uint_ranges: options.update_uint_ranges,
+        },
+        &options.compact_path,
+    )?;
+    if let Some(target) = &options.target {
+        write_file(target, &output.formatted)?;
+    }
+    Ok(output)
+}
+
+/// Apply Compact language migrations and formatting to in-memory source text.
+pub fn fixup_source(
+    path: &Path,
+    text: &str,
+    options: &FixupOptions,
+    compact_path: &[PathBuf],
+) -> Result<FixupOutput, DriverError> {
+    let mut sm = SourceMap::new();
+    let file_id = sm.add_disk_file(path, text);
+    let file = sm.get(file_id);
+    let loader = FsModuleLoader::with_search_paths(compact_path.to_vec());
+    run_fixup_source(file, options, &loader).map_err(DriverError::Diagnostics)
 }
 
 fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), DriverError> {
@@ -976,5 +1042,54 @@ mod tests {
         assert_eq!(info["circuits"].as_array().unwrap().len(), 4);
         assert_eq!(info["contracts"].as_array().unwrap().len(), 2);
         assert_eq!(info["ledger"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn end_to_end_fixup_file_and_compact_path() {
+        let dir = tempdir().unwrap();
+        let lib_dir = dir.path().join("lib");
+        fs::create_dir_all(&lib_dir).unwrap();
+        fs::write(
+            lib_dir.join("helper.compact"),
+            "export circuit double(x: Field): Field { return x + x; }\n",
+        )
+        .unwrap();
+
+        let src_path = dir.path().join("contract.compact");
+        let dst_path = dir.path().join("fixed.compact");
+        fs::write(
+            &src_path,
+            "include \"std\";\nimport \"helper\";\nexport ledger c: Counter;\nexport circuit run(x: Field): Field {\n  c.reset_to_default();\n  return transient_hash<Field>(double(x));\n}\n",
+        )
+        .unwrap();
+
+        let out = fixup_file(&FixupFileOptions {
+            source: src_path.clone(),
+            target: Some(dst_path.clone()),
+            line_length: 100,
+            update_uint_ranges: false,
+            compact_path: vec![lib_dir.clone()],
+        })
+        .unwrap();
+
+        assert!(out.edits_applied >= 3);
+        assert!(out.warnings.is_empty());
+        let written = fs::read_to_string(&dst_path).unwrap();
+        assert_eq!(written, out.formatted);
+        assert!(written.contains("import CompactStandardLibrary;"));
+        assert!(written.contains("c.resetToDefault();"));
+        assert!(written.contains("transientHash<Field>(double(x))"));
+
+        // Running fixup again in-place on `dst_path` is idempotent with 0 edits.
+        let second = fixup_file(&FixupFileOptions {
+            source: dst_path.clone(),
+            target: Some(dst_path.clone()),
+            line_length: 100,
+            update_uint_ranges: false,
+            compact_path: vec![lib_dir],
+        })
+        .unwrap();
+        assert_eq!(second.edits_applied, 0);
+        assert_eq!(second.formatted, written);
     }
 }

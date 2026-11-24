@@ -11,6 +11,7 @@ compact-circuit.workspace = true
 compact-codegen-ts.workspace = true
 compact-codegen-zkir.workspace = true
 compact-diagnostics.workspace = true
+compact-fixup.workspace = true
 compact-fmt.workspace = true
 compact-hir.workspace = true
 compact-parser.workspace = true

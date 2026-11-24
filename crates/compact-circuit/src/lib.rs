@@ -2988,28 +2988,46 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         results
                     }
-                    LedgerOp::MapInsert => {
+                    LedgerOp::MapInsert | LedgerOp::MapInsertCoin => {
                         let LedgerAdt::Map { key, value } = target_adt else {
                             unreachable!("sema validated MapInsert target");
                         };
                         let key_align = AlignmentAtom::alignment_of(self.program, key);
                         let raw_key_vals = self.lower_expr(&args[0], param_vals, locals, guard);
                         let key_vals = self.encode_to_native_wires(key, raw_key_vals);
-                        let val_state = match &args[1].kind {
-                            ExprKind::DefaultAdt(val_adt) => {
-                                adt_initial_state_value(self.program, val_adt)
+                        let val_state = if *op == LedgerOp::MapInsertCoin {
+                            let val_ty = value
+                                .cell_type()
+                                .expect("sema validated MapInsertCoin value type");
+                            let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
+                            let mut coin_vals =
+                                self.lower_expr(&args[1], param_vals, locals, guard);
+                            let _recip_vals = self.lower_expr(&args[2], param_vals, locals, guard);
+                            coin_vals.push(CircuitVal::Imm(0));
+                            let val_wires = self.encode_to_native_wires(val_ty, coin_vals);
+                            ImpactStateValue::Cell {
+                                alignment: val_align,
+                                values: val_wires,
                             }
-                            _ => {
-                                let val_ty = value
-                                    .cell_type()
-                                    .expect("sema validated MapInsert value type");
-                                let val_align = AlignmentAtom::alignment_of(self.program, val_ty);
-                                let raw_val_wires =
-                                    self.lower_expr(&args[1], param_vals, locals, guard);
-                                let val_wires = self.encode_to_native_wires(val_ty, raw_val_wires);
-                                ImpactStateValue::Cell {
-                                    alignment: val_align,
-                                    values: val_wires,
+                        } else {
+                            match &args[1].kind {
+                                ExprKind::DefaultAdt(val_adt) => {
+                                    adt_initial_state_value(self.program, val_adt)
+                                }
+                                _ => {
+                                    let val_ty = value
+                                        .cell_type()
+                                        .expect("sema validated MapInsert value type");
+                                    let val_align =
+                                        AlignmentAtom::alignment_of(self.program, val_ty);
+                                    let raw_val_wires =
+                                        self.lower_expr(&args[1], param_vals, locals, guard);
+                                    let val_wires =
+                                        self.encode_to_native_wires(val_ty, raw_val_wires);
+                                    ImpactStateValue::Cell {
+                                        alignment: val_align,
+                                        values: val_wires,
+                                    }
                                 }
                             }
                         };

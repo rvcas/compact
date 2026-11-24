@@ -680,6 +680,44 @@ impl<'a> Formatter<'a> {
         }
     }
 
+    fn binary_op_prec(op: &str) -> u8 {
+        match op {
+            "||" => 2,
+            "&&" => 3,
+            "==" | "!=" => 4,
+            "<" | "<=" | ">" | ">=" => 5,
+            "+" | "-" => 7,
+            "*" => 8,
+            _ => 7,
+        }
+    }
+
+    fn expr_prec(&self, node: NodeIndex) -> u8 {
+        match self.ast.node_tag(node) {
+            NodeTag::ArrowExpr => 0,
+            NodeTag::TernaryExpr => 1,
+            NodeTag::BinaryExpr => {
+                let op = self
+                    .ast
+                    .token_text(self.ast.node_main_token(node), self.source);
+                Self::binary_op_prec(op)
+            }
+            NodeTag::CastExpr => 6,
+            NodeTag::UnaryExpr => 9,
+            _ => 10,
+        }
+    }
+
+    fn format_expr_with_min_prec(&mut self, node: NodeIndex, min_prec: u8) {
+        if self.expr_prec(node) < min_prec {
+            self.out.push('(');
+            self.format_expr(node);
+            self.out.push(')');
+        } else {
+            self.format_expr(node);
+        }
+    }
+
     fn format_expr(&mut self, node: NodeIndex) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
@@ -704,21 +742,21 @@ impl<'a> Formatter<'a> {
                 self.out.push(']');
             }
             NodeTag::MemberExpr => {
-                self.format_expr(NodeIndex(data.lhs));
+                self.format_expr_with_min_prec(NodeIndex(data.lhs), 10);
                 self.out.push('.');
                 self.out
                     .push_str(self.ast.token_text(TokenIndex(data.rhs), self.source));
             }
             NodeTag::IndexExpr => {
                 let idx = self.ast.index_expr(node);
-                self.format_expr(idx.base);
+                self.format_expr_with_min_prec(idx.base, 10);
                 self.out.push('[');
                 self.format_expr(idx.index);
                 self.out.push(']');
             }
             NodeTag::CallExpr => {
                 let call = self.ast.call_expr(node);
-                self.format_expr(call.callee);
+                self.format_expr_with_min_prec(call.callee, 10);
                 self.out.push('(');
                 let args: Vec<_> = self
                     .ast
@@ -734,7 +772,7 @@ impl<'a> Formatter<'a> {
             }
             NodeTag::GenericCallExpr => {
                 let call = self.ast.generic_call_expr(node);
-                self.format_expr(call.callee);
+                self.format_expr_with_min_prec(call.callee, 10);
                 self.out.push('<');
                 let targs: Vec<_> = self
                     .ast
@@ -764,29 +802,31 @@ impl<'a> Formatter<'a> {
                     self.ast
                         .token_text(self.ast.node_main_token(node), self.source),
                 );
-                self.format_expr(NodeIndex(data.lhs));
+                self.format_expr_with_min_prec(NodeIndex(data.lhs), 9);
             }
             NodeTag::BinaryExpr => {
-                self.format_expr(NodeIndex(data.lhs));
-                write!(
-                    self.out,
-                    " {} ",
-                    self.ast
-                        .token_text(self.ast.node_main_token(node), self.source)
-                )
-                .unwrap();
-                self.format_expr(NodeIndex(data.rhs));
+                let op = self
+                    .ast
+                    .token_text(self.ast.node_main_token(node), self.source);
+                let prec = Self::binary_op_prec(op);
+                let rhs_min = match op {
+                    "+" | "*" | "&&" | "||" => prec,
+                    _ => prec + 1,
+                };
+                self.format_expr_with_min_prec(NodeIndex(data.lhs), prec);
+                write!(self.out, " {op} ").unwrap();
+                self.format_expr_with_min_prec(NodeIndex(data.rhs), rhs_min);
             }
             NodeTag::TernaryExpr => {
                 let t = self.ast.ternary_expr(node);
-                self.format_expr(t.cond);
+                self.format_expr_with_min_prec(t.cond, 2);
                 self.out.push_str(" ? ");
                 self.format_expr(t.then_branch);
                 self.out.push_str(" : ");
                 self.format_expr(t.else_branch);
             }
             NodeTag::CastExpr => {
-                self.format_expr(NodeIndex(data.lhs));
+                self.format_expr_with_min_prec(NodeIndex(data.lhs), 6);
                 self.out.push_str(" as ");
                 self.format_type(NodeIndex(data.rhs));
             }
