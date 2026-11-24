@@ -24,10 +24,9 @@ pub struct CompactDiagnostic {
 
 impl CompactDiagnostic {
     pub fn error(file: &SourceFile, span: Span, message: impl Into<String>) -> Self {
-        let msg = message.into();
         Self {
-            labels: vec![LabeledSpan::at(span, msg.clone())],
-            message: msg,
+            labels: vec![LabeledSpan::new_primary_with_span(None, span)],
+            message: message.into(),
             src: file.named_source(),
             help: None,
             severity: Severity::Error,
@@ -35,14 +34,21 @@ impl CompactDiagnostic {
     }
 
     pub fn warning(file: &SourceFile, span: Span, message: impl Into<String>) -> Self {
-        let msg = message.into();
         Self {
-            labels: vec![LabeledSpan::at(span, msg.clone())],
-            message: msg,
+            labels: vec![LabeledSpan::new_primary_with_span(None, span)],
+            message: message.into(),
             src: file.named_source(),
             help: None,
             severity: Severity::Warning,
         }
+    }
+
+    pub fn with_primary_label(mut self, label: impl Into<String>) -> Self {
+        if let Some(first) = self.labels.first_mut() {
+            let span = (first.offset(), first.len());
+            *first = LabeledSpan::new_primary_with_span(Some(label.into()), span);
+        }
+        self
     }
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {

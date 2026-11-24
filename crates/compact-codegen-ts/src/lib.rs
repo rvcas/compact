@@ -3174,12 +3174,14 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         let rt_fn = match op {
                             LedgerOp::CellRead => "readCell",
                             LedgerOp::CellWrite => "writeCell",
+                            LedgerOp::CellWriteCoin => "writeCoin",
                             LedgerOp::CounterRead => "readCounter",
                             LedgerOp::CounterLessThan => "counterLessThan",
                             LedgerOp::CounterIncrement => "counterIncrement",
                             LedgerOp::CounterDecrement => "counterDecrement",
                             LedgerOp::SetMember => "setMember",
                             LedgerOp::SetInsert => "setInsert",
+                            LedgerOp::SetInsertCoin => "setInsertCoin",
                             LedgerOp::SetRemove => "setRemove",
                             LedgerOp::SetIsEmpty => "setIsEmpty",
                             LedgerOp::SetSize => "setSize",
@@ -3191,16 +3193,38 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             LedgerOp::MapIsEmpty => "mapIsEmpty",
                             LedgerOp::MapSize => "mapSize",
                             LedgerOp::ListPushFront => "listPushFront",
+                            LedgerOp::ListPushFrontCoin => "listPushFrontCoin",
                             LedgerOp::ListPopFront => "listPopFront",
                             LedgerOp::ListHead => "listHead",
                             LedgerOp::ListLength => "listLength",
                             LedgerOp::ListIsEmpty => "listIsEmpty",
                             LedgerOp::MerkleTreeInsert => "merkleTreeInsert",
+                            LedgerOp::MerkleTreeInsertHash => "merkleTreeInsertHash",
+                            LedgerOp::MerkleTreeInsertHashIndex => "merkleTreeInsertHashIndex",
+                            LedgerOp::MerkleTreeInsertIndex => "merkleTreeInsertIndex",
+                            LedgerOp::MerkleTreeInsertIndexDefault => {
+                                "merkleTreeInsertIndexDefault"
+                            }
                             LedgerOp::MerkleTreeIsFull => "merkleTreeIsFull",
                             LedgerOp::MerkleTreeCheckRoot => "merkleTreeCheckRoot",
                             LedgerOp::HistoricMerkleTreeInsert => "historicMerkleTreeInsert",
+                            LedgerOp::HistoricMerkleTreeInsertHash => {
+                                "historicMerkleTreeInsertHash"
+                            }
+                            LedgerOp::HistoricMerkleTreeInsertHashIndex => {
+                                "historicMerkleTreeInsertHashIndex"
+                            }
+                            LedgerOp::HistoricMerkleTreeInsertIndex => {
+                                "historicMerkleTreeInsertIndex"
+                            }
+                            LedgerOp::HistoricMerkleTreeInsertIndexDefault => {
+                                "historicMerkleTreeInsertIndexDefault"
+                            }
                             LedgerOp::HistoricMerkleTreeIsFull => "historicMerkleTreeIsFull",
                             LedgerOp::HistoricMerkleTreeCheckRoot => "historicMerkleTreeCheckRoot",
+                            LedgerOp::HistoricMerkleTreeResetHistory => {
+                                "historicMerkleTreeResetHistory"
+                            }
                             LedgerOp::CellResetToDefault
                             | LedgerOp::CounterResetToDefault
                             | LedgerOp::SetResetToDefault
@@ -3584,8 +3608,9 @@ mod tests {
               return p.first;
             }
 
-            export circuit sample(acct: AccountId, v: Vector<3, Field>, idx: Uint<8>): [Field, Vector<2, Field>] {
+            export circuit sample(acct: AccountId, v: Vector<3, Field>): [Field, Vector<2, Field>] {
               const p: Pair<Field, AccountId> = Pair<Field, AccountId>{ first: v[0], second: acct };
+              const idx = 2;
               bump_two();
               return [first<Field, AccountId>(p) + v[idx], slice<2>(v, 1)];
             }

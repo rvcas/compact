@@ -96,8 +96,70 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
             continue;
         }
 
-        // Natural number literal
+        // Natural number literal (decimal, 0x hex, 0b binary, 0o octal)
         if b.is_ascii_digit() {
+            if b == b'0' && pos + 1 < len {
+                match bytes[pos + 1] {
+                    b'x' | b'X' => {
+                        pos += 2;
+                        let digits_start = pos;
+                        while pos < len && bytes[pos].is_ascii_hexdigit() {
+                            pos += 1;
+                        }
+                        if pos == digits_start {
+                            diagnostics.push(CompactDiagnostic::error(
+                                file,
+                                Span::new(start as u32, pos as u32),
+                                "invalid hexadecimal integer literal",
+                            ));
+                        }
+                        tokens.push(Token {
+                            tag: TokenTag::Nat,
+                            span: Span::new(start as u32, pos as u32),
+                        });
+                        continue;
+                    }
+                    b'b' | b'B' => {
+                        pos += 2;
+                        let digits_start = pos;
+                        while pos < len && matches!(bytes[pos], b'0' | b'1') {
+                            pos += 1;
+                        }
+                        if pos == digits_start {
+                            diagnostics.push(CompactDiagnostic::error(
+                                file,
+                                Span::new(start as u32, pos as u32),
+                                "invalid binary integer literal",
+                            ));
+                        }
+                        tokens.push(Token {
+                            tag: TokenTag::Nat,
+                            span: Span::new(start as u32, pos as u32),
+                        });
+                        continue;
+                    }
+                    b'o' | b'O' => {
+                        pos += 2;
+                        let digits_start = pos;
+                        while pos < len && matches!(bytes[pos], b'0'..=b'7') {
+                            pos += 1;
+                        }
+                        if pos == digits_start {
+                            diagnostics.push(CompactDiagnostic::error(
+                                file,
+                                Span::new(start as u32, pos as u32),
+                                "invalid octal integer literal",
+                            ));
+                        }
+                        tokens.push(Token {
+                            tag: TokenTag::Nat,
+                            span: Span::new(start as u32, pos as u32),
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             pos += 1;
             while pos < len && bytes[pos].is_ascii_digit() {
                 pos += 1;
@@ -117,15 +179,16 @@ pub fn lex(file: &SourceFile, diagnostics: &mut DiagnosticBag) -> LexOutput {
             while pos < len {
                 let c = bytes[pos];
                 if c == b'\\' && pos + 1 < len {
-                    pos += 2;
+                    if bytes[pos + 1] == b'\r' && pos + 2 < len && bytes[pos + 2] == b'\n' {
+                        pos += 3;
+                    } else {
+                        pos += 2;
+                    }
                     continue;
                 }
                 if c == quote {
                     pos += 1;
                     closed = true;
-                    break;
-                }
-                if c == b'\n' {
                     break;
                 }
                 pos += 1;
@@ -340,6 +403,9 @@ fn keyword_or_ident(text: &str) -> TokenTag {
         "implements" => TokenTag::Implements,
         "constructor" => TokenTag::Constructor,
         "emit" => TokenTag::Emit,
+        "await" | "break" | "case" | "catch" | "class" | "debugger" | "extends" | "finally"
+        | "function" | "in" | "instanceof" | "interface" | "super" | "switch" | "typeof"
+        | "var" | "void" | "yield" => TokenTag::Reserved,
         _ => TokenTag::Ident,
     }
 }

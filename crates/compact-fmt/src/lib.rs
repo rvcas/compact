@@ -526,6 +526,11 @@ impl<'a> Formatter<'a> {
                         .token_text(self.ast.node_main_token(node), self.source),
                 );
             }
+            NodeTag::TypeRange => {
+                self.format_type(NodeIndex(data.lhs));
+                self.out.push_str("..");
+                self.format_type(NodeIndex(data.rhs));
+            }
             NodeTag::TypeGeneric => {
                 self.out.push_str(
                     self.ast
@@ -579,6 +584,9 @@ impl<'a> Formatter<'a> {
     fn format_stmt(&mut self, node: NodeIndex, indent: usize) {
         let data = self.ast.node_data(node);
         match self.ast.node_tag(node) {
+            NodeTag::Block => {
+                self.format_block(node, indent);
+            }
             NodeTag::IfStmt => {
                 let stmt = self.ast.if_stmt(node);
                 self.out.push_str("if (");
@@ -817,9 +825,7 @@ impl<'a> Formatter<'a> {
                     if i > 0 {
                         self.out.push_str(", ");
                     }
-                    if self.ast.node_tag(f) == NodeTag::SpreadExpr {
-                        self.format_expr(f);
-                    } else {
+                    if self.ast.node_tag(f) == NodeTag::StructLitField {
                         let sf = self.ast.struct_lit_field(f);
                         write!(
                             self.out,
@@ -828,6 +834,8 @@ impl<'a> Formatter<'a> {
                         )
                         .unwrap();
                         self.format_expr(sf.value);
+                    } else {
+                        self.format_expr(f);
                     }
                 }
                 self.out.push_str(" }");

@@ -87,6 +87,7 @@ impl LedgerAdt {
 pub enum LedgerOp {
     CellRead,
     CellWrite,
+    CellWriteCoin,
     CellResetToDefault,
     CounterIncrement,
     CounterDecrement,
@@ -95,6 +96,7 @@ pub enum LedgerOp {
     CounterResetToDefault,
     SetMember,
     SetInsert,
+    SetInsertCoin,
     SetRemove,
     SetIsEmpty,
     SetSize,
@@ -108,18 +110,28 @@ pub enum LedgerOp {
     MapSize,
     MapResetToDefault,
     ListPushFront,
+    ListPushFrontCoin,
     ListPopFront,
     ListHead,
     ListLength,
     ListIsEmpty,
     ListResetToDefault,
     MerkleTreeInsert,
+    MerkleTreeInsertHash,
+    MerkleTreeInsertHashIndex,
+    MerkleTreeInsertIndex,
+    MerkleTreeInsertIndexDefault,
     MerkleTreeIsFull,
     MerkleTreeCheckRoot,
     MerkleTreeResetToDefault,
     HistoricMerkleTreeInsert,
+    HistoricMerkleTreeInsertHash,
+    HistoricMerkleTreeInsertHashIndex,
+    HistoricMerkleTreeInsertIndex,
+    HistoricMerkleTreeInsertIndexDefault,
     HistoricMerkleTreeIsFull,
     HistoricMerkleTreeCheckRoot,
+    HistoricMerkleTreeResetHistory,
     HistoricMerkleTreeResetToDefault,
     KernelSelf,
     KernelCaller,
@@ -145,6 +157,7 @@ impl LedgerOp {
         match self {
             Self::CellRead | Self::CounterRead => "read",
             Self::CellWrite => "write",
+            Self::CellWriteCoin => "writeCoin",
             Self::CounterIncrement => "increment",
             Self::CounterDecrement => "decrement",
             Self::CounterLessThan => "lessThan",
@@ -154,16 +167,27 @@ impl LedgerOp {
             | Self::MapInsert
             | Self::MerkleTreeInsert
             | Self::HistoricMerkleTreeInsert => "insert",
+            Self::SetInsertCoin => "insertCoin",
             Self::MapInsertDefault => "insertDefault",
             Self::SetRemove | Self::MapRemove => "remove",
             Self::SetIsEmpty | Self::MapIsEmpty | Self::ListIsEmpty => "isEmpty",
             Self::SetSize | Self::MapSize => "size",
             Self::ListPushFront => "pushFront",
+            Self::ListPushFrontCoin => "pushFrontCoin",
             Self::ListPopFront => "popFront",
             Self::ListHead => "head",
             Self::ListLength => "length",
+            Self::MerkleTreeInsertHash | Self::HistoricMerkleTreeInsertHash => "insertHash",
+            Self::MerkleTreeInsertHashIndex | Self::HistoricMerkleTreeInsertHashIndex => {
+                "insertHashIndex"
+            }
+            Self::MerkleTreeInsertIndex | Self::HistoricMerkleTreeInsertIndex => "insertIndex",
+            Self::MerkleTreeInsertIndexDefault | Self::HistoricMerkleTreeInsertIndexDefault => {
+                "insertIndexDefault"
+            }
             Self::MerkleTreeIsFull | Self::HistoricMerkleTreeIsFull => "isFull",
             Self::MerkleTreeCheckRoot | Self::HistoricMerkleTreeCheckRoot => "checkRoot",
+            Self::HistoricMerkleTreeResetHistory => "resetHistory",
             Self::CellResetToDefault
             | Self::CounterResetToDefault
             | Self::SetResetToDefault
@@ -195,11 +219,13 @@ impl LedgerOp {
         matches!(
             self,
             Self::CellWrite
+                | Self::CellWriteCoin
                 | Self::CellResetToDefault
                 | Self::CounterIncrement
                 | Self::CounterDecrement
                 | Self::CounterResetToDefault
                 | Self::SetInsert
+                | Self::SetInsertCoin
                 | Self::SetRemove
                 | Self::SetResetToDefault
                 | Self::MapInsert
@@ -207,11 +233,21 @@ impl LedgerOp {
                 | Self::MapRemove
                 | Self::MapResetToDefault
                 | Self::ListPushFront
+                | Self::ListPushFrontCoin
                 | Self::ListPopFront
                 | Self::ListResetToDefault
                 | Self::MerkleTreeInsert
+                | Self::MerkleTreeInsertHash
+                | Self::MerkleTreeInsertHashIndex
+                | Self::MerkleTreeInsertIndex
+                | Self::MerkleTreeInsertIndexDefault
                 | Self::MerkleTreeResetToDefault
                 | Self::HistoricMerkleTreeInsert
+                | Self::HistoricMerkleTreeInsertHash
+                | Self::HistoricMerkleTreeInsertHashIndex
+                | Self::HistoricMerkleTreeInsertIndex
+                | Self::HistoricMerkleTreeInsertIndexDefault
+                | Self::HistoricMerkleTreeResetHistory
                 | Self::HistoricMerkleTreeResetToDefault
                 | Self::KernelCheckpoint
                 | Self::KernelClaimZswapNullifier

@@ -27,8 +27,9 @@ circuit first<A, B>(p: Pair<A, B>): A {
   return p.first;
 }
 
-export circuit sample(acct: AccountId, v: Vector<3, Field>, idx: Uint<8>): [Field, Vector<2, Field>] {
+export circuit sample(acct: AccountId, v: Vector<3, Field>): [Field, Vector<2, Field>] {
   const p: Pair<Field, AccountId> = Pair<Field, AccountId>{ first: v[0], second: acct };
+  const idx = 2;
   bump_two();
   return [first<Field, AccountId>(p) + v[idx], slice<2>(v, 1)];
 }
@@ -62,12 +63,12 @@ function _first_Field_AccountId(p: Pair_Field_AccountId): bigint {
 export type Witnesses<T> = {};
 export type ImpureCircuits<T> = {
 	bump_two(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
-	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
+	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
 };
 export type PureCircuits = {};
 export type Circuits<T> = {
 	bump_two(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
-	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
+	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
 };
 export type Ledger = {};
 export const pureCircuits: PureCircuits = {};
@@ -104,14 +105,15 @@ export class Contract<
 					context
 				};
 			},
-			sample: (context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]> => {
+			sample: (context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]> => {
 				const p: Pair_Field_AccountId = {
 					first: v[0],
 					second: acct
 				};
+				const idx: bigint = 2n;
 				_bump_two(context);
 				return {
-					result: [_first_Field_AccountId(p) + v[Number(idx)], v.slice(1, 3)],
+					result: [_first_Field_AccountId(p) + v[2], v.slice(1, 3)],
 					context
 				};
 			}
@@ -137,14 +139,15 @@ export class Contract<
 					context
 				};
 			},
-			sample: (context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]> => {
+			sample: (context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]> => {
 				const p: Pair_Field_AccountId = {
 					first: v[0],
 					second: acct
 				};
+				const idx: bigint = 2n;
 				_bump_two(context);
 				return {
-					result: [_first_Field_AccountId(p) + v[Number(idx)], v.slice(1, 3)],
+					result: [_first_Field_AccountId(p) + v[2], v.slice(1, 3)],
 					context
 				};
 			}
@@ -207,14 +210,15 @@ export class Contract {
 					context
 				};
 			},
-			sample: (context, acct, v, idx) => {
+			sample: (context, acct, v) => {
 				const p = {
 					first: v[0],
 					second: acct
 				};
+				const idx = 2n;
 				_bump_two(context);
 				return {
-					result: [_first_Field_AccountId(p) + v[Number(idx)], v.slice(1, 3)],
+					result: [_first_Field_AccountId(p) + v[2], v.slice(1, 3)],
 					context
 				};
 			}
@@ -240,14 +244,15 @@ export class Contract {
 					context
 				};
 			},
-			sample: (context, acct, v, idx) => {
+			sample: (context, acct, v) => {
 				const p = {
 					first: v[0],
 					second: acct
 				};
+				const idx = 2n;
 				_bump_two(context);
 				return {
-					result: [_first_Field_AccountId(p) + v[Number(idx)], v.slice(1, 3)],
+					result: [_first_Field_AccountId(p) + v[2], v.slice(1, 3)],
 					context
 				};
 			}
@@ -264,12 +269,12 @@ export type AccountId = Uint8Array;
 export type Witnesses<T> = {};
 export type ImpureCircuits<T> = {
 	bump_two(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
-	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
+	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
 };
 export type PureCircuits = {};
 export type Circuits<T> = {
 	bump_two(context: __compactRuntime.CircuitContext<T>): __compactRuntime.CircuitResults<T, []>;
-	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint], idx: bigint): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
+	sample(context: __compactRuntime.CircuitContext<T>, acct: AccountId, v: [bigint, bigint, bigint]): __compactRuntime.CircuitResults<T, [bigint, [bigint, bigint]]>;
 };
 export type Ledger = {};
 export declare const pureCircuits: PureCircuits;

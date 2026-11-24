@@ -120,6 +120,7 @@ pub enum TokenTag {
     PipePipe,
 
     // Special
+    Reserved,
     Eof,
     Invalid,
 }
@@ -191,6 +192,7 @@ impl TokenTag {
             Self::Bang => "!",
             Self::AmpAmp => "&&",
             Self::PipePipe => "||",
+            Self::Reserved => "reserved keyword",
             Self::Eof => "end of file",
             Self::Invalid => "invalid token",
         }
@@ -311,6 +313,9 @@ pub enum NodeTag {
     TypeGeneric,
     /// Numeric type argument (e.g. `32` in `Bytes<32>`) — `main_token = nat_tok`.
     TypeNat,
+    /// Numeric range type argument (e.g. `0..10` or `0..N` in `Uint<0..10>`)
+    /// `main_token = '..'`, `data = (lo_node, hi_node)`.
+    TypeRange,
     /// String type argument (e.g. `"string"` in `Opaque<"string">`) — `main_token = string_tok`.
     TypeString,
     /// Tuple type (e.g. `[]`, `[Field, Boolean]`) — `main_token = '['`, `data = (extra_start, extra_end)`.
@@ -1389,6 +1394,9 @@ impl Ast {
                     main
                 }
             }
+            NodeTag::TypeRange => self
+                .node_span(NodeIndex(data.lhs))
+                .merge(self.node_span(NodeIndex(data.rhs))),
             NodeTag::TypeGeneric | NodeTag::TypeTuple | NodeTag::TupleExpr | NodeTag::Block => {
                 let mut span = main;
                 if let Some(last) = self.extra_nodes(data.lhs, data.rhs).last() {
@@ -1836,6 +1844,11 @@ impl Ast {
                 )
                 .unwrap();
             }
+            NodeTag::TypeRange => {
+                writeln!(out, "{pad}TypeRange").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+                self.dump_node(NodeIndex(data.rhs), source, indent + 1, out);
+            }
             NodeTag::TypeString => {
                 writeln!(
                     out,
@@ -2119,4 +2132,181 @@ impl Ast {
             }
         }
     }
+}
+
+/// Parse a Compact natural number literal (`decimal`, `0x` hex, `0b` binary, `0o` octal) into `u128`.
+pub fn parse_nat_u128(raw: &str) -> Option<u128> {
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        let trimmed = hex.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        u128::from_str_radix(trimmed, 16).ok()
+    } else if let Some(bin) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B")) {
+        let trimmed = bin.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        u128::from_str_radix(trimmed, 2).ok()
+    } else if let Some(oct) = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O")) {
+        let trimmed = oct.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        u128::from_str_radix(trimmed, 8).ok()
+    } else {
+        let trimmed = raw.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        trimmed.parse::<u128>().ok()
+    }
+}
+
+/// Parse a Compact natural number literal into `u64`.
+pub fn parse_nat_u64(raw: &str) -> Option<u64> {
+    parse_nat_u128(raw).and_then(|v| u64::try_from(v).ok())
+}
+
+/// Parse a Compact natural number literal into `u32`.
+pub fn parse_nat_u32(raw: &str) -> Option<u32> {
+    parse_nat_u128(raw).and_then(|v| u32::try_from(v).ok())
+}
+
+/// Compute the minimum bit width needed to represent a non-negative integer literal
+/// (supporting arbitrary-length decimal/hex/binary/octal literals up to 248+ bits for `Uint<0..max>`).
+/// Returns `None` if `raw` is malformed; returns `Some((is_zero, bit_width))` where `bit_width` is
+/// the number of bits needed to hold the inclusive upper bound `max` (e.g. `0` -> 0 bits, `1` -> 1 bit, `255` -> 8 bits).
+pub fn nat_literal_bit_width(raw: &str) -> Option<(bool, u32)> {
+    if let Some(v) = parse_nat_u128(raw) {
+        return Some((v == 0, 128 - v.leading_zeros()));
+    }
+    // Arbitrary-precision fallback for > 128-bit range bounds (e.g. `Uint<0..999999999999...>`).
+    let (radix, digits) = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))
+    {
+        (16u32, h)
+    } else if let Some(b) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B")) {
+        (2u32, b)
+    } else if let Some(o) = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O")) {
+        (8u32, o)
+    } else {
+        (10u32, raw)
+    };
+    // Big-endian base-2^32 limbs (little-endian stored in `limbs`).
+    let mut limbs: Vec<u32> = Vec::new();
+    for ch in digits.chars() {
+        let d = ch.to_digit(radix)?;
+        let mut carry = d as u64;
+        for limb in &mut limbs {
+            let prod = (*limb as u64) * (radix as u64) + carry;
+            *limb = prod as u32;
+            carry = prod >> 32;
+        }
+        if carry > 0 {
+            limbs.push(carry as u32);
+        }
+    }
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    if limbs.is_empty() {
+        return Some((true, 0));
+    }
+    let top = *limbs.last().unwrap();
+    let bits = ((limbs.len() as u32 - 1) * 32) + (32 - top.leading_zeros());
+    Some((false, bits))
+}
+
+/// Unquote and unescape a Compact string literal (`"..."` or `'...'`) into its exact UTF-8 byte sequence.
+pub fn unescape_string_bytes(raw: &str) -> Vec<u8> {
+    let inner = if (raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2)
+        || (raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2)
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let mut out = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('0') => out.push(0),
+            Some('b') => out.push(0x08),
+            Some('f') => out.push(0x0C),
+            Some('v') => out.push(0x0B),
+            Some('\\') => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
+            Some('\'') => out.push(b'\''),
+            // Backslash line continuation
+            Some('\n') => {}
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some('x') => {
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    if let Some(&h) = chars.peek()
+                        && h.is_ascii_hexdigit()
+                    {
+                        hex.push(h);
+                        chars.next();
+                    }
+                }
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    out.push(byte);
+                }
+            }
+            Some('u') => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut hex = String::new();
+                    while let Some(&h) = chars.peek() {
+                        chars.next();
+                        if h == '}' {
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(cp)
+                    {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                } else {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(&h) = chars.peek()
+                            && h.is_ascii_hexdigit()
+                        {
+                            hex.push(h);
+                            chars.next();
+                        }
+                    }
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(cp)
+                    {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+            Some(other) => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => {}
+        }
+    }
+    out
 }

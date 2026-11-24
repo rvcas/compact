@@ -82,6 +82,12 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         generic_circuits: Vec::new(),
         generic_circuit_cache: HashMap::new(),
         resolving_aliases: HashSet::new(),
+        instantiating_modules: HashSet::new(),
+        instantiating_module_files: HashSet::new(),
+        new_type_adts: HashMap::new(),
+        const_int_locals: HashMap::new(),
+        loop_index_locals: HashSet::new(),
+        block_consts: Vec::new(),
         next_mod_instance: 0,
         next_local: 0,
         next_ledger_slot: 0,
@@ -116,6 +122,9 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         &mut analyzer.diagnostics,
     );
     reject_constructor_forbidden_ops(file, &program, &mut analyzer.diagnostics);
+    reject_sealed_mutations(file, &program, &mut analyzer.diagnostics);
+    check_returns_and_reachability(file, &program, &mut analyzer.diagnostics);
+    reject_case_insensitive_duplicate_exports(file, &program, &mut analyzer.diagnostics);
     if !analyzer.diagnostics.has_errors() {
         witness::check_witness_disclosure(file, &program, &mut analyzer.diagnostics);
     }
@@ -197,12 +206,14 @@ struct GenericParamDef {
 enum GenericArgVal {
     Type(Type),
     Nat(u32),
+    BigNat(String),
 }
 
 #[derive(Debug, Clone, Default)]
 struct GenericEnv {
     types: HashMap<String, Type>,
     nats: HashMap<String, u32>,
+    big_nat_bits: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -216,9 +227,10 @@ struct ScopeEnv {
     contracts: HashMap<String, ContractId>,
     ledger_fields: HashMap<String, LedgerFieldId>,
     witnesses: HashMap<String, WitnessId>,
-    circuits: HashMap<String, CircuitId>,
-    generic_circuits: HashMap<String, usize>,
+    circuits: HashMap<String, Vec<CircuitId>>,
+    generic_circuits: HashMap<String, Vec<usize>>,
     modules: HashMap<String, usize>,
+    stdlib_aliases: HashMap<String, String>,
     generics: GenericEnv,
     has_stdlib: bool,
 }
@@ -234,9 +246,10 @@ struct ModuleExports {
     contracts: HashMap<String, ContractId>,
     ledger_fields: HashMap<String, LedgerFieldId>,
     witnesses: HashMap<String, WitnessId>,
-    circuits: HashMap<String, CircuitId>,
-    generic_circuits: HashMap<String, usize>,
+    circuits: HashMap<String, Vec<CircuitId>>,
+    generic_circuits: HashMap<String, Vec<usize>>,
     modules: HashMap<String, usize>,
+    stdlib_aliases: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -340,6 +353,12 @@ struct Analyzer<'a> {
     generic_circuits: Vec<GenericCircuitTemplate>,
     generic_circuit_cache: HashMap<(usize, Vec<GenericArgVal>), CircuitId>,
     resolving_aliases: HashSet<usize>,
+    instantiating_modules: HashSet<usize>,
+    instantiating_module_files: HashSet<String>,
+    new_type_adts: HashMap<NewTypeId, LedgerAdt>,
+    const_int_locals: HashMap<LocalId, u128>,
+    loop_index_locals: HashSet<LocalId>,
+    block_consts: Vec<HashSet<String>>,
     next_mod_instance: usize,
     next_local: u32,
     next_ledger_slot: u32,
@@ -447,9 +466,15 @@ impl<'a> Analyzer<'a> {
                     });
                     std_internal_scope
                         .generic_circuits
-                        .insert(name.clone(), gid);
+                        .entry(name.clone())
+                        .or_default()
+                        .push(gid);
                     if c.exported {
-                        std_exported_scope.generic_circuits.insert(name, gid);
+                        std_exported_scope
+                            .generic_circuits
+                            .entry(name)
+                            .or_default()
+                            .push(gid);
                     }
                     created_circuits.push(gid);
                 }
@@ -504,10 +529,178 @@ impl<'a> Analyzer<'a> {
     }
 
     fn underlying_type<'b>(&'b self, mut ty: &'b Type) -> &'b Type {
+        let limit = self.new_types.len();
+        let mut steps = 0;
         while let Type::NewType(id) = ty {
+            if steps > limit {
+                break;
+            }
+            steps += 1;
             ty = &self.new_types[id.0 as usize].inner;
         }
         ty
+    }
+
+    fn reject_cyclic_types(&mut self) {
+        #[derive(Copy, Clone, PartialEq, Eq, Hash)]
+        enum TypeNode {
+            NewType(u32),
+            Struct(u32),
+        }
+
+        fn visit(
+            node: TypeNode,
+            new_types: &[NewTypeDecl],
+            structs: &[StructDecl],
+            visiting: &mut HashSet<TypeNode>,
+            visited: &mut HashSet<TypeNode>,
+            cyclic_new_types: &mut Vec<u32>,
+            cyclic_structs: &mut Vec<u32>,
+        ) -> bool {
+            if visited.contains(&node) {
+                return false;
+            }
+            if !visiting.insert(node) {
+                return true;
+            }
+            let mut has_cycle = false;
+            let check_ty = |ty: &Type,
+                            visiting: &mut HashSet<TypeNode>,
+                            visited: &mut HashSet<TypeNode>,
+                            cyclic_nt: &mut Vec<u32>,
+                            cyclic_st: &mut Vec<u32>|
+             -> bool {
+                fn walk(
+                    ty: &Type,
+                    new_types: &[NewTypeDecl],
+                    structs: &[StructDecl],
+                    visiting: &mut HashSet<TypeNode>,
+                    visited: &mut HashSet<TypeNode>,
+                    cyclic_nt: &mut Vec<u32>,
+                    cyclic_st: &mut Vec<u32>,
+                ) -> bool {
+                    match ty {
+                        Type::NewType(id) => visit(
+                            TypeNode::NewType(id.0),
+                            new_types,
+                            structs,
+                            visiting,
+                            visited,
+                            cyclic_nt,
+                            cyclic_st,
+                        ),
+                        Type::Struct(id) => visit(
+                            TypeNode::Struct(id.0),
+                            new_types,
+                            structs,
+                            visiting,
+                            visited,
+                            cyclic_nt,
+                            cyclic_st,
+                        ),
+                        Type::Vector(_, inner) | Type::Maybe(inner) => walk(
+                            inner, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                        ),
+                        Type::Either(l, r) => {
+                            let a = walk(
+                                l, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                            );
+                            let b = walk(
+                                r, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                            );
+                            a || b
+                        }
+                        Type::Tuple(elems) => elems.iter().any(|e| {
+                            walk(
+                                e, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                            )
+                        }),
+                        Type::MerkleTreePath(_, leaf) => walk(
+                            leaf, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                        ),
+                        _ => false,
+                    }
+                }
+                walk(
+                    ty, new_types, structs, visiting, visited, cyclic_nt, cyclic_st,
+                )
+            };
+
+            match node {
+                TypeNode::NewType(id) => {
+                    let inner = &new_types[id as usize].inner;
+                    if check_ty(inner, visiting, visited, cyclic_new_types, cyclic_structs) {
+                        has_cycle = true;
+                        cyclic_new_types.push(id);
+                    }
+                }
+                TypeNode::Struct(id) => {
+                    for f in &structs[id as usize].fields {
+                        if check_ty(&f.ty, visiting, visited, cyclic_new_types, cyclic_structs) {
+                            has_cycle = true;
+                        }
+                    }
+                    if has_cycle {
+                        cyclic_structs.push(id);
+                    }
+                }
+            }
+            visiting.remove(&node);
+            visited.insert(node);
+            has_cycle
+        }
+
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut cyclic_nt = Vec::new();
+        let mut cyclic_st = Vec::new();
+        for i in 0..self.new_types.len() {
+            visit(
+                TypeNode::NewType(i as u32),
+                &self.new_types,
+                &self.structs,
+                &mut visiting,
+                &mut visited,
+                &mut cyclic_nt,
+                &mut cyclic_st,
+            );
+        }
+        for i in 0..self.structs.len() {
+            visit(
+                TypeNode::Struct(i as u32),
+                &self.new_types,
+                &self.structs,
+                &mut visiting,
+                &mut visited,
+                &mut cyclic_nt,
+                &mut cyclic_st,
+            );
+        }
+        cyclic_nt.sort_unstable();
+        cyclic_nt.dedup();
+        for id in cyclic_nt {
+            let nt = &mut self.new_types[id as usize];
+            let name = nt.name.clone();
+            let span = nt.span;
+            nt.inner = Type::unit();
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                span,
+                format!("cyclic new type definition `{name}`"),
+            ));
+        }
+        cyclic_st.sort_unstable();
+        cyclic_st.dedup();
+        for id in cyclic_st {
+            let st = &self.structs[id as usize];
+            let name = st.name.clone();
+            let span = st.span;
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                span,
+                format!("cyclic struct definition `{name}`"),
+            ));
+        }
     }
 
     fn read_generic_params(&self, start: u32, end: u32) -> Vec<GenericParamDef> {
@@ -527,6 +720,7 @@ impl<'a> Analyzer<'a> {
     fn run(&mut self) {
         let root_decls: Vec<_> = self.units.ast().root_decls().collect();
         let _ = self.process_scope_decls(UnitId(0), &root_decls, None, false);
+        self.reject_cyclic_types();
 
         // Pass 2: type-check constructor & all concrete + on-demand monomorphized circuit bodies.
         if let Some((ctor_unit, ctor_node, ctor_scope)) = self.constructor_node.clone() {
@@ -665,6 +859,9 @@ impl<'a> Analyzer<'a> {
             }
             self.units.switch(prev);
         }
+        if !is_module_instance && !created_modules.is_empty() {
+            self.validate_declared_modules(&created_modules);
+        }
 
         // Pass 1a-1: export lists, enums, type aliases, new types, and struct names.
         for &(du, decl) in &decls {
@@ -722,6 +919,33 @@ impl<'a> Analyzer<'a> {
                 NodeTag::TypeDecl => {
                     let td = self.units.ast().type_decl(decl);
                     let local_name = self.text(td.name_token).to_owned();
+                    let name_span = self.units.ast().token_span(td.name_token);
+                    if is_builtin_type_name(&local_name)
+                        || (self.scope.has_stdlib && is_stdlib_type_name(&local_name))
+                    {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            name_span,
+                            format!("cannot redefine built-in type `{local_name}`"),
+                        ));
+                        self.units.switch(prev);
+                        continue;
+                    }
+                    if self.scope.type_aliases.contains_key(&local_name)
+                        || self.scope.new_types.contains_key(&local_name)
+                        || self.scope.generic_new_types.contains_key(&local_name)
+                        || self.scope.structs.contains_key(&local_name)
+                        || self.scope.generic_structs.contains_key(&local_name)
+                        || self.scope.enums.contains_key(&local_name)
+                    {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            name_span,
+                            format!("duplicate type definition `{local_name}`"),
+                        ));
+                        self.units.switch(prev);
+                        continue;
+                    }
                     let gparams = self.read_generic_params(td.gparams_start, td.gparams_end);
                     if !td.is_new {
                         let aid = self.type_aliases.len();
@@ -839,7 +1063,11 @@ impl<'a> Analyzer<'a> {
         for &(du, decl, nid) in &pending_new_types {
             let prev = self.units.switch(du);
             let td = self.units.ast().type_decl(decl);
-            if let Some(inner) = self.resolve_type(td.target_type) {
+            if self.is_adt_type_node(td.target_type) {
+                if let Some(adt) = self.resolve_ledger_adt(td.target_type) {
+                    self.new_type_adts.insert(nid, adt);
+                }
+            } else if let Some(inner) = self.resolve_type(td.target_type) {
                 self.new_types[nid.0 as usize].inner = inner;
             }
             self.units.switch(prev);
@@ -920,9 +1148,17 @@ impl<'a> Analyzer<'a> {
                             span: self.units.ast().node_span(decl),
                             scope: ScopeEnv::default(),
                         });
-                        self.scope.generic_circuits.insert(local_name.clone(), gid);
+                        self.scope
+                            .generic_circuits
+                            .entry(local_name.clone())
+                            .or_default()
+                            .push(gid);
                         if c.exported {
-                            exports.generic_circuits.insert(local_name, gid);
+                            exports
+                                .generic_circuits
+                                .entry(local_name)
+                                .or_default()
+                                .push(gid);
                         }
                         created_generic_circuits.push(gid);
                     } else if let Some((cname, cid, exported)) =
@@ -930,7 +1166,7 @@ impl<'a> Analyzer<'a> {
                     {
                         created_circuits.push(cid.0 as usize);
                         if exported {
-                            exports.circuits.insert(cname, cid);
+                            exports.circuits.entry(cname).or_default().push(cid);
                         }
                     }
                 }
@@ -943,22 +1179,35 @@ impl<'a> Analyzer<'a> {
         for (du, tok) in export_list_tokens {
             let prev = self.units.switch(du);
             let name = self.text(tok).to_owned();
-            if let Some(&cid) = self.scope.circuits.get(&name) {
+            if let Some(cids) = self.scope.circuits.get(&name).cloned() {
                 if is_module_instance {
-                    exports.circuits.insert(name, cid);
+                    exports.circuits.entry(name).or_default().extend(cids);
                 } else {
-                    self.circuit_sigs[cid.0 as usize].exported = true;
-                    self.circuit_sigs[cid.0 as usize].name = name;
+                    for cid in cids {
+                        self.circuit_sigs[cid.0 as usize].exported = true;
+                        self.circuit_sigs[cid.0 as usize].name = name.clone();
+                    }
                 }
-            } else if let Some(&gid) = self.scope.generic_circuits.get(&name) {
+            } else if let Some(gids) = self.scope.generic_circuits.get(&name).cloned() {
                 if is_module_instance {
-                    exports.generic_circuits.insert(name, gid);
-                } else if self.generic_circuits[gid].gparams.is_empty()
-                    && let Some(cid) =
-                        self.instantiate_generic_circuit(gid, &[], self.units.ast().token_span(tok))
-                {
-                    self.circuit_sigs[cid.0 as usize].exported = true;
-                    self.circuit_sigs[cid.0 as usize].name = name;
+                    exports
+                        .generic_circuits
+                        .entry(name)
+                        .or_default()
+                        .extend(gids);
+                } else {
+                    for gid in gids {
+                        if self.generic_circuits[gid].gparams.is_empty()
+                            && let Some(cid) = self.instantiate_generic_circuit(
+                                gid,
+                                &[],
+                                self.units.ast().token_span(tok),
+                            )
+                        {
+                            self.circuit_sigs[cid.0 as usize].exported = true;
+                            self.circuit_sigs[cid.0 as usize].name = name.clone();
+                        }
+                    }
                 }
             } else if let Some(&eid) = self.scope.enums.get(&name) {
                 if is_module_instance {
@@ -1015,6 +1264,12 @@ impl<'a> Analyzer<'a> {
                 } else {
                     self.witnesses[wid.0 as usize].exported = true;
                     self.witnesses[wid.0 as usize].name = name;
+                }
+            } else if let Some(canon) = self.scope.stdlib_aliases.get(&name).cloned() {
+                if is_module_instance {
+                    exports.stdlib_aliases.insert(name, canon);
+                } else if !self.exported_stdlib_types.iter().any(|s| s == &canon) {
+                    self.exported_stdlib_types.push(canon);
                 }
             } else if !is_module_instance
                 && self.scope.has_stdlib
@@ -1098,6 +1353,41 @@ impl<'a> Analyzer<'a> {
             .collect();
 
         if name_tag == TokenTag::Ident && raw_name == "CompactStandardLibrary" {
+            if self.scope.circuits.contains_key("CompactStandardLibrary")
+                || self
+                    .scope
+                    .generic_circuits
+                    .contains_key("CompactStandardLibrary")
+                || self
+                    .scope
+                    .type_aliases
+                    .contains_key("CompactStandardLibrary")
+                || self.scope.new_types.contains_key("CompactStandardLibrary")
+                || self
+                    .scope
+                    .generic_new_types
+                    .contains_key("CompactStandardLibrary")
+                || self.scope.structs.contains_key("CompactStandardLibrary")
+                || self
+                    .scope
+                    .generic_structs
+                    .contains_key("CompactStandardLibrary")
+                || self.scope.enums.contains_key("CompactStandardLibrary")
+                || self
+                    .scope
+                    .ledger_fields
+                    .contains_key("CompactStandardLibrary")
+                || self.scope.witnesses.contains_key("CompactStandardLibrary")
+                || self.scope.contracts.contains_key("CompactStandardLibrary")
+                || self.scope.modules.contains_key("CompactStandardLibrary")
+            {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    name_span,
+                    "cannot import `CompactStandardLibrary` because the name is already bound",
+                ));
+                return;
+            }
             self.scope.has_stdlib = true;
             let std_scope = self.ensure_stdlib_loaded();
             let apply_prefix = |name: &str| -> String {
@@ -1107,6 +1397,56 @@ impl<'a> Analyzer<'a> {
                 }
             };
             if selections.is_empty() {
+                // Reject user-declared types/aliases that collide with imported CompactStandardLibrary names
+                // (while allowing idempotent repeated `import CompactStandardLibrary;` in the same scope).
+                let check_collision =
+                    |imported_name: &str, expected_ta: Option<usize>, diags: &mut DiagnosticBag| {
+                        let ta_conflict = self
+                            .scope
+                            .type_aliases
+                            .get(imported_name)
+                            .is_some_and(|&aid| Some(aid) != expected_ta);
+                        if ta_conflict
+                            || self.scope.new_types.contains_key(imported_name)
+                            || self.scope.generic_new_types.contains_key(imported_name)
+                            || self.scope.structs.contains_key(imported_name)
+                            || self.scope.enums.contains_key(imported_name)
+                        {
+                            diags.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            name_span,
+                            format!(
+                                "declaration `{imported_name}` conflicts with imported `CompactStandardLibrary` binding"
+                            ),
+                        ));
+                        }
+                    };
+                for k in std_scope.generic_structs.keys() {
+                    check_collision(&apply_prefix(k), None, &mut self.diagnostics);
+                }
+                for (k, &aid) in &std_scope.type_aliases {
+                    check_collision(&apply_prefix(k), Some(aid), &mut self.diagnostics);
+                }
+                for std_builtin in [
+                    "Maybe",
+                    "Either",
+                    "MerkleTreeDigest",
+                    "MerkleTreePathEntry",
+                    "MerkleTreePath",
+                    "JubjubScalar",
+                    "JubjubPoint",
+                    "Secp256k1Base",
+                    "Secp256k1Scalar",
+                    "Secp256k1Point",
+                    "Secp256r1Base",
+                    "Secp256r1Scalar",
+                    "Secp256r1Point",
+                    "Curve25519Base",
+                    "Curve25519Scalar",
+                    "Curve25519Point",
+                ] {
+                    check_collision(&apply_prefix(std_builtin), None, &mut self.diagnostics);
+                }
                 for (k, v) in std_scope.generic_structs {
                     self.scope
                         .generic_structs
@@ -1117,22 +1457,59 @@ impl<'a> Analyzer<'a> {
                     self.scope.type_aliases.entry(apply_prefix(&k)).or_insert(v);
                 }
                 for (k, v) in std_scope.generic_circuits {
-                    self.scope
+                    let entry = self
+                        .scope
                         .generic_circuits
                         .entry(apply_prefix(&k))
-                        .or_insert(v);
+                        .or_default();
+                    for gid in v {
+                        if !entry.contains(&gid) {
+                            entry.push(gid);
+                        }
+                    }
                 }
             } else {
-                for (orig, alias, _) in selections {
+                for (orig, alias, ispan) in selections {
                     let target = apply_prefix(&alias);
+                    let expected_ta = std_scope.type_aliases.get(&orig).copied();
+                    let ta_conflict = self
+                        .scope
+                        .type_aliases
+                        .get(&target)
+                        .is_some_and(|&aid| Some(aid) != expected_ta);
+                    if ta_conflict
+                        || self.scope.new_types.contains_key(&target)
+                        || self.scope.structs.contains_key(&target)
+                        || self.scope.enums.contains_key(&target)
+                    {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            ispan,
+                            format!(
+                                "imported `CompactStandardLibrary` name `{target}` conflicts with an existing binding"
+                            ),
+                        ));
+                    }
                     if let Some(&v) = std_scope.generic_structs.get(&orig) {
                         self.scope.generic_structs.insert(target.clone(), v);
                     }
                     if let Some(&v) = std_scope.type_aliases.get(&orig) {
                         self.scope.type_aliases.insert(target.clone(), v);
                     }
-                    if let Some(&v) = std_scope.generic_circuits.get(&orig) {
-                        self.scope.generic_circuits.insert(target, v);
+                    if let Some(v) = std_scope.generic_circuits.get(&orig) {
+                        let entry = self
+                            .scope
+                            .generic_circuits
+                            .entry(target.clone())
+                            .or_default();
+                        for &gid in v {
+                            if !entry.contains(&gid) {
+                                entry.push(gid);
+                            }
+                        }
+                    }
+                    if is_stdlib_builtin_type(&orig) {
+                        self.scope.stdlib_aliases.insert(target, orig);
                     }
                 }
             }
@@ -1140,11 +1517,23 @@ impl<'a> Analyzer<'a> {
         }
 
         // Resolve module template: either file import (`import "foo";`) or local module (`import M<...>;`).
+        let mut guard_mod_id: Option<usize> = None;
+        let mut guard_mod_file: Option<String> = None;
         let template = if name_tag == TokenTag::String {
             let spec = unquote_string(&raw_name);
             let from_file = self.units.file().clone();
             match self.loader.load(&from_file, &spec) {
                 Ok((mod_file, mod_ast)) => {
+                    let canonical = mod_file.name.clone();
+                    if !self.instantiating_module_files.insert(canonical.clone()) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            name_span,
+                            format!("cyclic module import `{spec}`"),
+                        ));
+                        return;
+                    }
+                    guard_mod_file = Some(canonical);
                     let stem = std::path::Path::new(&spec)
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -1209,6 +1598,15 @@ impl<'a> Analyzer<'a> {
                 }
             }
         } else if let Some(&mid) = self.scope.modules.get(&raw_name) {
+            if !self.instantiating_modules.insert(mid) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    name_span,
+                    format!("cyclic module import `{raw_name}`"),
+                ));
+                return;
+            }
+            guard_mod_id = Some(mid);
             self.modules[mid].clone()
         } else {
             self.diagnostics.push(CompactDiagnostic::error(
@@ -1223,6 +1621,12 @@ impl<'a> Analyzer<'a> {
         let Some(bound_generics) =
             self.resolve_generic_args(&template.name, &template.gparams, &garg_nodes, name_span)
         else {
+            if let Some(mid) = guard_mod_id {
+                self.instantiating_modules.remove(&mid);
+            }
+            if let Some(f) = guard_mod_file {
+                self.instantiating_module_files.remove(&f);
+            }
             return;
         };
 
@@ -1241,6 +1645,12 @@ impl<'a> Analyzer<'a> {
         let mod_exports =
             self.process_scope_decls(template.unit, &template.decls, Some(&mangle_prefix), true);
         self.scope = saved_scope;
+        if let Some(mid) = guard_mod_id {
+            self.instantiating_modules.remove(&mid);
+        }
+        if let Some(f) = guard_mod_file {
+            self.instantiating_module_files.remove(&f);
+        }
 
         // Bind imported items into the importer's scope (either selective `{ a as b } from` or all exports).
         let apply_prefix = |name: &str| -> String {
@@ -1279,18 +1689,41 @@ impl<'a> Analyzer<'a> {
                 self.scope.witnesses.insert(apply_prefix(&k), v);
             }
             for (k, v) in mod_exports.circuits {
-                self.scope.circuits.insert(apply_prefix(&k), v);
+                let entry = self.scope.circuits.entry(apply_prefix(&k)).or_default();
+                for cid in v {
+                    if !entry.contains(&cid) {
+                        entry.push(cid);
+                    }
+                }
             }
             for (k, v) in mod_exports.generic_circuits {
-                self.scope.generic_circuits.insert(apply_prefix(&k), v);
+                let entry = self
+                    .scope
+                    .generic_circuits
+                    .entry(apply_prefix(&k))
+                    .or_default();
+                for gid in v {
+                    if !entry.contains(&gid) {
+                        entry.push(gid);
+                    }
+                }
             }
             for (k, v) in mod_exports.modules {
                 self.scope.modules.insert(apply_prefix(&k), v);
+            }
+            for (k, v) in mod_exports.stdlib_aliases {
+                self.scope.stdlib_aliases.insert(apply_prefix(&k), v);
             }
         } else {
             for (orig, alias, ispan) in selections {
                 let target = apply_prefix(&alias);
                 let mut found = false;
+                if let Some(canon) = mod_exports.stdlib_aliases.get(&orig) {
+                    self.scope
+                        .stdlib_aliases
+                        .insert(target.clone(), canon.clone());
+                    found = true;
+                }
                 if let Some(&v) = mod_exports.enums.get(&orig) {
                     self.scope.enums.insert(target.clone(), v);
                     found = true;
@@ -1320,6 +1753,15 @@ impl<'a> Analyzer<'a> {
                     found = true;
                 }
                 if let Some(&v) = mod_exports.ledger_fields.get(&orig) {
+                    if let Some(&prev) = self.scope.ledger_fields.get(&target)
+                        && prev != v
+                    {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            ispan,
+                            format!("duplicate imported ledger field binding `{target}`"),
+                        ));
+                    }
                     self.scope.ledger_fields.insert(target.clone(), v);
                     found = true;
                 }
@@ -1327,12 +1769,26 @@ impl<'a> Analyzer<'a> {
                     self.scope.witnesses.insert(target.clone(), v);
                     found = true;
                 }
-                if let Some(&v) = mod_exports.circuits.get(&orig) {
-                    self.scope.circuits.insert(target.clone(), v);
+                if let Some(v) = mod_exports.circuits.get(&orig) {
+                    let entry = self.scope.circuits.entry(target.clone()).or_default();
+                    for &cid in v {
+                        if !entry.contains(&cid) {
+                            entry.push(cid);
+                        }
+                    }
                     found = true;
                 }
-                if let Some(&v) = mod_exports.generic_circuits.get(&orig) {
-                    self.scope.generic_circuits.insert(target.clone(), v);
+                if let Some(v) = mod_exports.generic_circuits.get(&orig) {
+                    let entry = self
+                        .scope
+                        .generic_circuits
+                        .entry(target.clone())
+                        .or_default();
+                    for &gid in v {
+                        if !entry.contains(&gid) {
+                            entry.push(gid);
+                        }
+                    }
                     found = true;
                 }
                 if let Some(&v) = mod_exports.modules.get(&orig) {
@@ -1372,8 +1828,25 @@ impl<'a> Analyzer<'a> {
         let mut env = GenericEnv::default();
         for (i, gp) in gparams.iter().enumerate() {
             if gp.is_nat {
-                let n = self.expect_type_nat(arg_nodes, i, owner, span)?;
-                env.nats.insert(gp.name.clone(), n);
+                let arg = arg_nodes[i];
+                if self.units.ast().node_tag(arg) == NodeTag::TypeNat {
+                    let raw = self.text(self.units.ast().node_main_token(arg)).to_owned();
+                    if let Some(n) = compact_ast::parse_nat_u32(&raw) {
+                        env.nats.insert(gp.name.clone(), n);
+                    } else if let Some((_, bw)) = compact_ast::nat_literal_bit_width(&raw) {
+                        env.big_nat_bits.insert(gp.name.clone(), bw);
+                    } else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            self.units.ast().node_span(arg),
+                            format!("invalid numeric size `{raw}`"),
+                        ));
+                        return None;
+                    }
+                } else {
+                    let n = self.expect_type_nat(arg_nodes, i, owner, span)?;
+                    env.nats.insert(gp.name.clone(), n);
+                }
             } else {
                 let ty = self.resolve_type(arg_nodes[i])?;
                 env.types.insert(gp.name.clone(), ty);
@@ -1405,9 +1878,28 @@ impl<'a> Analyzer<'a> {
         let mut env = GenericEnv::default();
         for (i, gp) in gparams.iter().enumerate() {
             if gp.is_nat {
-                let n = self.expect_type_nat(arg_nodes, i, owner, span)?;
-                vals.push(GenericArgVal::Nat(n));
-                env.nats.insert(gp.name.clone(), n);
+                let arg = arg_nodes[i];
+                if self.units.ast().node_tag(arg) == NodeTag::TypeNat {
+                    let raw = self.text(self.units.ast().node_main_token(arg)).to_owned();
+                    if let Some(n) = compact_ast::parse_nat_u32(&raw) {
+                        vals.push(GenericArgVal::Nat(n));
+                        env.nats.insert(gp.name.clone(), n);
+                    } else if let Some((_, bw)) = compact_ast::nat_literal_bit_width(&raw) {
+                        vals.push(GenericArgVal::BigNat(raw));
+                        env.big_nat_bits.insert(gp.name.clone(), bw);
+                    } else {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            self.units.ast().node_span(arg),
+                            format!("invalid numeric size `{raw}`"),
+                        ));
+                        return None;
+                    }
+                } else {
+                    let n = self.expect_type_nat(arg_nodes, i, owner, span)?;
+                    vals.push(GenericArgVal::Nat(n));
+                    env.nats.insert(gp.name.clone(), n);
+                }
             } else {
                 let ty = self.resolve_type(arg_nodes[i])?;
                 vals.push(GenericArgVal::Type(ty.clone()));
@@ -1449,6 +1941,7 @@ impl<'a> Analyzer<'a> {
         let mut inst_scope = tmpl.scope.clone();
         inst_scope.generics.types.extend(bound.types);
         inst_scope.generics.nats.extend(bound.nats);
+        inst_scope.generics.big_nat_bits.extend(bound.big_nat_bits);
         let prev_unit = self.units.switch(tmpl.unit);
         let prev_scope = std::mem::replace(&mut self.scope, inst_scope);
 
@@ -1504,6 +1997,7 @@ impl<'a> Analyzer<'a> {
         let mut inst_scope = tmpl.scope.clone();
         inst_scope.generics.types.extend(bound.types);
         inst_scope.generics.nats.extend(bound.nats);
+        inst_scope.generics.big_nat_bits.extend(bound.big_nat_bits);
         let prev_unit = self.units.switch(tmpl.unit);
         let prev_scope = std::mem::replace(&mut self.scope, inst_scope);
 
@@ -1533,6 +2027,7 @@ impl<'a> Analyzer<'a> {
         let mut inst_scope = tmpl.scope.clone();
         inst_scope.generics.types.extend(bound.types);
         inst_scope.generics.nats.extend(bound.nats);
+        inst_scope.generics.big_nat_bits.extend(bound.big_nat_bits);
 
         let prev_unit = self.units.switch(tmpl.unit);
         let prev_scope = std::mem::replace(&mut self.scope, inst_scope.clone());
@@ -1545,10 +2040,15 @@ impl<'a> Analyzer<'a> {
 
         let ret_type = ret_type?;
         let cid = CircuitId(self.circuit_sigs.len() as u32);
-        let mangled = if vals.is_empty() {
+        let base_mangled = if vals.is_empty() {
             tmpl.name.clone()
         } else {
             format!("{}_{}", tmpl.name, self.format_generic_suffix(&vals))
+        };
+        let mangled = if self.circuit_sigs.iter().any(|s| s.name == base_mangled) {
+            format!("{base_mangled}$ov{}", cid.0)
+        } else {
+            base_mangled
         };
         self.circuit_sigs.push(CircuitSig {
             id: cid,
@@ -1571,6 +2071,7 @@ impl<'a> Analyzer<'a> {
         vals.iter()
             .map(|v| match v {
                 GenericArgVal::Nat(n) => n.to_string(),
+                GenericArgVal::BigNat(s) => format!("bn{}", s.len()),
                 GenericArgVal::Type(ty) => self
                     .format_type(ty)
                     .chars()
@@ -1700,6 +2201,29 @@ impl<'a> Analyzer<'a> {
         self.structs[sid.0 as usize].fields = fields;
     }
 
+    fn is_adt_type_node(&self, node: NodeIndex) -> bool {
+        match self.units.ast().node_tag(node) {
+            NodeTag::TypeNamed => {
+                let name = self.text(self.units.ast().node_main_token(node));
+                if matches!(name, "Counter" | "Kernel") {
+                    return true;
+                }
+                if let Some(&nid) = self.scope.new_types.get(name) {
+                    return self.new_type_adts.contains_key(&nid);
+                }
+                false
+            }
+            NodeTag::TypeGeneric => {
+                let name = self.text(self.units.ast().node_main_token(node));
+                matches!(
+                    name,
+                    "Set" | "List" | "Map" | "MerkleTree" | "HistoricMerkleTree"
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn resolve_ledger_adt(&mut self, node: NodeIndex) -> Option<LedgerAdt> {
         match self.units.ast().node_tag(node) {
             NodeTag::TypeNamed => {
@@ -1709,6 +2233,11 @@ impl<'a> Analyzer<'a> {
                 }
                 if name == "Kernel" {
                     return Some(LedgerAdt::Kernel);
+                }
+                if let Some(&nid) = self.scope.new_types.get(&name)
+                    && let Some(adt) = self.new_type_adts.get(&nid).cloned()
+                {
+                    return Some(adt);
                 }
                 if let Some(&aid) = self.scope.type_aliases.get(&name) {
                     return self.expand_type_alias_as_adt(
@@ -1842,6 +2371,7 @@ impl<'a> Analyzer<'a> {
             let mut inst_scope = tmpl.scope.clone();
             inst_scope.generics.types.extend(bound.types);
             inst_scope.generics.nats.extend(bound.nats);
+            inst_scope.generics.big_nat_bits.extend(bound.big_nat_bits);
             let prev_unit = self.units.switch(tmpl.unit);
             let prev_scope = std::mem::replace(&mut self.scope, inst_scope);
             let adt = self.resolve_ledger_adt(tmpl.target_node);
@@ -1942,25 +2472,46 @@ impl<'a> Analyzer<'a> {
         let local_name = self.text(decl.name_token).to_owned();
         let name_span = self.units.ast().token_span(decl.name_token);
 
-        if self.scope.circuits.contains_key(&local_name) {
-            self.diagnostics.push(CompactDiagnostic::error(
-                self.units.file(),
-                name_span,
-                format!("duplicate circuit `{local_name}`"),
-            ));
-            return None;
-        }
-
         let params = self.resolve_params(decl.params_start, decl.params_end);
         let ret_type = self.resolve_type(decl.ret_type)?;
+        let param_tys: Vec<Type> = params.iter().map(|p| p.ty.clone()).collect();
+
+        let existing_count = if let Some(existing) = self.scope.circuits.get(&local_name) {
+            for &prev_cid in existing {
+                let prev = &self.circuit_sigs[prev_cid.0 as usize];
+                let prev_tys: Vec<Type> = prev.params.iter().map(|p| p.ty.clone()).collect();
+                if prev_tys == param_tys || (!is_module_instance && decl.exported && prev.exported)
+                {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        name_span,
+                        format!("duplicate circuit `{local_name}` with identical parameter types"),
+                    ));
+                    return None;
+                }
+            }
+            existing.len()
+        } else {
+            0
+        };
 
         let id = CircuitId(self.circuit_sigs.len() as u32);
-        self.scope.circuits.insert(local_name.clone(), id);
+        self.scope
+            .circuits
+            .entry(local_name.clone())
+            .or_default()
+            .push(id);
+        let base_name = mangle_name(mangle_prefix, &local_name);
+        let hir_name = if existing_count > 0 && (is_module_instance || !decl.exported) {
+            format!("{base_name}$ov{}", id.0)
+        } else {
+            base_name
+        };
         self.circuit_sigs.push(CircuitSig {
             id,
             unit,
             scope: ScopeEnv::default(),
-            name: mangle_name(mangle_prefix, &local_name),
+            name: hir_name,
             name_span,
             params,
             ret_type,
@@ -2006,10 +2557,16 @@ impl<'a> Analyzer<'a> {
         match self.units.ast().node_tag(node) {
             NodeTag::TypeNamed => {
                 let tok = self.units.ast().node_main_token(node);
-                let name = self.text(tok).to_owned();
-                if let Some(ty) = self.scope.generics.types.get(&name).cloned() {
+                let raw_name = self.text(tok).to_owned();
+                if let Some(ty) = self.scope.generics.types.get(&raw_name).cloned() {
                     return Some(ty);
                 }
+                let name = self
+                    .scope
+                    .stdlib_aliases
+                    .get(&raw_name)
+                    .cloned()
+                    .unwrap_or(raw_name);
                 match name.as_str() {
                     "Field" => Some(Type::Field),
                     "Boolean" => Some(Type::Boolean),
@@ -2059,7 +2616,13 @@ impl<'a> Analyzer<'a> {
             }
             NodeTag::TypeGeneric => {
                 let tok = self.units.ast().node_main_token(node);
-                let name = self.text(tok).to_owned();
+                let raw_name = self.text(tok).to_owned();
+                let name = self
+                    .scope
+                    .stdlib_aliases
+                    .get(&raw_name)
+                    .cloned()
+                    .unwrap_or(raw_name);
                 let span = self.units.ast().node_span(node);
                 let data = self.units.ast().node_data(node);
                 let arg_nodes: Vec<_> = self.units.ast().extra_nodes(data.lhs, data.rhs).collect();
@@ -2069,8 +2632,93 @@ impl<'a> Analyzer<'a> {
                         Some(Type::Bytes(len))
                     }
                     "Uint" => {
-                        let bits = self.expect_type_nat(&arg_nodes, 0, "Uint", span)?;
-                        Some(Type::Uint(bits))
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                span,
+                                format!(
+                                    "`Uint` expects 1 size or range argument, found {}",
+                                    arg_nodes.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        let arg0 = arg_nodes[0];
+                        if self.units.ast().node_tag(arg0) == NodeTag::TypeRange {
+                            let rdata = self.units.ast().node_data(arg0);
+                            let lo_node = NodeIndex(rdata.lhs);
+                            let hi_node = NodeIndex(rdata.rhs);
+                            let lo_val = self.expect_type_nat(&[lo_node], 0, "Uint", span)?;
+                            if lo_val != 0 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    self.units.ast().node_span(lo_node),
+                                    format!("`Uint` range lower bound must be 0, found {lo_val}"),
+                                ));
+                                return None;
+                            }
+                            let bits = if self.units.ast().node_tag(hi_node) == NodeTag::TypeNamed {
+                                let hname = self.text(self.units.ast().node_main_token(hi_node));
+                                if let Some(&n) = self.scope.generics.nats.get(hname) {
+                                    32 - n.leading_zeros()
+                                } else if let Some(&bw) =
+                                    self.scope.generics.big_nat_bits.get(hname)
+                                {
+                                    bw
+                                } else {
+                                    self.diagnostics.push(CompactDiagnostic::error(
+                                        self.units.file(),
+                                        self.units.ast().node_span(hi_node),
+                                        "`Uint` range upper bound must be a numeric literal or generic size",
+                                    ));
+                                    return None;
+                                }
+                            } else if self.units.ast().node_tag(hi_node) == NodeTag::TypeNat {
+                                let raw = self
+                                    .text(self.units.ast().node_main_token(hi_node))
+                                    .to_owned();
+                                match compact_ast::nat_literal_bit_width(&raw) {
+                                    Some((_is_zero, bw)) => bw,
+                                    None => {
+                                        self.diagnostics.push(CompactDiagnostic::error(
+                                            self.units.file(),
+                                            self.units.ast().node_span(hi_node),
+                                            format!("invalid numeric bound `{raw}`"),
+                                        ));
+                                        return None;
+                                    }
+                                }
+                            } else {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    self.units.ast().node_span(hi_node),
+                                    "`Uint` range upper bound must be a numeric literal",
+                                ));
+                                return None;
+                            };
+                            if bits > 248 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!(
+                                        "`Uint` range exceeds maximum 248-bit width ({bits} bits)"
+                                    ),
+                                ));
+                                return None;
+                            }
+                            Some(Type::Uint(bits))
+                        } else {
+                            let bits = self.expect_type_nat(&arg_nodes, 0, "Uint", span)?;
+                            if bits > 248 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    span,
+                                    format!("`Uint<{bits}>` exceeds maximum bit width 248"),
+                                ));
+                                return None;
+                            }
+                            Some(Type::Uint(bits))
+                        }
                     }
                     "Opaque" => {
                         if arg_nodes.len() != 1
@@ -2101,10 +2749,28 @@ impl<'a> Analyzer<'a> {
                             return None;
                         }
                         let len = self.expect_type_nat(&arg_nodes, 0, "Vector", span)?;
+                        if len > 16_777_216 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                span,
+                                format!(
+                                    "`Vector` length {len} exceeds maximum allowed length 16777216"
+                                ),
+                            ));
+                            return None;
+                        }
                         let elem = self.resolve_type(arg_nodes[1])?;
                         Some(Type::Vector(len, Box::new(elem)))
                     }
                     "Maybe" => {
+                        if !self.scope.has_stdlib {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                self.units.ast().token_span(tok),
+                                "unknown type `Maybe` (missing `import CompactStandardLibrary;`)",
+                            ));
+                            return None;
+                        }
                         if arg_nodes.len() != 1 {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
@@ -2120,6 +2786,14 @@ impl<'a> Analyzer<'a> {
                         Some(Type::Maybe(Box::new(inner)))
                     }
                     "Either" => {
+                        if !self.scope.has_stdlib {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                self.units.ast().token_span(tok),
+                                "unknown type `Either` (missing `import CompactStandardLibrary;`)",
+                            ));
+                            return None;
+                        }
                         if arg_nodes.len() != 2 {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
@@ -2136,6 +2810,14 @@ impl<'a> Analyzer<'a> {
                         Some(Type::Either(Box::new(left), Box::new(right)))
                     }
                     "MerkleTreePath" => {
+                        if !self.scope.has_stdlib {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                self.units.ast().token_span(tok),
+                                "unknown type `MerkleTreePath` (missing `import CompactStandardLibrary;`)",
+                            ));
+                            return None;
+                        }
                         if arg_nodes.len() != 2 {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
@@ -2204,6 +2886,7 @@ impl<'a> Analyzer<'a> {
             let mut inst_scope = tmpl.scope.clone();
             inst_scope.generics.types.extend(bound.types);
             inst_scope.generics.nats.extend(bound.nats);
+            inst_scope.generics.big_nat_bits.extend(bound.big_nat_bits);
             let prev_unit = self.units.switch(tmpl.unit);
             let prev_scope = std::mem::replace(&mut self.scope, inst_scope);
             let ty = self.resolve_type(tmpl.target_node);
@@ -2247,9 +2930,9 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         let raw = self.text(self.units.ast().node_main_token(arg)).to_owned();
-        match raw.parse::<u32>() {
-            Ok(n) => Some(n),
-            Err(_) => {
+        match compact_ast::parse_nat_u32(&raw) {
+            Some(n) => Some(n),
+            None => {
                 self.diagnostics.push(CompactDiagnostic::error(
                     self.units.file(),
                     self.units.ast().node_span(arg),
@@ -2480,17 +3163,8 @@ impl<'a> Analyzer<'a> {
             scope.insert(p.name.clone(), ValueBinding::Param(p.id, p.ty.clone()));
         }
         self.next_local = 0;
-        let block_data = self.units.ast().node_data(decl.body);
-        let stmt_nodes: Vec<_> = self
-            .units
-            .ast()
-            .extra_nodes(block_data.lhs, block_data.rhs)
-            .collect();
         let ret_unit = Type::unit();
-        let mut body = Vec::new();
-        for snode in stmt_nodes {
-            self.check_stmt(snode, &mut scope, &ret_unit, &mut body);
-        }
+        let body = self.check_stmt_list(decl.body, &scope, &ret_unit);
         self.constructor = Some(Constructor {
             params,
             body,
@@ -2518,17 +3192,7 @@ impl<'a> Analyzer<'a> {
         }
         self.next_local = 0;
 
-        let block_data = self.units.ast().node_data(body_node);
-        let stmt_nodes: Vec<_> = self
-            .units
-            .ast()
-            .extra_nodes(block_data.lhs, block_data.rhs)
-            .collect();
-
-        let mut body = Vec::new();
-        for snode in stmt_nodes {
-            self.check_stmt(snode, &mut scope, &ret_type, &mut body);
-        }
+        let body = self.check_stmt_list(body_node, &scope, &ret_type);
 
         self.scope = prev_scope;
         self.units.switch(prev_unit);
@@ -2546,6 +3210,25 @@ impl<'a> Analyzer<'a> {
         });
     }
 
+    fn ast_stmt_always_returns(&self, node: NodeIndex) -> bool {
+        match self.units.ast().node_tag(node) {
+            NodeTag::ReturnStmt => true,
+            NodeTag::Block => {
+                let d = self.units.ast().node_data(node);
+                let stmts: Vec<_> = self.units.ast().extra_nodes(d.lhs, d.rhs).collect();
+                stmts.into_iter().any(|s| self.ast_stmt_always_returns(s))
+            }
+            NodeTag::IfStmt => {
+                let stmt = self.units.ast().if_stmt(node);
+                let Some(eb) = stmt.else_branch else {
+                    return false;
+                };
+                self.ast_stmt_always_returns(stmt.then_branch) && self.ast_stmt_always_returns(eb)
+            }
+            _ => false,
+        }
+    }
+
     fn check_stmt_list(
         &mut self,
         node: NodeIndex,
@@ -2554,6 +3237,7 @@ impl<'a> Analyzer<'a> {
     ) -> Vec<Stmt> {
         let mut inner_scope = scope.clone();
         let mut stmts = Vec::new();
+        self.block_consts.push(HashSet::new());
         if self.units.ast().node_tag(node) == NodeTag::Block {
             let block_data = self.units.ast().node_data(node);
             let stmt_nodes: Vec<_> = self
@@ -2561,12 +3245,24 @@ impl<'a> Analyzer<'a> {
                 .ast()
                 .extra_nodes(block_data.lhs, block_data.rhs)
                 .collect();
+            let mut terminated = false;
             for snode in stmt_nodes {
+                if terminated {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        self.units.ast().node_span(snode),
+                        "unreachable statement after return",
+                    ));
+                }
                 self.check_stmt(snode, &mut inner_scope, expected_ret, &mut stmts);
+                if self.ast_stmt_always_returns(snode) {
+                    terminated = true;
+                }
             }
         } else {
             self.check_stmt(node, &mut inner_scope, expected_ret, &mut stmts);
         }
+        self.block_consts.pop();
         stmts
     }
 
@@ -2582,8 +3278,20 @@ impl<'a> Analyzer<'a> {
         match self.units.ast().node_tag(pat) {
             NodeTag::PatIdent => {
                 let name = self.text(self.units.ast().node_main_token(pat)).to_owned();
+                if let Some(current) = self.block_consts.last_mut()
+                    && !current.insert(name.clone())
+                {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        pat_span,
+                        format!("duplicate `const` binding `{name}` in the same block"),
+                    ));
+                }
                 let local = self.alloc_local();
                 let ty = val.ty.clone();
+                if let Some(v) = self.eval_const_u128_in_scope(&val) {
+                    self.const_int_locals.insert(local, v);
+                }
                 scope.insert(name.clone(), ValueBinding::Local(local, ty.clone()));
                 out.push(Stmt::Const {
                     local,
@@ -2599,7 +3307,7 @@ impl<'a> Analyzer<'a> {
                 let val_u = self.underlying_type(&val.ty).clone();
                 let elem_tys: Vec<Type> = match val_u {
                     Type::Tuple(tys) => {
-                        if tys.len() != elems.len() {
+                        if elems.len() > tys.len() {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 pat_span,
@@ -2611,10 +3319,10 @@ impl<'a> Analyzer<'a> {
                             ));
                             return;
                         }
-                        tys
+                        tys.into_iter().take(elems.len()).collect()
                     }
                     Type::Vector(len, ety) => {
-                        if len as usize != elems.len() {
+                        if elems.len() > len as usize {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 pat_span,
@@ -2799,7 +3507,7 @@ impl<'a> Analyzer<'a> {
                 let Some(end_expr) = self.check_expr(stmt.end, scope, Some(&Type::Uint(64))) else {
                     return;
                 };
-                let Some(start) = eval_const_u128(&start_expr) else {
+                let Some(start) = self.eval_const_u128_in_scope(&start_expr) else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         start_expr.span,
@@ -2807,7 +3515,7 @@ impl<'a> Analyzer<'a> {
                     ));
                     return;
                 };
-                let Some(end) = eval_const_u128(&end_expr) else {
+                let Some(end) = self.eval_const_u128_in_scope(&end_expr) else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         end_expr.span,
@@ -2824,6 +3532,7 @@ impl<'a> Analyzer<'a> {
                     return;
                 }
                 let local = self.alloc_local();
+                self.loop_index_locals.insert(local);
                 let mut loop_scope = scope.clone();
                 loop_scope.insert(var_name.clone(), ValueBinding::Local(local, Type::Uint(64)));
                 let body = self.check_stmt_list(stmt.body, &loop_scope, expected_ret);
@@ -2842,10 +3551,15 @@ impl<'a> Analyzer<'a> {
                 let Some(iter) = self.check_expr(stmt.iter, scope, None) else {
                     return;
                 };
-                let (len, elem_ty) = match &iter.ty {
-                    Type::Vector(len, elem) => (*len, (**elem).clone()),
+                let iter_u = self.underlying_type(&iter.ty).clone();
+                let (len, elem_ty) = match iter_u {
+                    Type::Vector(len, elem) => (len, (*elem).clone()),
+                    Type::Bytes(len) => (len, Type::Uint(8)),
+                    Type::Tuple(elems) if elems.is_empty() => (0, Type::unit()),
                     Type::Tuple(elems)
-                        if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) =>
+                        if elems
+                            .iter()
+                            .all(|t| self.can_implicitly_widen(t, &elems[0])) =>
                     {
                         (elems.len() as u32, elems[0].clone())
                     }
@@ -2855,13 +3569,16 @@ impl<'a> Analyzer<'a> {
                             iter.span,
                             format!(
                                 "`for` loop iterable must be a `Vector`, found `{}`",
-                                self.format_type(other)
+                                self.format_type(&other)
                             ),
                         ));
                         return;
                     }
                 };
                 let local = self.alloc_local();
+                if matches!(self.underlying_type(&elem_ty), Type::Uint(_)) {
+                    self.loop_index_locals.insert(local);
+                }
                 let mut loop_scope = scope.clone();
                 loop_scope.insert(
                     var_name.clone(),
@@ -3075,6 +3792,58 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn structs_structurally_equal(&self, a: StructId, b: StructId) -> bool {
+        if a == b {
+            return true;
+        }
+        let sa = &self.structs[a.0 as usize];
+        let sb = &self.structs[b.0 as usize];
+        sa.fields.len() == sb.fields.len()
+            && sa
+                .fields
+                .iter()
+                .zip(&sb.fields)
+                .all(|(fa, fb)| fa.name == fb.name && self.can_implicitly_widen(&fa.ty, &fb.ty))
+    }
+
+    fn enums_structurally_equal(&self, a: EnumId, b: EnumId) -> bool {
+        if a == b {
+            return true;
+        }
+        self.enums[a.0 as usize].variants == self.enums[b.0 as usize].variants
+    }
+
+    fn can_implicitly_widen(&self, src: &Type, dst: &Type) -> bool {
+        if src == dst {
+            return true;
+        }
+        match (src, dst) {
+            (Type::Uint(a), Type::Uint(b)) => a <= b,
+            (Type::Struct(a), Type::Struct(b)) => self.structs_structurally_equal(*a, *b),
+            (Type::Enum(a), Type::Enum(b)) => self.enums_structurally_equal(*a, *b),
+            (Type::Vector(n1, e1), Type::Vector(n2, e2)) => {
+                n1 == n2 && self.can_implicitly_widen(e1, e2)
+            }
+            (Type::Vector(n, e), Type::Tuple(dst_elems)) => {
+                *n as usize == dst_elems.len()
+                    && dst_elems.iter().all(|d| self.can_implicitly_widen(e, d))
+            }
+            (Type::Tuple(src_elems), Type::Vector(n, dst_e)) => {
+                src_elems.len() == *n as usize
+                    && src_elems
+                        .iter()
+                        .all(|s| self.can_implicitly_widen(s, dst_e))
+            }
+            (Type::Tuple(s), Type::Tuple(d)) => {
+                s.len() == d.len()
+                    && s.iter()
+                        .zip(d.iter())
+                        .all(|(a, b)| self.can_implicitly_widen(a, b))
+            }
+            _ => false,
+        }
+    }
+
     fn coerce_or_check(&self, expr: &mut Expr, expected: &Type) -> bool {
         if expr.ty == *expected {
             return true;
@@ -3099,12 +3868,48 @@ impl<'a> Analyzer<'a> {
                 _ => {}
             }
         }
+        if let Type::Tuple(dst_elems) = expected {
+            if let ExprKind::Tuple(elems) = &mut expr.kind
+                && elems.len() == dst_elems.len()
+                && elems
+                    .iter_mut()
+                    .zip(dst_elems.iter())
+                    .all(|(e, dt)| self.coerce_or_check(e, dt))
+            {
+                expr.ty = expected.clone();
+                return true;
+            }
+            if let ExprKind::Vector(elems) = &mut expr.kind
+                && elems.len() == dst_elems.len()
+                && elems
+                    .iter_mut()
+                    .zip(dst_elems.iter())
+                    .all(|(e, dt)| self.coerce_or_check(e, dt))
+            {
+                let moved = std::mem::take(elems);
+                expr.kind = ExprKind::Tuple(moved);
+                expr.ty = expected.clone();
+                return true;
+            }
+            if let ExprKind::Block { tail, .. } = &mut expr.kind
+                && self.coerce_or_check(tail, expected)
+            {
+                expr.ty = expected.clone();
+                return true;
+            }
+        }
         if let Type::Vector(expected_len, elem_ty) = expected {
             match &mut expr.kind {
                 ExprKind::Tuple(elems) if elems.len() == *expected_len as usize => {
                     if elems.iter_mut().all(|e| self.coerce_or_check(e, elem_ty)) {
                         let moved = std::mem::take(elems);
                         expr.kind = ExprKind::Vector(moved);
+                        expr.ty = expected.clone();
+                        return true;
+                    }
+                }
+                ExprKind::Vector(elems) if elems.len() == *expected_len as usize => {
+                    if elems.iter_mut().all(|e| self.coerce_or_check(e, elem_ty)) {
                         expr.ty = expected.clone();
                         return true;
                     }
@@ -3118,7 +3923,7 @@ impl<'a> Analyzer<'a> {
                 _ => {}
             }
         }
-        false
+        !matches!(&expr.kind, ExprKind::IntLit(_)) && self.can_implicitly_widen(&expr.ty, expected)
     }
 
     fn check_expr(
@@ -3132,9 +3937,9 @@ impl<'a> Analyzer<'a> {
             NodeTag::IntLitExpr => {
                 let tok = self.units.ast().node_main_token(node);
                 let raw = self.text(tok);
-                let val: u128 = match raw.parse() {
-                    Ok(v) => v,
-                    Err(_) => {
+                let val: u128 = match compact_ast::parse_nat_u128(raw) {
+                    Some(v) => v,
+                    None => {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.units.file(),
                             span,
@@ -3157,7 +3962,7 @@ impl<'a> Analyzer<'a> {
             }
             NodeTag::StringLitExpr => {
                 let tok = self.units.ast().node_main_token(node);
-                let bytes = unquote_string(self.text(tok)).into_bytes();
+                let bytes = compact_ast::unescape_string_bytes(self.text(tok));
                 let len = bytes.len() as u32;
                 Some(Expr {
                     kind: ExprKind::BytesLit(bytes),
@@ -3229,6 +4034,19 @@ impl<'a> Analyzer<'a> {
                             span,
                         });
                     }
+                    if field.adt == LedgerAdt::Counter {
+                        return Some(Expr {
+                            kind: ExprKind::LedgerCall {
+                                field: field_id,
+                                key_path: Vec::new(),
+                                target_adt: LedgerAdt::Counter,
+                                op: LedgerOp::CounterRead,
+                                args: Vec::new(),
+                            },
+                            ty: Type::Uint(64),
+                            span,
+                        });
+                    }
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         span,
@@ -3249,11 +4067,20 @@ impl<'a> Analyzer<'a> {
             NodeTag::IndexExpr => {
                 let idx_expr = self.units.ast().index_expr(node);
                 let base = self.check_expr(idx_expr.base, scope, None)?;
-                let index = self.check_expr(idx_expr.index, scope, Some(&Type::Uint(64)))?;
+                let mut index = self.check_expr(idx_expr.index, scope, Some(&Type::Uint(64)))?;
                 let base_underlying = self.underlying_type(&base.ty).clone();
+                let const_idx = self.eval_const_u128_in_scope(&index);
+                let is_loop_idx = self.is_loop_index_expr(&index);
+                if let Some(k) = const_idx {
+                    index = Expr {
+                        kind: ExprKind::IntLit(k),
+                        ty: Type::Uint(64),
+                        span: index.span,
+                    };
+                }
                 match base_underlying {
                     Type::Vector(len, elem) => {
-                        if let Some(k) = eval_const_u128(&index) {
+                        if let Some(k) = const_idx {
                             if k >= len as u128 {
                                 self.diagnostics.push(CompactDiagnostic::error(
                                     self.units.file(),
@@ -3264,14 +4091,11 @@ impl<'a> Analyzer<'a> {
                                 ));
                                 return None;
                             }
-                        } else if !matches!(self.underlying_type(&index.ty), Type::Uint(_)) {
+                        } else if !is_loop_idx {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 index.span,
-                                format!(
-                                    "vector index must be a `Uint`, found `{}`",
-                                    self.format_type(&index.ty)
-                                ),
+                                "vector index must be a compile-time integer constant",
                             ));
                             return None;
                         }
@@ -3284,41 +4108,81 @@ impl<'a> Analyzer<'a> {
                             span,
                         })
                     }
-                    Type::Tuple(elems) => {
-                        let Some(k) = eval_const_u128(&index) else {
+                    Type::Bytes(len) => {
+                        if let Some(k) = const_idx {
+                            if k >= len as u128 {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    index.span,
+                                    format!("bytes index {k} out of bounds for `Bytes<{len}>`"),
+                                ));
+                                return None;
+                            }
+                        } else if !is_loop_idx {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 index.span,
-                                "tuple index must be a compile-time integer constant",
+                                "bytes index must be a compile-time integer constant",
                             ));
                             return None;
-                        };
-                        let Some(elem_ty) = elems.get(k as usize).cloned() else {
-                            self.diagnostics.push(CompactDiagnostic::error(
-                                self.units.file(),
-                                index.span,
-                                format!(
-                                    "tuple index {k} out of bounds for tuple of length {}",
-                                    elems.len()
-                                ),
-                            ));
-                            return None;
-                        };
+                        }
                         Some(Expr {
                             kind: ExprKind::Index {
                                 base: Box::new(base),
                                 index: Box::new(index),
                             },
-                            ty: elem_ty,
+                            ty: Type::Uint(8),
                             span,
                         })
+                    }
+                    Type::Tuple(elems) => {
+                        if let Some(k) = const_idx {
+                            let Some(elem_ty) = elems.get(k as usize).cloned() else {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    index.span,
+                                    format!(
+                                        "tuple index {k} out of bounds for tuple of length {}",
+                                        elems.len()
+                                    ),
+                                ));
+                                return None;
+                            };
+                            Some(Expr {
+                                kind: ExprKind::Index {
+                                    base: Box::new(base),
+                                    index: Box::new(index),
+                                },
+                                ty: elem_ty,
+                                span,
+                            })
+                        } else if is_loop_idx
+                            && !elems.is_empty()
+                            && elems.iter().all(|e| *e == elems[0])
+                        {
+                            Some(Expr {
+                                kind: ExprKind::Index {
+                                    base: Box::new(base),
+                                    index: Box::new(index),
+                                },
+                                ty: elems[0].clone(),
+                                span,
+                            })
+                        } else {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                index.span,
+                                "tuple index must be a compile-time integer constant",
+                            ));
+                            None
+                        }
                     }
                     other => {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.units.file(),
                             span,
                             format!(
-                                "cannot index into type `{}` (expected `Vector` or tuple)",
+                                "cannot index into type `{}` (expected `Vector`, `Bytes`, or tuple)",
                                 self.format_type(&other)
                             ),
                         ));
@@ -3407,6 +4271,7 @@ impl<'a> Analyzer<'a> {
                     .collect();
                 let mut prelude: Vec<Stmt> = Vec::new();
                 let mut provided: HashMap<String, Expr> = HashMap::new();
+                let mut pos_idx = 0usize;
                 for fnode in lit_nodes {
                     if self.units.ast().node_tag(fnode) == NodeTag::SpreadExpr {
                         let sdata = self.units.ast().node_data(fnode);
@@ -3451,31 +4316,66 @@ impl<'a> Analyzer<'a> {
                         }
                         continue;
                     }
-                    let sf = self.units.ast().struct_lit_field(fnode);
-                    let fname = self.text(sf.name_token).to_owned();
-                    let Some((_, expected_ty)) = expected_fields.iter().find(|(n, _)| *n == fname)
-                    else {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.units.file(),
-                            self.units.ast().token_span(sf.name_token),
-                            format!("struct `{}` has no field `{fname}`", self.format_type(&ty)),
-                        ));
-                        return None;
-                    };
-                    let mut val = self.check_expr(sf.value, scope, Some(expected_ty))?;
-                    if !self.coerce_or_check(&mut val, expected_ty) {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.units.file(),
-                            val.span,
-                            format!(
-                                "type mismatch for field `{fname}`: expected `{}`, found `{}`",
-                                self.format_type(expected_ty),
-                                self.format_type(&val.ty)
-                            ),
-                        ));
-                        return None;
+                    if self.units.ast().node_tag(fnode) == NodeTag::StructLitField {
+                        let sf = self.units.ast().struct_lit_field(fnode);
+                        let fname = self.text(sf.name_token).to_owned();
+                        let Some((_, expected_ty)) =
+                            expected_fields.iter().find(|(n, _)| *n == fname)
+                        else {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                self.units.ast().token_span(sf.name_token),
+                                format!(
+                                    "struct `{}` has no field `{fname}`",
+                                    self.format_type(&ty)
+                                ),
+                            ));
+                            return None;
+                        };
+                        let mut val = self.check_expr(sf.value, scope, Some(expected_ty))?;
+                        if !self.coerce_or_check(&mut val, expected_ty) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                val.span,
+                                format!(
+                                    "type mismatch for field `{fname}`: expected `{}`, found `{}`",
+                                    self.format_type(expected_ty),
+                                    self.format_type(&val.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        provided.insert(fname, val);
+                    } else {
+                        // Positional struct literal argument.
+                        let Some((fname, expected_ty)) = expected_fields.get(pos_idx) else {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                self.units.ast().node_span(fnode),
+                                format!(
+                                    "too many positional fields for struct `{}` (expected {})",
+                                    self.format_type(&ty),
+                                    expected_fields.len()
+                                ),
+                            ));
+                            return None;
+                        };
+                        pos_idx += 1;
+                        let mut val = self.check_expr(fnode, scope, Some(expected_ty))?;
+                        if !self.coerce_or_check(&mut val, expected_ty) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                val.span,
+                                format!(
+                                    "type mismatch for field `{fname}`: expected `{}`, found `{}`",
+                                    self.format_type(expected_ty),
+                                    self.format_type(&val.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        provided.insert(fname.clone(), val);
                     }
-                    provided.insert(fname, val);
                 }
                 let mut ordered = Vec::with_capacity(expected_fields.len());
                 for (fname, _) in expected_fields {
@@ -3654,6 +4554,7 @@ impl<'a> Analyzer<'a> {
                     let mut prelude: Vec<Stmt> = Vec::new();
                     let mut flat: Vec<Expr> = Vec::new();
                     let mut tys: Vec<Type> = Vec::new();
+                    let mut empty_spread_elem_ty: Option<Type> = None;
                     for enode in elem_nodes {
                         if self.units.ast().node_tag(enode) == NodeTag::SpreadExpr {
                             let sdata = self.units.ast().node_data(enode);
@@ -3662,14 +4563,25 @@ impl<'a> Analyzer<'a> {
                             let inner_ty = inner.ty.clone();
                             let inner_u = self.underlying_type(&inner_ty).clone();
                             let spread_tys: Vec<Type> = match inner_u {
-                                Type::Vector(k, ety) => vec![(*ety).clone(); k as usize],
+                                Type::Vector(k, ety) => {
+                                    if k == 0 && empty_spread_elem_ty.is_none() {
+                                        empty_spread_elem_ty = Some((*ety).clone());
+                                    }
+                                    vec![(*ety).clone(); k as usize]
+                                }
+                                Type::Bytes(k) => {
+                                    if k == 0 && empty_spread_elem_ty.is_none() {
+                                        empty_spread_elem_ty = Some(Type::Uint(8));
+                                    }
+                                    vec![Type::Uint(8); k as usize]
+                                }
                                 Type::Tuple(etys) => etys,
                                 other => {
                                     self.diagnostics.push(CompactDiagnostic::error(
                                         self.units.file(),
                                         inner_span,
                                         format!(
-                                            "cannot spread type `{}` inside `[...]`; expected `Vector` or tuple",
+                                            "cannot spread type `{}` inside `[...]`; expected `Vector`, `Bytes`, or tuple",
                                             self.format_type(&other)
                                         ),
                                     ));
@@ -3749,12 +4661,23 @@ impl<'a> Analyzer<'a> {
                             span,
                         });
                     }
-                    let ty = Type::Tuple(tys);
+                    let ty = if tys.is_empty()
+                        && let Some(elem_ty) = empty_spread_elem_ty
+                    {
+                        Type::Vector(0, Box::new(elem_ty))
+                    } else {
+                        Type::Tuple(tys)
+                    };
+                    let tail_kind = if matches!(ty, Type::Vector(..)) {
+                        ExprKind::Vector(flat)
+                    } else {
+                        ExprKind::Tuple(flat)
+                    };
                     return Some(Expr {
                         kind: ExprKind::Block {
                             stmts: prelude,
                             tail: Box::new(Expr {
-                                kind: ExprKind::Tuple(flat),
+                                kind: tail_kind,
                                 ty: ty.clone(),
                                 span,
                             }),
@@ -3920,10 +4843,20 @@ impl<'a> Analyzer<'a> {
                 if !self.coerce_or_check(&mut rhs, &lhs.ty)
                     && !self.coerce_or_check(&mut lhs, &rhs.ty)
                 {
-                    if let (Type::Uint(a), Type::Uint(b)) = (&lhs.ty, &rhs.ty) {
+                    if let (Type::Uint(a), Type::Uint(b)) =
+                        (self.underlying_type(&lhs.ty), self.underlying_type(&rhs.ty))
+                    {
                         let widened = Type::Uint((*a).max(*b));
                         lhs.ty = widened.clone();
                         rhs.ty = widened;
+                    } else if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                        && matches!(
+                            (self.underlying_type(&lhs.ty), self.underlying_type(&rhs.ty)),
+                            (Type::Field, Type::Uint(_)) | (Type::Uint(_), Type::Field)
+                        )
+                    {
+                        lhs.ty = Type::Field;
+                        rhs.ty = Type::Field;
                     } else {
                         self.diagnostics.push(CompactDiagnostic::error(
                             self.units.file(),
@@ -3957,7 +4890,7 @@ impl<'a> Analyzer<'a> {
                 if matches!(
                     op,
                     BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-                ) && !matches!(lhs.ty, Type::Uint(_))
+                ) && !matches!(self.underlying_type(&lhs.ty), Type::Uint(_))
                 {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
@@ -3994,7 +4927,7 @@ impl<'a> Analyzer<'a> {
             NodeTag::TernaryExpr => {
                 let t = self.units.ast().ternary_expr(node);
                 let cond = self.check_expr(t.cond, scope, Some(&Type::Boolean))?;
-                if cond.ty != Type::Boolean {
+                if *self.underlying_type(&cond.ty) != Type::Boolean {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         cond.span,
@@ -4034,19 +4967,37 @@ impl<'a> Analyzer<'a> {
             NodeTag::CastExpr => {
                 let data = self.units.ast().node_data(node);
                 let target = self.resolve_type(NodeIndex(data.rhs))?;
-                let inner = self.check_expr(NodeIndex(data.lhs), scope, None)?;
+                let mut inner = self.check_expr(NodeIndex(data.lhs), scope, None)?;
+                let dst_u = self.underlying_type(&target).clone();
+                // Allow tuple literals like `[1, 2, 3, 4] as Bytes<4>` or `[1, 2] as Vector<2, Uint<32>>`
+                // by coercing the tuple to the appropriate vector type before casting.
+                if let Type::Bytes(n) = &dst_u
+                    && let Type::Tuple(ref elems) = *self.underlying_type(&inner.ty)
+                    && elems.len() == *n as usize
+                {
+                    let vec_u8 = Type::Vector(*n, Box::new(Type::Uint(8)));
+                    let _ = self.coerce_or_check(&mut inner, &vec_u8);
+                } else if let Type::Vector(n, ref elem_ty) = dst_u
+                    && let Type::Tuple(ref elems) = *self.underlying_type(&inner.ty)
+                    && elems.len() == n as usize
+                {
+                    let vec_t = Type::Vector(n, elem_ty.clone());
+                    let _ = self.coerce_or_check(&mut inner, &vec_t);
+                }
                 let src_u = self.underlying_type(&inner.ty);
-                let dst_u = self.underlying_type(&target);
                 let valid = inner.ty == target
-                    || src_u == dst_u
+                    || *src_u == dst_u
                     || matches!(
-                        (src_u, dst_u),
-                        (Type::Uint(_), Type::Field)
-                            | (Type::Uint(_), Type::Uint(_))
-                            | (Type::Field, Type::Uint(_))
-                            | (Type::Boolean, Type::Field)
-                            | (Type::Enum(_), Type::Field)
-                            | (Type::Field, Type::Field)
+                        (src_u, &dst_u),
+                        (
+                            Type::Uint(_),
+                            Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_)
+                        ) | (
+                            Type::Field,
+                            Type::Uint(_) | Type::Field | Type::Boolean | Type::Enum(_)
+                        ) | (Type::Boolean, Type::Field | Type::Uint(_) | Type::Boolean)
+                            | (Type::Enum(_), Type::Field | Type::Uint(_))
+                            | (Type::Contract(_), Type::Contract(_))
                             | (
                                 Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_),
                                 Type::CurveField(CurveFieldKind::JubjubScalar)
@@ -4063,22 +5014,71 @@ impl<'a> Analyzer<'a> {
                             )
                     )
                     || matches!(
-                        (src_u, dst_u),
-                        (Type::Bytes(n), Type::Field) if *n <= 31
+                        (src_u, &dst_u),
+                        (Type::Bytes(n), Type::Field | Type::Uint(_)) if *n <= 31
                     )
                     || matches!(
-                        (src_u, dst_u),
+                        (src_u, &dst_u),
                         (Type::Field, Type::Bytes(n)) if *n <= 32
                     )
+                    || matches!((src_u, &dst_u), (Type::Uint(_), Type::Bytes(_)))
                     || matches!(
-                        (src_u, dst_u),
+                        (src_u, &dst_u),
                         (Type::Bytes(n), Type::Vector(m, elem))
-                            if n == m && *self.underlying_type(elem) == Type::Uint(8)
+                            if n == m && matches!(self.underlying_type(elem), Type::Uint(bits) if *bits >= 8)
                     )
                     || matches!(
-                        (src_u, dst_u),
+                        (src_u, &dst_u),
+                        (Type::Bytes(n), Type::Tuple(elems))
+                            if *n as usize == elems.len()
+                                && elems.iter().all(|e| matches!(self.underlying_type(e), Type::Field | Type::Uint(8..=248)))
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
                         (Type::Vector(n, elem), Type::Bytes(m))
-                            if n == m && *self.underlying_type(elem) == Type::Uint(8)
+                            if n == m && matches!(self.underlying_type(elem), Type::Uint(bits) if *bits <= 8)
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Tuple(elems), Type::Bytes(m))
+                            if elems.len() == *m as usize
+                                && elems.iter().all(|e| matches!(self.underlying_type(e), Type::Uint(bits) if *bits <= 8))
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Vector(n, s_elem), Type::Vector(m, d_elem))
+                            if n == m && self.can_implicitly_widen(s_elem, d_elem)
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Vector(n, s_elem), Type::Tuple(d_elems))
+                            if *n as usize == d_elems.len()
+                                && d_elems.iter().all(|d| self.can_implicitly_widen(s_elem, d))
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Tuple(s_elems), Type::Vector(n, d_elem))
+                            if s_elems.len() == *n as usize
+                                && s_elems.iter().all(|s| self.can_implicitly_widen(s, d_elem))
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Struct(a), Type::Struct(b))
+                            if self.structs_structurally_equal(*a, *b)
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Enum(a), Type::Enum(b))
+                            if self.enums_structurally_equal(*a, *b)
+                    )
+                    || matches!(
+                        (src_u, &dst_u),
+                        (Type::Tuple(s_elems), Type::Tuple(d_elems))
+                            if s_elems.len() == d_elems.len()
+                                && s_elems
+                                    .iter()
+                                    .zip(d_elems.iter())
+                                    .all(|(s, d)| self.can_implicitly_widen(s, d))
                     );
                 if !valid {
                     self.diagnostics.push(CompactDiagnostic::error(
@@ -4159,9 +5159,15 @@ impl<'a> Analyzer<'a> {
                 if self.units.ast().node_tag(call.callee) == NodeTag::IdentExpr {
                     let callee_tok = self.units.ast().node_main_token(call.callee);
                     let callee_name = self.text(callee_tok).to_owned();
-                    if let Some(&gid) = self.scope.generic_circuits.get(&callee_name) {
-                        let cid = self.instantiate_generic_circuit(gid, &targ_nodes, span)?;
-                        return self.check_circuit_call(cid, &arg_nodes, span, scope);
+                    if let Some(gids) = self.scope.generic_circuits.get(&callee_name).cloned() {
+                        return self.resolve_generic_circuit_overload(
+                            &callee_name,
+                            &gids,
+                            &targ_nodes,
+                            &arg_nodes,
+                            span,
+                            scope,
+                        );
                     }
                     return self.check_generic_builtin(
                         &callee_name,
@@ -4661,14 +5667,29 @@ impl<'a> Analyzer<'a> {
                         }
                         _ => {}
                     }
-                    if let Some(&cid) = self.scope.circuits.get(&callee_name) {
-                        return self.check_circuit_call(cid, &arg_nodes, span, scope);
+                    let mut candidates: Vec<CircuitId> = self
+                        .scope
+                        .circuits
+                        .get(&callee_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(gids) = self.scope.generic_circuits.get(&callee_name).cloned() {
+                        for gid in gids {
+                            if self.generic_circuits[gid].gparams.is_empty()
+                                && let Some(cid) = self.instantiate_generic_circuit(gid, &[], span)
+                            {
+                                candidates.push(cid);
+                            }
+                        }
                     }
-                    if let Some(&gid) = self.scope.generic_circuits.get(&callee_name)
-                        && self.generic_circuits[gid].gparams.is_empty()
-                    {
-                        let cid = self.instantiate_generic_circuit(gid, &[], span)?;
-                        return self.check_circuit_call(cid, &arg_nodes, span, scope);
+                    if !candidates.is_empty() {
+                        return self.resolve_circuit_overload(
+                            &callee_name,
+                            &candidates,
+                            &arg_nodes,
+                            span,
+                            scope,
+                        );
                     }
                     if let Some(&wid) = self.scope.witnesses.get(&callee_name) {
                         return self.check_witness_call(wid, &arg_nodes, span, scope);
@@ -4741,6 +5762,15 @@ impl<'a> Analyzer<'a> {
                             scope,
                         );
                     }
+                }
+
+                // 3. Direct arrow invocation `((x) => ...)(arg)` or `() => { ... }()`.
+                if self.units.ast().node_tag(call.callee) == NodeTag::ArrowExpr {
+                    let mut arg_exprs = Vec::with_capacity(arg_nodes.len());
+                    for &anode in &arg_nodes {
+                        arg_exprs.push(self.check_expr(anode, scope, None)?);
+                    }
+                    return self.eval_higher_order_call(call.callee, arg_exprs, span, scope);
                 }
 
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -4827,12 +5857,11 @@ impl<'a> Analyzer<'a> {
             ));
             return None;
         }
-        let len: u32 = match self
-            .text(self.units.ast().node_main_token(arg_nodes[0]))
-            .parse()
-        {
-            Ok(n) => n,
-            Err(_) => {
+        let len: u32 = match compact_ast::parse_nat_u32(
+            self.text(self.units.ast().node_main_token(arg_nodes[0])),
+        ) {
+            Some(n) => n,
+            None => {
                 self.diagnostics.push(CompactDiagnostic::error(
                     self.units.file(),
                     self.units.ast().node_span(arg_nodes[0]),
@@ -4849,8 +5878,9 @@ impl<'a> Analyzer<'a> {
             ));
             return None;
         }
-        let text = unquote_string(self.text(self.units.ast().node_main_token(arg_nodes[1])));
-        let raw_bytes = text.as_bytes();
+        let raw_bytes = compact_ast::unescape_string_bytes(
+            self.text(self.units.ast().node_main_token(arg_nodes[1])),
+        );
         if raw_bytes.len() > len as usize {
             self.diagnostics.push(CompactDiagnostic::error(
                 self.units.file(),
@@ -4863,7 +5893,7 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         let mut padded = vec![0u8; len as usize];
-        padded[..raw_bytes.len()].copy_from_slice(raw_bytes);
+        padded[..raw_bytes.len()].copy_from_slice(&raw_bytes);
         Some(Expr {
             kind: ExprKind::BytesLit(padded),
             ty: Type::Bytes(len),
@@ -4882,7 +5912,7 @@ impl<'a> Analyzer<'a> {
             NodeTag::IdentExpr => {
                 let tok = self.units.ast().node_main_token(fn_node);
                 let name = self.text(tok).to_owned();
-                let Some(&cid) = self.scope.circuits.get(&name) else {
+                let Some(cids) = self.scope.circuits.get(&name).cloned() else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         self.units.ast().token_span(tok),
@@ -4890,6 +5920,11 @@ impl<'a> Analyzer<'a> {
                     ));
                     return None;
                 };
+                let cid = cids
+                    .iter()
+                    .copied()
+                    .find(|&c| self.circuit_sigs[c.0 as usize].params.len() == arg_exprs.len())
+                    .unwrap_or(cids[0]);
                 let expected_params: Vec<Type> = self.circuit_sigs[cid.0 as usize]
                     .params
                     .iter()
@@ -5000,14 +6035,20 @@ impl<'a> Analyzer<'a> {
                         .collect();
                     let mut body_stmts = Vec::new();
                     let mut ret_val: Option<Expr> = None;
+                    let mut ok = true;
+                    self.block_consts.push(HashSet::new());
                     for (i, snode) in stmt_nodes.iter().copied().enumerate() {
                         if self.units.ast().node_tag(snode) == NodeTag::ReturnStmt
                             && i + 1 == stmt_nodes.len()
                         {
                             let rdata = self.units.ast().node_data(snode);
                             if let Some(enode) = NodeIndex(rdata.lhs).into_option() {
-                                let mut expr =
-                                    self.check_expr(enode, &inner_scope, annotated_ret.as_ref())?;
+                                let Some(mut expr) =
+                                    self.check_expr(enode, &inner_scope, annotated_ret.as_ref())
+                                else {
+                                    ok = false;
+                                    break;
+                                };
                                 if let Some(ref rt) = annotated_ret {
                                     if !self.coerce_or_check(&mut expr, rt) {
                                         self.diagnostics.push(CompactDiagnostic::error(
@@ -5019,7 +6060,8 @@ impl<'a> Analyzer<'a> {
                                                 self.format_type(&expr.ty)
                                             ),
                                         ));
-                                        return None;
+                                        ok = false;
+                                        break;
                                     }
                                     expr.ty = rt.clone();
                                 }
@@ -5035,6 +6077,10 @@ impl<'a> Analyzer<'a> {
                                 &mut body_stmts,
                             );
                         }
+                    }
+                    self.block_consts.pop();
+                    if !ok {
+                        return None;
                     }
                     stmts.extend(body_stmts);
                     let tail = ret_val.unwrap_or_else(|| Expr {
@@ -5101,7 +6147,9 @@ impl<'a> Analyzer<'a> {
         let u = self.underlying_type(&expr.ty).clone();
         match u {
             Type::Vector(len, elem) => Some((expr, len, (*elem).clone())),
-            Type::Tuple(elems) if !elems.is_empty() && elems.iter().all(|t| *t == elems[0]) => {
+            Type::Bytes(len) => Some((expr, len, Type::Uint(8))),
+            Type::Tuple(elems) if elems.is_empty() => Some((expr, 0, Type::unit())),
+            Type::Tuple(elems) if elems.iter().all(|t| *t == elems[0]) => {
                 let len = elems.len() as u32;
                 let elem = elems[0].clone();
                 let vec_ty = Type::Vector(len, Box::new(elem.clone()));
@@ -5113,7 +6161,7 @@ impl<'a> Analyzer<'a> {
                     self.units.file(),
                     expr.span,
                     format!(
-                        "`{builtin}` vector argument must have `Vector<N, T>` type, found `{}`",
+                        "`{builtin}` vector argument must have `Vector<N, T>` or `Bytes<N>` type, found `{}`",
                         self.format_type(&other)
                     ),
                 ));
@@ -5253,6 +6301,7 @@ impl<'a> Analyzer<'a> {
                 self.scope
                     .circuits
                     .get(&name)
+                    .and_then(|cids| cids.first())
                     .and_then(|&cid| self.circuit_sigs[cid.0 as usize].params.first())
                     .map(|p| p.ty.clone())
             }
@@ -5939,7 +6988,7 @@ impl<'a> Analyzer<'a> {
                 let len = self.expect_type_nat(targ_nodes, 0, "slice", call_span)?;
                 let base = self.check_expr(arg_nodes[0], scope, None)?;
                 let start_expr = self.check_expr(arg_nodes[1], scope, Some(&Type::Uint(64)))?;
-                let Some(start_u128) = eval_const_u128(&start_expr) else {
+                let Some(start_u128) = self.eval_const_u128_in_scope(&start_expr) else {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
                         start_expr.span,
@@ -5964,6 +7013,18 @@ impl<'a> Analyzer<'a> {
                         Type::Vector(len, elem)
                     }
                     Type::Tuple(elems) => {
+                        let is_homogeneous =
+                            elems.is_empty() || elems.iter().all(|e| *e == elems[0]);
+                        let is_literal_start =
+                            self.units.ast().node_tag(arg_nodes[1]) == NodeTag::IntLitExpr;
+                        if !is_homogeneous && !is_literal_start {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                base.span,
+                                "`slice` on a heterogeneous tuple requires a literal start index",
+                            ));
+                            return None;
+                        }
                         if (start as usize).saturating_add(len as usize) > elems.len() {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
@@ -6074,6 +7135,198 @@ impl<'a> Analyzer<'a> {
             ty: ret_type,
             span: call_span,
         })
+    }
+
+    fn is_nat_type_arg(&self, node: NodeIndex) -> bool {
+        match self.units.ast().node_tag(node) {
+            NodeTag::TypeNat => true,
+            NodeTag::TypeNamed => {
+                let name = self.text(self.units.ast().node_main_token(node));
+                self.scope.generics.nats.contains_key(name)
+            }
+            _ => false,
+        }
+    }
+
+    fn resolve_generic_circuit_overload(
+        &mut self,
+        callee_name: &str,
+        gids: &[usize],
+        targ_nodes: &[NodeIndex],
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        let matching_gids: Vec<usize> = gids
+            .iter()
+            .copied()
+            .filter(|&gid| {
+                let gparams = &self.generic_circuits[gid].gparams;
+                if gparams.len() != targ_nodes.len() {
+                    return false;
+                }
+                gparams
+                    .iter()
+                    .zip(targ_nodes.iter())
+                    .all(|(gp, &arg)| gp.is_nat == self.is_nat_type_arg(arg))
+            })
+            .collect();
+        if matching_gids.is_empty() {
+            if gids.len() == 1 {
+                let cid = self.instantiate_generic_circuit(gids[0], targ_nodes, call_span)?;
+                return self.check_circuit_call(cid, arg_nodes, call_span, scope);
+            }
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                format!("no overload of generic circuit `{callee_name}` matches the provided generic arguments"),
+            ));
+            return None;
+        }
+        if matching_gids.len() == 1 {
+            let cid = self.instantiate_generic_circuit(matching_gids[0], targ_nodes, call_span)?;
+            return self.check_circuit_call(cid, arg_nodes, call_span, scope);
+        }
+        let mut cids = Vec::with_capacity(matching_gids.len());
+        for gid in matching_gids {
+            if let Some(cid) = self.instantiate_generic_circuit(gid, targ_nodes, call_span) {
+                cids.push(cid);
+            }
+        }
+        if cids.is_empty() {
+            return None;
+        }
+        self.resolve_circuit_overload(callee_name, &cids, arg_nodes, call_span, scope)
+    }
+
+    fn resolve_circuit_overload(
+        &mut self,
+        callee_name: &str,
+        candidates: &[CircuitId],
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        if candidates.len() == 1 {
+            return self.check_circuit_call(candidates[0], arg_nodes, call_span, scope);
+        }
+        let arity_matches: Vec<CircuitId> = candidates
+            .iter()
+            .copied()
+            .filter(|&cid| self.circuit_sigs[cid.0 as usize].params.len() == arg_nodes.len())
+            .collect();
+        if arity_matches.is_empty() {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                format!(
+                    "no overload of circuit `{callee_name}` takes {} argument(s)",
+                    arg_nodes.len()
+                ),
+            ));
+            return None;
+        }
+        // Deduplicate identical circuit instances (e.g. from importing the same module twice).
+        let mut unique_arity: Vec<CircuitId> = Vec::with_capacity(arity_matches.len());
+        for cid in arity_matches {
+            let s = &self.circuit_sigs[cid.0 as usize];
+            let dup = unique_arity.iter().any(|&prev| {
+                let p = &self.circuit_sigs[prev.0 as usize];
+                p.unit == s.unit
+                    && p.body_node == s.body_node
+                    && p.ret_type == s.ret_type
+                    && p.scope.generics.types == s.scope.generics.types
+                    && p.scope.generics.nats == s.scope.generics.nats
+                    && p.params.len() == s.params.len()
+                    && p.params.iter().zip(&s.params).all(|(a, b)| a.ty == b.ty)
+            });
+            if !dup {
+                unique_arity.push(cid);
+            }
+        }
+        let arity_matches = unique_arity;
+        if arity_matches.len() == 1 {
+            return self.check_circuit_call(arity_matches[0], arg_nodes, call_span, scope);
+        }
+
+        // Evaluate arguments once without forcing a single overload's expected type.
+        let mut checked_args = Vec::with_capacity(arg_nodes.len());
+        for &anode in arg_nodes {
+            checked_args.push(self.check_expr(anode, scope, None)?);
+        }
+
+        let mut exact_matches = Vec::new();
+        let mut widening_matches = Vec::new();
+        for &cid in &arity_matches {
+            let expected_params: Vec<Type> = self.circuit_sigs[cid.0 as usize]
+                .params
+                .iter()
+                .map(|p| p.ty.clone())
+                .collect();
+            let is_exact = checked_args
+                .iter()
+                .zip(&expected_params)
+                .all(|(a, exp)| a.ty == *exp);
+            if is_exact {
+                exact_matches.push(cid);
+                continue;
+            }
+            let mut trial = checked_args.clone();
+            let is_widening = trial
+                .iter_mut()
+                .zip(&expected_params)
+                .all(|(a, exp)| self.coerce_or_check(a, exp));
+            if is_widening {
+                widening_matches.push((cid, trial));
+            }
+        }
+
+        if exact_matches.len() == 1 {
+            let cid = exact_matches[0];
+            let ret_type = self.circuit_sigs[cid.0 as usize].ret_type.clone();
+            return Some(Expr {
+                kind: ExprKind::CircuitCall {
+                    circuit: cid,
+                    args: checked_args,
+                },
+                ty: ret_type,
+                span: call_span,
+            });
+        }
+        if exact_matches.len() > 1 {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                format!("ambiguous call to overloaded circuit `{callee_name}`"),
+            ));
+            return None;
+        }
+        if widening_matches.len() == 1 {
+            let (cid, coerced_args) = widening_matches.into_iter().next().unwrap();
+            let ret_type = self.circuit_sigs[cid.0 as usize].ret_type.clone();
+            return Some(Expr {
+                kind: ExprKind::CircuitCall {
+                    circuit: cid,
+                    args: coerced_args,
+                },
+                ty: ret_type,
+                span: call_span,
+            });
+        }
+        if widening_matches.len() > 1 {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                format!("ambiguous call to overloaded circuit `{callee_name}` (multiple widening matches)"),
+            ));
+            return None;
+        }
+        self.diagnostics.push(CompactDiagnostic::error(
+            self.units.file(),
+            call_span,
+            format!("no overload of circuit `{callee_name}` matches the argument types"),
+        ));
+        None
     }
 
     fn check_circuit_call(
@@ -6450,6 +7703,50 @@ impl<'a> Analyzer<'a> {
                     }
                     make_call(LedgerOp::CellWrite, vec![val], Type::unit(), target_adt)
                 }
+                "writeCoin" => {
+                    if arg_nodes.len() != 2 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            call_span,
+                            "`Cell.writeCoin` takes 2 arguments (coin, recipient)",
+                        ));
+                        return None;
+                    }
+                    let coin_ty = self.resolve_stdlib_struct("ShieldedCoinInfo", call_span)?;
+                    let pk_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", call_span)?;
+                    let ca_ty = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                    let recip_ty = Type::Either(Box::new(pk_ty), Box::new(ca_ty));
+                    let mut coin = self.check_expr(arg_nodes[0], scope, Some(&coin_ty))?;
+                    if !self.coerce_or_check(&mut coin, &coin_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            coin.span,
+                            format!(
+                                "`Cell.writeCoin` expects `ShieldedCoinInfo`, found `{}`",
+                                self.format_type(&coin.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let mut recip = self.check_expr(arg_nodes[1], scope, Some(&recip_ty))?;
+                    if !self.coerce_or_check(&mut recip, &recip_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            recip.span,
+                            format!(
+                                "`Cell.writeCoin` expects recipient `Either<ZswapCoinPublicKey, ContractAddress>`, found `{}`",
+                                self.format_type(&recip.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(
+                        LedgerOp::CellWriteCoin,
+                        vec![coin, recip],
+                        Type::unit(),
+                        target_adt,
+                    )
+                }
                 "resetToDefault" => {
                     if !arg_nodes.is_empty() {
                         self.diagnostics.push(CompactDiagnostic::error(
@@ -6521,6 +7818,50 @@ impl<'a> Analyzer<'a> {
                     }
                     make_call(op, vec![elem], ret_ty, target_adt)
                 }
+                "insertCoin" => {
+                    if arg_nodes.len() != 2 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            call_span,
+                            "`Set.insertCoin` takes 2 arguments (coin, recipient)",
+                        ));
+                        return None;
+                    }
+                    let coin_ty = self.resolve_stdlib_struct("ShieldedCoinInfo", call_span)?;
+                    let pk_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", call_span)?;
+                    let ca_ty = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                    let recip_ty = Type::Either(Box::new(pk_ty), Box::new(ca_ty));
+                    let mut coin = self.check_expr(arg_nodes[0], scope, Some(&coin_ty))?;
+                    if !self.coerce_or_check(&mut coin, &coin_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            coin.span,
+                            format!(
+                                "`Set.insertCoin` expects `ShieldedCoinInfo`, found `{}`",
+                                self.format_type(&coin.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let mut recip = self.check_expr(arg_nodes[1], scope, Some(&recip_ty))?;
+                    if !self.coerce_or_check(&mut recip, &recip_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            recip.span,
+                            format!(
+                                "`Set.insertCoin` expects recipient `Either<ZswapCoinPublicKey, ContractAddress>`, found `{}`",
+                                self.format_type(&recip.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(
+                        LedgerOp::SetInsertCoin,
+                        vec![coin, recip],
+                        Type::unit(),
+                        target_adt,
+                    )
+                }
                 other => {
                     self.diagnostics.push(CompactDiagnostic::error(
                         self.units.file(),
@@ -6574,6 +7915,50 @@ impl<'a> Analyzer<'a> {
                     make_call(
                         LedgerOp::ListPushFront,
                         vec![elem],
+                        Type::unit(),
+                        target_adt,
+                    )
+                }
+                "pushFrontCoin" => {
+                    if arg_nodes.len() != 2 {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            call_span,
+                            "`List.pushFrontCoin` takes 2 arguments (coin, recipient)",
+                        ));
+                        return None;
+                    }
+                    let coin_ty = self.resolve_stdlib_struct("ShieldedCoinInfo", call_span)?;
+                    let pk_ty = self.resolve_stdlib_struct("ZswapCoinPublicKey", call_span)?;
+                    let ca_ty = self.resolve_stdlib_struct("ContractAddress", call_span)?;
+                    let recip_ty = Type::Either(Box::new(pk_ty), Box::new(ca_ty));
+                    let mut coin = self.check_expr(arg_nodes[0], scope, Some(&coin_ty))?;
+                    if !self.coerce_or_check(&mut coin, &coin_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            coin.span,
+                            format!(
+                                "`List.pushFrontCoin` expects `ShieldedCoinInfo`, found `{}`",
+                                self.format_type(&coin.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    let mut recip = self.check_expr(arg_nodes[1], scope, Some(&recip_ty))?;
+                    if !self.coerce_or_check(&mut recip, &recip_ty) {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            recip.span,
+                            format!(
+                                "`List.pushFrontCoin` expects recipient `Either<ZswapCoinPublicKey, ContractAddress>`, found `{}`",
+                                self.format_type(&recip.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    make_call(
+                        LedgerOp::ListPushFrontCoin,
+                        vec![coin, recip],
                         Type::unit(),
                         target_adt,
                     )
@@ -6705,36 +8090,42 @@ impl<'a> Analyzer<'a> {
                             return None;
                         }
                         val
-                    } else if self.units.ast().node_tag(arg_nodes[1]) == NodeTag::DefaultExpr {
-                        let inner_ty = NodeIndex(self.units.ast().node_data(arg_nodes[1]).lhs);
-                        let default_adt = self.resolve_ledger_adt(inner_ty)?;
-                        if default_adt != *value {
+                    } else {
+                        let mut default_node = arg_nodes[1];
+                        while self.units.ast().node_tag(default_node) == NodeTag::DiscloseExpr {
+                            default_node = NodeIndex(self.units.ast().node_data(default_node).lhs);
+                        }
+                        if self.units.ast().node_tag(default_node) == NodeTag::DefaultExpr {
+                            let inner_ty = NodeIndex(self.units.ast().node_data(default_node).lhs);
+                            let default_adt = self.resolve_ledger_adt(inner_ty)?;
+                            if default_adt != *value {
+                                self.diagnostics.push(CompactDiagnostic::error(
+                                    self.units.file(),
+                                    self.units.ast().node_span(arg_nodes[1]),
+                                    format!(
+                                        "`Map.insert` expects default value for `{}`, found `{}`",
+                                        value.name(),
+                                        default_adt.name()
+                                    ),
+                                ));
+                                return None;
+                            }
+                            Expr {
+                                kind: ExprKind::DefaultAdt(default_adt),
+                                ty: Type::unit(),
+                                span: self.units.ast().node_span(arg_nodes[1]),
+                            }
+                        } else {
                             self.diagnostics.push(CompactDiagnostic::error(
                                 self.units.file(),
                                 self.units.ast().node_span(arg_nodes[1]),
                                 format!(
-                                    "`Map.insert` expects default value for `{}`, found `{}`",
-                                    value.name(),
-                                    default_adt.name()
+                                    "`Map.insert` for nested ADT `{}` requires `default<...>`",
+                                    value.name()
                                 ),
                             ));
                             return None;
                         }
-                        Expr {
-                            kind: ExprKind::DefaultAdt(default_adt),
-                            ty: Type::unit(),
-                            span: self.units.ast().node_span(arg_nodes[1]),
-                        }
-                    } else {
-                        self.diagnostics.push(CompactDiagnostic::error(
-                            self.units.file(),
-                            self.units.ast().node_span(arg_nodes[1]),
-                            format!(
-                                "`Map.insert` for nested ADT `{}` requires `default<...>`",
-                                value.name()
-                            ),
-                        ));
-                        return None;
                     };
                     make_call(LedgerOp::MapInsert, vec![k, v], Type::unit(), target_adt)
                 }
@@ -6837,6 +8228,178 @@ impl<'a> Analyzer<'a> {
                             target_adt,
                         )
                     }
+                    "insertHash" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                format!("`{adt_name}.insertHash` takes 1 argument"),
+                            ));
+                            return None;
+                        }
+                        let mut h = self.check_expr(arg_nodes[0], scope, Some(&Type::Bytes(32)))?;
+                        if !self.coerce_or_check(&mut h, &Type::Bytes(32)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                h.span,
+                                format!(
+                                    "`{adt_name}.insertHash` expects `Bytes<32>`, found `{}`",
+                                    self.format_type(&h.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeInsertHash
+                            } else {
+                                LedgerOp::MerkleTreeInsertHash
+                            },
+                            vec![h],
+                            Type::unit(),
+                            target_adt,
+                        )
+                    }
+                    "insertHashIndex" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                format!("`{adt_name}.insertHashIndex` takes 2 arguments"),
+                            ));
+                            return None;
+                        }
+                        let mut h = self.check_expr(arg_nodes[0], scope, Some(&Type::Bytes(32)))?;
+                        if !self.coerce_or_check(&mut h, &Type::Bytes(32)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                h.span,
+                                format!(
+                                    "`{adt_name}.insertHashIndex` expects `Bytes<32>`, found `{}`",
+                                    self.format_type(&h.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        let mut idx =
+                            self.check_expr(arg_nodes[1], scope, Some(&Type::Uint(64)))?;
+                        if !self.coerce_or_check(&mut idx, &Type::Uint(64)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                idx.span,
+                                format!(
+                                    "`{adt_name}.insertHashIndex` expects index `Uint<64>`, found `{}`",
+                                    self.format_type(&idx.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeInsertHashIndex
+                            } else {
+                                LedgerOp::MerkleTreeInsertHashIndex
+                            },
+                            vec![h, idx],
+                            Type::unit(),
+                            target_adt,
+                        )
+                    }
+                    "insertIndex" => {
+                        if arg_nodes.len() != 2 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                format!("`{adt_name}.insertIndex` takes 2 arguments"),
+                            ));
+                            return None;
+                        }
+                        let mut item = self.check_expr(arg_nodes[0], scope, Some(&value))?;
+                        if !self.coerce_or_check(&mut item, &value) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                item.span,
+                                format!(
+                                    "`{adt_name}.insertIndex` expects `{}`, found `{}`",
+                                    self.format_type(&value),
+                                    self.format_type(&item.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        let mut idx =
+                            self.check_expr(arg_nodes[1], scope, Some(&Type::Uint(64)))?;
+                        if !self.coerce_or_check(&mut idx, &Type::Uint(64)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                idx.span,
+                                format!(
+                                    "`{adt_name}.insertIndex` expects index `Uint<64>`, found `{}`",
+                                    self.format_type(&idx.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeInsertIndex
+                            } else {
+                                LedgerOp::MerkleTreeInsertIndex
+                            },
+                            vec![item, idx],
+                            Type::unit(),
+                            target_adt,
+                        )
+                    }
+                    "insertIndexDefault" => {
+                        if arg_nodes.len() != 1 {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                format!("`{adt_name}.insertIndexDefault` takes 1 argument"),
+                            ));
+                            return None;
+                        }
+                        let mut idx =
+                            self.check_expr(arg_nodes[0], scope, Some(&Type::Uint(64)))?;
+                        if !self.coerce_or_check(&mut idx, &Type::Uint(64)) {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                idx.span,
+                                format!(
+                                    "`{adt_name}.insertIndexDefault` expects index `Uint<64>`, found `{}`",
+                                    self.format_type(&idx.ty)
+                                ),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeInsertIndexDefault
+                            } else {
+                                LedgerOp::MerkleTreeInsertIndexDefault
+                            },
+                            vec![idx],
+                            Type::unit(),
+                            target_adt,
+                        )
+                    }
+                    "resetHistory" if historic => {
+                        if !arg_nodes.is_empty() {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                "`HistoricMerkleTree.resetHistory` takes 0 arguments",
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            LedgerOp::HistoricMerkleTreeResetHistory,
+                            Vec::new(),
+                            Type::unit(),
+                            target_adt,
+                        )
+                    }
                     "resetToDefault" => {
                         if !arg_nodes.is_empty() {
                             self.diagnostics.push(CompactDiagnostic::error(
@@ -6869,6 +8432,183 @@ impl<'a> Analyzer<'a> {
             }
         }
     }
+    fn validate_declared_modules(&mut self, mod_ids: &[usize]) {
+        // 1. Check each module (recursively for nested modules) for duplicate ledger fields and include cycles.
+        fn check_module_body(analyzer: &mut Analyzer<'_>, unit: UnitId, decls: &[NodeIndex]) {
+            let mut seen_ledgers: HashSet<String> = HashSet::new();
+            let mut nested_mods: Vec<(UnitId, Vec<NodeIndex>)> = Vec::new();
+            let mut include_specs: Vec<(String, Span)> = Vec::new();
+
+            let prev = analyzer.units.switch(unit);
+            for &d in decls {
+                match analyzer.units.ast().node_tag(d) {
+                    NodeTag::LedgerDecl => {
+                        let ld = analyzer.units.ast().ledger_decl(d);
+                        let name = analyzer.text(ld.name_token).to_owned();
+                        let span = analyzer.units.ast().token_span(ld.name_token);
+                        if !seen_ledgers.insert(name.clone()) {
+                            analyzer.diagnostics.push(CompactDiagnostic::error(
+                                analyzer.units.file(),
+                                span,
+                                format!("duplicate ledger field `{name}`"),
+                            ));
+                        }
+                    }
+                    NodeTag::ModuleDecl => {
+                        let md = analyzer.units.ast().module_decl(d);
+                        let body: Vec<_> = analyzer
+                            .units
+                            .ast()
+                            .extra_nodes(md.decls_start, md.decls_end)
+                            .collect();
+                        nested_mods.push((unit, body));
+                    }
+                    NodeTag::IncludeDecl => {
+                        let inc = analyzer.units.ast().include_decl(d);
+                        let spec = unquote_string(analyzer.text(inc.path_token));
+                        let span = analyzer.units.ast().token_span(inc.path_token);
+                        include_specs.push((spec, span));
+                    }
+                    _ => {}
+                }
+            }
+            let from_file = analyzer.units.file().clone();
+            analyzer.units.switch(prev);
+
+            for (spec, span) in include_specs {
+                if analyzer.include_stack.contains(&spec) {
+                    analyzer.diagnostics.push(CompactDiagnostic::error(
+                        &from_file,
+                        span,
+                        format!("cyclic `include` of `{spec}`"),
+                    ));
+                    continue;
+                }
+                if let Ok((inc_file, inc_ast)) = analyzer.loader.load(&from_file, &spec) {
+                    let inc_unit = analyzer.units.push_owned(inc_file, inc_ast);
+                    let prev_u = analyzer.units.switch(inc_unit);
+                    let inc_decls: Vec<_> = analyzer.units.ast().root_decls().collect();
+                    analyzer.units.switch(prev_u);
+                    analyzer.include_stack.push(spec);
+                    check_module_body(analyzer, inc_unit, &inc_decls);
+                    analyzer.include_stack.pop();
+                }
+            }
+            for (nu, nd) in nested_mods {
+                check_module_body(analyzer, nu, &nd);
+            }
+        }
+
+        // 2. Build module import graph and detect self/mutual import cycles among declared modules.
+        let mut name_to_mid: HashMap<String, usize> = HashMap::new();
+        for &mid in mod_ids {
+            name_to_mid.insert(self.modules[mid].name.clone(), mid);
+        }
+        let mut edges: HashMap<usize, Vec<(usize, Span)>> = HashMap::new();
+        for &mid in mod_ids {
+            let tmpl = self.modules[mid].clone();
+            check_module_body(self, tmpl.unit, &tmpl.decls);
+            let prev = self.units.switch(tmpl.unit);
+            let mut inner_mod_names: HashSet<String> = HashSet::new();
+            for &d in &tmpl.decls {
+                if self.units.ast().node_tag(d) == NodeTag::ModuleDecl {
+                    let md = self.units.ast().module_decl(d);
+                    inner_mod_names.insert(self.text(md.name_token).to_owned());
+                } else if self.units.ast().node_tag(d) == NodeTag::ImportDecl {
+                    let imp = self.units.ast().import_decl(d);
+                    if self.units.ast().token_tag(imp.name_token) == TokenTag::Ident {
+                        let target = self.text(imp.name_token).to_owned();
+                        if !inner_mod_names.contains(&target)
+                            && let Some(&tmid) = name_to_mid.get(&target)
+                        {
+                            edges
+                                .entry(mid)
+                                .or_default()
+                                .push((tmid, self.units.ast().token_span(imp.name_token)));
+                        }
+                    }
+                }
+            }
+            self.units.switch(prev);
+        }
+
+        fn dfs_mod_cycle(
+            u: usize,
+            edges: &HashMap<usize, Vec<(usize, Span)>>,
+            visiting: &mut HashSet<usize>,
+            visited: &mut HashSet<usize>,
+        ) -> Option<Span> {
+            if visited.contains(&u) {
+                return None;
+            }
+            visiting.insert(u);
+            if let Some(neighbors) = edges.get(&u) {
+                for &(v, span) in neighbors {
+                    if visiting.contains(&v) {
+                        return Some(span);
+                    }
+                    if let Some(s) = dfs_mod_cycle(v, edges, visiting, visited) {
+                        return Some(s);
+                    }
+                }
+            }
+            visiting.remove(&u);
+            visited.insert(u);
+            None
+        }
+
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        for &mid in mod_ids {
+            if let Some(span) = dfs_mod_cycle(mid, &edges, &mut visiting, &mut visited) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    span,
+                    format!(
+                        "cyclic module import involving `{}`",
+                        self.modules[mid].name
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+
+    fn eval_const_u128_in_scope(&self, expr: &Expr) -> Option<u128> {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Some(*v),
+            ExprKind::BoolLit(b) => Some(u128::from(*b)),
+            ExprKind::LocalRef(lid) => self.const_int_locals.get(lid).copied(),
+            ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => {
+                self.eval_const_u128_in_scope(expr)
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let a = self.eval_const_u128_in_scope(lhs)?;
+                let b = self.eval_const_u128_in_scope(rhs)?;
+                match op {
+                    BinaryOp::Add => a.checked_add(b),
+                    BinaryOp::Sub => a.checked_sub(b),
+                    BinaryOp::Mul => a.checked_mul(b),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_loop_index_expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::LocalRef(lid) => {
+                self.loop_index_locals.contains(lid) || self.const_int_locals.contains_key(lid)
+            }
+            ExprKind::IntLit(_) => true,
+            ExprKind::Cast { expr, .. } | ExprKind::Disclose(expr) => self.is_loop_index_expr(expr),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.is_loop_index_expr(lhs) && self.is_loop_index_expr(rhs)
+            }
+            _ => false,
+        }
+    }
 }
 
 fn mangle_name(prefix: Option<&str>, name: &str) -> String {
@@ -6897,11 +8637,7 @@ fn eval_const_u128(expr: &Expr) -> Option<u128> {
 }
 
 fn unquote_string(raw: &str) -> String {
-    if raw.len() >= 2 {
-        raw[1..raw.len() - 1].to_owned()
-    } else {
-        raw.to_owned()
-    }
+    String::from_utf8_lossy(&compact_ast::unescape_string_bytes(raw)).into_owned()
 }
 
 fn propagate_purity(
@@ -7118,6 +8854,343 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
         | ExprKind::LocalRef(_)
         | ExprKind::EnumVariant { .. }
         | ExprKind::MaybeNone(_) => (false, false),
+    }
+}
+
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Field"
+            | "Boolean"
+            | "Uint"
+            | "Bytes"
+            | "Vector"
+            | "Opaque"
+            | "Counter"
+            | "Set"
+            | "List"
+            | "Map"
+            | "MerkleTree"
+            | "HistoricMerkleTree"
+            | "Kernel"
+    )
+}
+
+fn is_stdlib_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Maybe"
+            | "Either"
+            | "MerkleTreeDigest"
+            | "MerkleTreePathEntry"
+            | "MerkleTreePath"
+            | "JubjubScalar"
+            | "JubjubPoint"
+            | "Secp256k1Base"
+            | "Secp256k1Scalar"
+            | "Secp256k1Point"
+            | "Secp256r1Base"
+            | "Secp256r1Scalar"
+            | "Secp256r1Point"
+            | "Curve25519Base"
+            | "Curve25519Scalar"
+            | "Curve25519Point"
+    )
+}
+
+fn is_stdlib_type_name(name: &str) -> bool {
+    is_stdlib_builtin_type(name)
+        || matches!(
+            name,
+            "ZswapCoinPublicKey"
+                | "ContractAddress"
+                | "UserAddress"
+                | "ShieldedCoinInfo"
+                | "QualifiedShieldedCoinInfo"
+                | "ShieldedSendResult"
+                | "CurvePoint"
+                | "ShieldedSpend"
+                | "ShieldedReceive"
+                | "ShieldedMint"
+                | "ShieldedBurn"
+                | "UnshieldedSpend"
+                | "UnshieldedReceive"
+                | "UnshieldedMint"
+                | "UnshieldedBurn"
+                | "Paused"
+                | "Unpaused"
+                | "Misc"
+        )
+}
+
+fn reject_sealed_mutations(file: &SourceFile, program: &Program, diagnostics: &mut DiagnosticBag) {
+    fn walk_stmts(
+        stmts: &[Stmt],
+        program: &Program,
+        visited_circuits: &mut HashSet<CircuitId>,
+        file: &SourceFile,
+        diagnostics: &mut DiagnosticBag,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Const { init, .. } | Stmt::Expr(init) => {
+                    walk_expr(init, program, visited_circuits, file, diagnostics);
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(v) = value {
+                        walk_expr(v, program, visited_circuits, file, diagnostics);
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    walk_expr(cond, program, visited_circuits, file, diagnostics);
+                    walk_stmts(then_branch, program, visited_circuits, file, diagnostics);
+                    walk_stmts(else_branch, program, visited_circuits, file, diagnostics);
+                }
+                Stmt::ForRange { body, .. } => {
+                    walk_stmts(body, program, visited_circuits, file, diagnostics);
+                }
+                Stmt::ForEach { iter, body, .. } => {
+                    walk_expr(iter, program, visited_circuits, file, diagnostics);
+                    walk_stmts(body, program, visited_circuits, file, diagnostics);
+                }
+            }
+        }
+    }
+
+    fn walk_expr(
+        expr: &Expr,
+        program: &Program,
+        visited_circuits: &mut HashSet<CircuitId>,
+        file: &SourceFile,
+        diagnostics: &mut DiagnosticBag,
+    ) {
+        match &expr.kind {
+            ExprKind::LedgerCall {
+                field,
+                key_path,
+                op,
+                args,
+                ..
+            } => {
+                let lf = program.ledger_field(*field);
+                if lf.sealed && op.is_mutating() {
+                    diagnostics.push(CompactDiagnostic::error(
+                        file,
+                        expr.span,
+                        format!(
+                            "cannot mutate sealed ledger field `{}` outside `constructor`",
+                            lf.name
+                        ),
+                    ));
+                }
+                for k in key_path {
+                    walk_expr(k, program, visited_circuits, file, diagnostics);
+                }
+                for a in args {
+                    walk_expr(a, program, visited_circuits, file, diagnostics);
+                }
+            }
+            ExprKind::CircuitCall { circuit, args } => {
+                for a in args {
+                    walk_expr(a, program, visited_circuits, file, diagnostics);
+                }
+                if visited_circuits.insert(*circuit) {
+                    let callee = program.circuit(*circuit);
+                    walk_stmts(&callee.body, program, visited_circuits, file, diagnostics);
+                }
+            }
+            ExprKind::WitnessCall { args, .. }
+            | ExprKind::NativeWitness { args, .. }
+            | ExprKind::Tuple(args)
+            | ExprKind::Vector(args)
+            | ExprKind::BytesPack(args) => {
+                for a in args {
+                    walk_expr(a, program, visited_circuits, file, diagnostics);
+                }
+            }
+            ExprKind::ContractCall { receiver, args, .. } => {
+                walk_expr(receiver, program, visited_circuits, file, diagnostics);
+                for a in args {
+                    walk_expr(a, program, visited_circuits, file, diagnostics);
+                }
+            }
+            ExprKind::StructLit { fields } => {
+                for (_, e) in fields {
+                    walk_expr(e, program, visited_circuits, file, diagnostics);
+                }
+            }
+            ExprKind::Block { stmts, tail } => {
+                walk_stmts(stmts, program, visited_circuits, file, diagnostics);
+                walk_expr(tail, program, visited_circuits, file, diagnostics);
+            }
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Index {
+                base: lhs,
+                index: rhs,
+            }
+            | ExprKind::EcAdd { lhs, rhs }
+            | ExprKind::EcMul {
+                point: lhs,
+                scalar: rhs,
+            }
+            | ExprKind::ConstructJubjubPoint { x: lhs, y: rhs }
+            | ExprKind::PersistentCommit {
+                value: lhs,
+                rand: rhs,
+                ..
+            }
+            | ExprKind::TransientCommit {
+                value: lhs,
+                rand: rhs,
+                ..
+            } => {
+                walk_expr(lhs, program, visited_circuits, file, diagnostics);
+                walk_expr(rhs, program, visited_circuits, file, diagnostics);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                walk_expr(cond, program, visited_circuits, file, diagnostics);
+                walk_expr(then_branch, program, visited_circuits, file, diagnostics);
+                walk_expr(else_branch, program, visited_circuits, file, diagnostics);
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::Assert { cond: operand, .. }
+            | ExprKind::Disclose(operand)
+            | ExprKind::Emit { value: operand, .. }
+            | ExprKind::Serialize { value: operand, .. }
+            | ExprKind::Deserialize { bytes: operand, .. }
+            | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::Keccak256 { arg: operand, .. }
+            | ExprKind::Sha512 { arg: operand, .. }
+            | ExprKind::TransientHash { arg: operand, .. }
+            | ExprKind::DegradeToTransient(operand)
+            | ExprKind::UpgradeFromTransient(operand)
+            | ExprKind::FieldInv(operand)
+            | ExprKind::EcNeg(operand)
+            | ExprKind::EcMulGenerator(operand)
+            | ExprKind::HashToCurve { arg: operand, .. }
+            | ExprKind::PointCoord { point: operand, .. }
+            | ExprKind::MerkleTreePathRoot { path: operand, .. }
+            | ExprKind::FieldAccess { base: operand, .. }
+            | ExprKind::Slice { base: operand, .. }
+            | ExprKind::MaybeSome(operand) => {
+                walk_expr(operand, program, visited_circuits, file, diagnostics);
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::BytesLit(_)
+            | ExprKind::Default(_)
+            | ExprKind::DefaultAdt(_)
+            | ExprKind::ParamRef(_)
+            | ExprKind::LocalRef(_)
+            | ExprKind::EnumVariant { .. }
+            | ExprKind::MaybeNone(_) => {}
+        }
+    }
+
+    for circuit in &program.circuits {
+        if !circuit.exported {
+            continue;
+        }
+        let mut visited = HashSet::new();
+        visited.insert(circuit.id);
+        walk_stmts(&circuit.body, program, &mut visited, file, diagnostics);
+    }
+}
+
+fn check_returns_and_reachability(
+    file: &SourceFile,
+    program: &Program,
+    diagnostics: &mut DiagnosticBag,
+) {
+    fn check_stmts(
+        stmts: &[Stmt],
+        in_for: bool,
+        file: &SourceFile,
+        diagnostics: &mut DiagnosticBag,
+    ) -> bool {
+        let mut always_returns = false;
+        for s in stmts {
+            match s {
+                Stmt::Return { span, .. } => {
+                    if in_for {
+                        diagnostics.push(CompactDiagnostic::error(
+                            file,
+                            *span,
+                            "`return` statement is not allowed inside a `for` loop",
+                        ));
+                    }
+                    always_returns = true;
+                }
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    let t = check_stmts(then_branch, in_for, file, diagnostics);
+                    let e = check_stmts(else_branch, in_for, file, diagnostics);
+                    if t && e {
+                        always_returns = true;
+                    }
+                }
+                Stmt::ForRange { body, .. } | Stmt::ForEach { body, .. } => {
+                    let _ = check_stmts(body, true, file, diagnostics);
+                }
+                Stmt::Const { .. } | Stmt::Expr(_) => {}
+            }
+        }
+        always_returns
+    }
+
+    if let Some(ctor) = &program.constructor {
+        let _ = check_stmts(&ctor.body, false, file, diagnostics);
+    }
+    for c in &program.circuits {
+        let returns = check_stmts(&c.body, false, file, diagnostics);
+        if c.ret_type != Type::unit() && !returns {
+            diagnostics.push(CompactDiagnostic::error(
+                file,
+                c.span,
+                format!("circuit `{}` may exit without returning a value", c.name),
+            ));
+        }
+    }
+}
+
+fn reject_case_insensitive_duplicate_exports(
+    file: &SourceFile,
+    program: &Program,
+    diagnostics: &mut DiagnosticBag,
+) {
+    let mut seen: HashMap<String, (String, Span)> = HashMap::new();
+    for c in &program.circuits {
+        if !c.exported {
+            continue;
+        }
+        let lower = c.name.to_ascii_lowercase();
+        if let Some((prev, _)) = seen.get(&lower) {
+            if prev != &c.name {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    c.span,
+                    format!(
+                        "exported circuit name `{}` conflicts case-insensitively with `{prev}`",
+                        c.name
+                    ),
+                ));
+            }
+        } else {
+            seen.insert(lower, (c.name.clone(), c.span));
+        }
     }
 }
 
@@ -7977,5 +10050,205 @@ mod tests {
             "expected WPP errors for emit and contract call, got: {:?}",
             checked.diagnostics
         );
+    }
+
+    #[test]
+    fn circuit_overloading_and_disambiguation() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            circuit f(x: Uint<8>): Field { return x as Field; }
+            circuit f(x: Uint<16>): Field { return (x + 1) as Field; }
+            circuit f(x: Field, y: Field): Field { return x + y; }
+            circuit g<T>(x: T): T { return x; }
+            circuit g<#N>(x: Bytes<N>): Bytes<N> { return x; }
+
+            export circuit run(a: Uint<8>, b: Uint<16>, c: Bytes<4>): Field {
+              const r1 = f(a);
+              const r2 = f(b);
+              const r3 = f(r1, r2);
+              const s1 = g<Field>(r3);
+              const s2 = g<4>(c);
+              return s1 + (s2[0] as Field);
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors(), "{:?}", parsed.diagnostics);
+        let checked = check(file, &parsed.ast);
+        assert!(
+            !checked.diagnostics.has_errors(),
+            "unexpected errors: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_circuit_overload() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            circuit h(x: Uint<16>, y: Uint<8>): Field { return (x + y) as Field; }
+            circuit h(x: Uint<8>, y: Uint<16>): Field { return (x + y) as Field; }
+
+            export circuit run(a: Uint<8>, b: Uint<8>): Field {
+              return h(a, b);
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked
+                .diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("ambiguous")),
+            "expected ambiguous overload error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn uint_ranges_radices_escapes_cast_precedence_and_bytes_ops() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+
+            struct Point { x: Uint<0..255>; y: Uint<0..100000>; }
+
+            export ledger c: Counter;
+            export ledger tree: HistoricMerkleTree<4, Bytes<32>>;
+
+            export circuit exercise(b: Bytes<4>, h: Bytes<32>): [Uint<8>, Point] {
+              const hex: Uint<8> = 0x10;
+              const bin: Uint<8> = 0b0101;
+              const oct: Uint<8> = 0o12;
+              const cast_prec: Uint<16> = hex + bin as Uint<16>;
+              const p = Point { hex, cast_prec + oct };
+              const msg: Bytes<5> = "a\nb\x21\0";
+              const spread_v: Vector<4, Uint<8>> = [...b];
+              const doubled = map((x: Uint<8>) => x + 1, b);
+              const total = fold((acc: Field, x: Uint<8>) => acc + (x as Field), 0 as Field, b);
+              for (const byte of b) {
+                assert(byte >= 0, "ok");
+              }
+              const current: Uint<64> = c;
+              assert(current >= 0 && total == total && spread_v[0] >= 0 && doubled[0] >= 0 && msg[0] >= 0, "ok");
+              tree.insertHash(disclose(h));
+              tree.resetHistory();
+              return [b[1], p];
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors(), "{:?}", parsed.diagnostics);
+        let checked = check(file, &parsed.ast);
+        assert!(
+            !checked.diagnostics.has_errors(),
+            "unexpected errors: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_static_safety_and_cycle_violations() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "sealed mutation outside constructor",
+                r#"
+                export sealed ledger owner: Field;
+                constructor() { owner = 1; }
+                export circuit bad(): [] { owner = 2; }
+                "#,
+            ),
+            (
+                "return inside for loop",
+                r#"
+                export circuit bad(): Field {
+                  for (const i of 0..3) { return i as Field; }
+                  return 0;
+                }
+                "#,
+            ),
+            (
+                "unreachable statement after return",
+                r#"
+                export circuit bad(): Field {
+                  return 1;
+                  const dead = 2;
+                }
+                "#,
+            ),
+            (
+                "missing return in non-unit circuit",
+                r#"
+                export circuit bad(x: Boolean): Field {
+                  if (x) { return 1; }
+                }
+                "#,
+            ),
+            (
+                "duplicate const in same block",
+                r#"
+                export circuit bad(): Field {
+                  const x = 1;
+                  const x = 2;
+                  return x;
+                }
+                "#,
+            ),
+            (
+                "cyclic new type",
+                r#"
+                new type A = B;
+                new type B = A;
+                export circuit bad(): [] {}
+                "#,
+            ),
+            (
+                "cyclic module import",
+                r#"
+                module A { import B; }
+                module B { import A; }
+                export circuit bad(): [] {}
+                "#,
+            ),
+            (
+                "case-insensitive duplicate exported circuit",
+                r#"
+                export circuit Foo(): [] {}
+                export circuit foo(): [] {}
+                "#,
+            ),
+            (
+                "non-constant vector index",
+                r#"
+                export circuit bad(v: Vector<3, Field>, i: Uint<8>): Field {
+                  return v[i];
+                }
+                "#,
+            ),
+        ];
+
+        for (label, src) in cases {
+            let mut sm = SourceMap::new();
+            let id = sm.add_file("test.compact", *src);
+            let file = sm.get(id);
+            let parsed = parse(file);
+            assert!(
+                !parsed.diagnostics.has_errors(),
+                "case `{label}` failed to parse: {:?}",
+                parsed.diagnostics
+            );
+            let checked = check(file, &parsed.ast);
+            assert!(
+                checked.diagnostics.has_errors(),
+                "case `{label}` unexpectedly succeeded without errors"
+            );
+        }
     }
 }

@@ -29,7 +29,6 @@ export circuit deposit(
   acct: AccountId,
   key: Field,
   batch: Vector<3, Field>,
-  idx: Uint<8>,
 ): [Field, Vector<2, Field>, Tag<4>] {
   const raw: Bytes<32> = acct as Bytes<32>;
   const tag: Tag<4> = slice<4>(raw, 0) as Tag<4>;
@@ -37,6 +36,7 @@ export circuit deposit(
   const k = pick_first<Field, AccountId>(pair);
   const amt: Amount = 5;
   V_bump(k, amt);
+  const idx = 2;
   const picked = batch[0] + batch[idx];
   return [picked, head_two<3>(batch), tag];
 }

@@ -30,7 +30,8 @@ circuit first_of<A, B>(p: Pair<A, B>): A {
   return p.first;
 }
 
-export circuit inspect(v: Vector<3, Field>, idx: Uint<8>, raw: Bytes<8>): [Field, Vector<2, Field>, Tag<4>] {
+export circuit inspect(v: Vector<3, Field>, raw: Bytes<8>): [Field, Vector<2, Field>, Tag<4>] {
+  const idx = 2;
   const p: Pair<Field, Field> = Pair<Field, Field>{ first: v[0], second: v[idx] };
   const head = slice<2>(v, 0);
   const tag: Tag<4> = slice<4>(raw, 2) as Tag<4>;
@@ -66,8 +67,7 @@ export circuit inspect(v: Vector<3, Field>, idx: Uint<8>, raw: Bytes<8>): [Field
     {"name":"%v.0","type":"Scalar<BLS12-381>"},
     {"name":"%v.1","type":"Scalar<BLS12-381>"},
     {"name":"%v.2","type":"Scalar<BLS12-381>"},
-    {"name":"%idx.3","type":"Scalar<BLS12-381>"},
-    {"name":"%raw.4","type":"Scalar<BLS12-381>"}
+    {"name":"%raw.3","type":"Scalar<BLS12-381>"}
   ],
   "outputs": [
     "Scalar<BLS12-381>",
@@ -76,20 +76,15 @@ export circuit inspect(v: Vector<3, Field>, idx: Uint<8>, raw: Bytes<8>): [Field
     "Scalar<BLS12-381>"
   ],
   "instructions": [
-    {"op":"constrain_bits","val":"%idx.3","bits":8},
-    {"op":"constrain_bits","val":"%raw.4","bits":64},
-    {"op":"test_eq","a":"%idx.3","b":"0x01","output":"%t.5"},
-    {"op":"cond_select","bit":"%t.5","a":"%v.1","b":"%v.0","output":"%t.6"},
-    {"op":"test_eq","a":"%idx.3","b":"0x02","output":"%t.7"},
-    {"op":"cond_select","bit":"%t.7","a":"%v.2","b":"%t.6","output":"%t.8"},
-    {"op":"div_mod_power_of_two","val":"%raw.4","bits":16,"outputs":["%quo.9","%rem.10"]},
-    {"op":"div_mod_power_of_two","val":"%quo.9","bits":32,"outputs":["%quo.11","%rem.12"]},
+    {"op":"constrain_bits","val":"%raw.3","bits":64},
+    {"op":"div_mod_power_of_two","val":"%raw.3","bits":16,"outputs":["%quo.4","%rem.5"]},
+    {"op":"div_mod_power_of_two","val":"%quo.4","bits":32,"outputs":["%quo.6","%rem.7"]},
     {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x00"]},
     {"op":"impact","guard":"0x01","inputs":["0x0e","0x01"]},
     {"op":"impact","guard":"0x01","inputs":["0xa1"]},
     {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x00"]},
     {"op":"impact","guard":"0x01","inputs":["0x0e","0x01"]},
     {"op":"impact","guard":"0x01","inputs":["0xa1"]},
-    {"op":"output","vals":["%v.0","%v.0","%v.1","%rem.12"]}
+    {"op":"output","vals":["%v.0","%v.0","%v.1","%rem.7"]}
   ]
 }

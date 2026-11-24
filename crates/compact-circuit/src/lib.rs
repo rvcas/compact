@@ -1298,18 +1298,49 @@ impl<'a> CircuitLowerer<'a> {
                     local, iter, body, ..
                 } => {
                     let iter_vals = self.lower_expr(iter, param_vals, locals, guard);
-                    if let Type::Vector(len, elem_ty) = &iter.ty {
-                        let elem_width = wire_count(self.program, elem_ty);
-                        for i in 0..(*len as usize) {
-                            let mut iter_locals = locals.clone();
-                            let slice = iter_vals[i * elem_width..(i + 1) * elem_width].to_vec();
-                            iter_locals.insert(*local, slice);
-                            if let Some(r) =
-                                self.lower_stmts(body, param_vals, &mut iter_locals, guard)
-                            {
-                                ret_vals = Some(r);
+                    match self.program.underlying_type(&iter.ty).clone() {
+                        Type::Vector(len, elem_ty) => {
+                            let elem_width = wire_count(self.program, &elem_ty);
+                            for i in 0..(len as usize) {
+                                let mut iter_locals = locals.clone();
+                                let slice =
+                                    iter_vals[i * elem_width..(i + 1) * elem_width].to_vec();
+                                iter_locals.insert(*local, slice);
+                                if let Some(r) =
+                                    self.lower_stmts(body, param_vals, &mut iter_locals, guard)
+                                {
+                                    ret_vals = Some(r);
+                                }
                             }
                         }
+                        Type::Bytes(len) => {
+                            let byte_wires = self.unpack_bytes_wires(&iter_vals, len);
+                            for bw in byte_wires {
+                                let mut iter_locals = locals.clone();
+                                iter_locals.insert(*local, vec![bw]);
+                                if let Some(r) =
+                                    self.lower_stmts(body, param_vals, &mut iter_locals, guard)
+                                {
+                                    ret_vals = Some(r);
+                                }
+                            }
+                        }
+                        Type::Tuple(elems) if !elems.is_empty() => {
+                            let mut offset = 0usize;
+                            for elem_ty in &elems {
+                                let w = wire_count(self.program, elem_ty);
+                                let mut iter_locals = locals.clone();
+                                let slice = iter_vals[offset..offset + w].to_vec();
+                                offset += w;
+                                iter_locals.insert(*local, slice);
+                                if let Some(r) =
+                                    self.lower_stmts(body, param_vals, &mut iter_locals, guard)
+                                {
+                                    ret_vals = Some(r);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Stmt::Expr(expr) => {
@@ -1431,19 +1462,61 @@ impl<'a> CircuitLowerer<'a> {
                         acc
                     }
                     Type::Tuple(elems) => {
-                        let k = eval_const_u128(index).expect("sema validated constant tuple index")
-                            as usize;
-                        let mut offset = 0usize;
-                        for (i, ety) in elems.iter().enumerate() {
-                            let w = wire_count(self.program, ety);
-                            if i == k {
-                                return base_vals[offset..offset + w].to_vec();
+                        if let Some(k) = eval_const_u128(index) {
+                            let k = k as usize;
+                            let mut offset = 0usize;
+                            for (i, ety) in elems.iter().enumerate() {
+                                let w = wire_count(self.program, ety);
+                                if i == k {
+                                    return base_vals[offset..offset + w].to_vec();
+                                }
+                                offset += w;
                             }
-                            offset += w;
+                            unreachable!("sema validated tuple index")
                         }
-                        unreachable!("sema validated tuple index")
+                        let elem_width = wire_count(self.program, &elems[0]);
+                        let idx_val = self
+                            .lower_expr(index, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let mut acc = base_vals[..elem_width].to_vec();
+                        for i in 1..elems.len() {
+                            let eq = self.fresh_var("t");
+                            self.instructions.push(CircuitInstr::TestEq {
+                                a: idx_val.clone(),
+                                b: CircuitVal::Imm(i as i128),
+                                output: eq,
+                            });
+                            let elem_slice =
+                                base_vals[i * elem_width..(i + 1) * elem_width].to_vec();
+                            acc = self.select_wires(&CircuitVal::Var(eq), elem_slice, acc);
+                        }
+                        acc
                     }
-                    _ => unreachable!("sema validated Index on Vector or Tuple"),
+                    Type::Bytes(len) => {
+                        let byte_wires = self.unpack_bytes_wires(&base_vals, *len);
+                        if let Some(k) = eval_const_u128(index) {
+                            return vec![byte_wires[k as usize].clone()];
+                        }
+                        let idx_val = self
+                            .lower_expr(index, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let mut acc = vec![byte_wires[0].clone()];
+                        for (i, bw) in byte_wires.into_iter().enumerate().skip(1) {
+                            let eq = self.fresh_var("t");
+                            self.instructions.push(CircuitInstr::TestEq {
+                                a: idx_val.clone(),
+                                b: CircuitVal::Imm(i as i128),
+                                output: eq,
+                            });
+                            acc = self.select_wires(&CircuitVal::Var(eq), vec![bw], acc);
+                        }
+                        acc
+                    }
+                    _ => unreachable!("sema validated Index on Vector, Bytes, or Tuple"),
                 }
             }
             ExprKind::Slice { base, start, len } => {
@@ -1554,13 +1627,83 @@ impl<'a> CircuitLowerer<'a> {
                 let src_u = self.program.underlying_type(&inner.ty).clone();
                 let dst_u = self.program.underlying_type(target).clone();
                 match (&src_u, &dst_u) {
-                    (Type::Bytes(n), Type::Vector(_, _)) => {
+                    (Type::Bytes(n), Type::Vector(_, _) | Type::Tuple(_)) => {
                         let wires = self.lower_expr(inner, param_vals, locals, guard);
                         self.unpack_bytes_wires(&wires, *n)
                     }
-                    (Type::Vector(_, _), Type::Bytes(_)) => {
+                    (Type::Vector(_, _) | Type::Tuple(_), Type::Bytes(_)) => {
                         let byte_vals = self.lower_expr(inner, param_vals, locals, guard);
                         self.pack_bytes_wires(&byte_vals)
+                    }
+                    (Type::Field | Type::Uint(_), Type::Boolean) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        let is_zero = self.fresh_var("t");
+                        self.instructions.push(CircuitInstr::TestEq {
+                            a: val,
+                            b: CircuitVal::Imm(0),
+                            output: is_zero,
+                        });
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions.push(CircuitInstr::CondSelect {
+                            bit: CircuitVal::Var(is_zero),
+                            a: CircuitVal::Imm(0),
+                            b: CircuitVal::Imm(1),
+                            output: out,
+                        });
+                        vec![CircuitVal::Var(out)]
+                    }
+                    (Type::Uint(_), Type::Bytes(n)) => {
+                        let val = self
+                            .lower_expr(inner, param_vals, locals, guard)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CircuitVal::Imm(0));
+                        if *n == 0 {
+                            Vec::new()
+                        } else if *n <= FIELD_BYTES {
+                            let out = self.fresh_var(hint.unwrap_or("t"));
+                            self.instructions
+                                .push(CircuitInstr::Copy { val, output: out });
+                            self.instructions.push(CircuitInstr::ConstrainBits {
+                                val: CircuitVal::Var(out),
+                                bits: *n * 8,
+                            });
+                            vec![CircuitVal::Var(out)]
+                        } else {
+                            let total_wires = (*n as usize).div_ceil(FIELD_BYTES as usize);
+                            let hi = self.fresh_var("hi");
+                            let lo = self.fresh_var("lo");
+                            self.instructions.push(CircuitInstr::DivModPowerOfTwo {
+                                val,
+                                bits: FIELD_BYTES * 8,
+                                quotient: hi,
+                                remainder: lo,
+                            });
+                            let mut out = vec![CircuitVal::Imm(0); total_wires];
+                            out[total_wires - 2] = CircuitVal::Var(hi);
+                            out[total_wires - 1] = CircuitVal::Var(lo);
+                            out
+                        }
+                    }
+                    (Type::Bytes(n), Type::Uint(bits)) => {
+                        let wires = self.lower_expr(inner, param_vals, locals, guard);
+                        let val = if *n == 0 {
+                            CircuitVal::Imm(0)
+                        } else {
+                            wires.into_iter().last().unwrap_or(CircuitVal::Imm(0))
+                        };
+                        let out = self.fresh_var(hint.unwrap_or("t"));
+                        self.instructions
+                            .push(CircuitInstr::Copy { val, output: out });
+                        self.instructions.push(CircuitInstr::ConstrainBits {
+                            val: CircuitVal::Var(out),
+                            bits: *bits,
+                        });
+                        vec![CircuitVal::Var(out)]
                     }
                     (
                         Type::Field | Type::Uint(_) | Type::Boolean | Type::Enum(_),
@@ -2476,13 +2619,22 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         results
                     }
-                    LedgerOp::CellWrite => {
+                    LedgerOp::CellWrite | LedgerOp::CellWriteCoin => {
                         let cell_ty = target_adt
                             .cell_type()
                             .expect("sema validated CellWrite target");
                         let alignment = AlignmentAtom::alignment_of(self.program, cell_ty);
-                        let raw_values = self.lower_expr(&args[0], param_vals, locals, guard);
-                        let values = self.encode_to_native_wires(cell_ty, raw_values);
+                        let values = if *op == LedgerOp::CellWriteCoin {
+                            let mut coin_vals =
+                                self.lower_expr(&args[0], param_vals, locals, guard);
+                            let _recip_vals = self.lower_expr(&args[1], param_vals, locals, guard);
+                            // Append placeholder mt_index (Uint<64> = 1 wire) to match QualifiedShieldedCoinInfo.
+                            coin_vals.push(CircuitVal::Imm(0));
+                            self.encode_to_native_wires(cell_ty, coin_vals)
+                        } else {
+                            let raw_values = self.lower_expr(&args[0], param_vals, locals, guard);
+                            self.encode_to_native_wires(cell_ty, raw_values)
+                        };
                         self.emit_write_at_path(
                             full_path,
                             ImpactStateValue::Cell { alignment, values },
@@ -2690,13 +2842,21 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         vec![CircuitVal::Var(out)]
                     }
-                    LedgerOp::SetInsert => {
+                    LedgerOp::SetInsert | LedgerOp::SetInsertCoin => {
                         let LedgerAdt::Set(elem_ty) = target_adt else {
                             unreachable!("sema validated SetInsert target");
                         };
                         let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let raw_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        let elem_vals = self.encode_to_native_wires(elem_ty, raw_vals);
+                        let elem_vals = if *op == LedgerOp::SetInsertCoin {
+                            let mut coin_vals =
+                                self.lower_expr(&args[0], param_vals, locals, guard);
+                            let _recip_vals = self.lower_expr(&args[1], param_vals, locals, guard);
+                            coin_vals.push(CircuitVal::Imm(0));
+                            self.encode_to_native_wires(elem_ty, coin_vals)
+                        } else {
+                            let raw_vals = self.lower_expr(&args[0], param_vals, locals, guard);
+                            self.encode_to_native_wires(elem_ty, raw_vals)
+                        };
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -3131,13 +3291,22 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         Vec::new()
                     }
-                    LedgerOp::ListPushFront => {
+                    LedgerOp::ListPushFront | LedgerOp::ListPushFrontCoin => {
                         let LedgerAdt::List(elem_ty) = target_adt else {
                             unreachable!("sema validated ListPushFront target");
                         };
                         let val_align = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let raw_val_wires = self.lower_expr(&args[0], param_vals, locals, guard);
-                        let val_wires = self.encode_to_native_wires(elem_ty, raw_val_wires);
+                        let val_wires = if *op == LedgerOp::ListPushFrontCoin {
+                            let mut coin_vals =
+                                self.lower_expr(&args[0], param_vals, locals, guard);
+                            let _recip_vals = self.lower_expr(&args[1], param_vals, locals, guard);
+                            coin_vals.push(CircuitVal::Imm(0));
+                            self.encode_to_native_wires(elem_ty, coin_vals)
+                        } else {
+                            let raw_val_wires =
+                                self.lower_expr(&args[0], param_vals, locals, guard);
+                            self.encode_to_native_wires(elem_ty, raw_val_wires)
+                        };
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -3203,30 +3372,60 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         Vec::new()
                     }
-                    LedgerOp::MerkleTreeInsert => {
+                    LedgerOp::MerkleTreeInsert
+                    | LedgerOp::MerkleTreeInsertHash
+                    | LedgerOp::MerkleTreeInsertIndex
+                    | LedgerOp::MerkleTreeInsertHashIndex
+                    | LedgerOp::MerkleTreeInsertIndexDefault => {
                         let LedgerAdt::MerkleTree { value: elem_ty, .. } = target_adt else {
-                            unreachable!("sema validated MerkleTreeInsert target");
+                            unreachable!("sema validated MerkleTree insert target");
                         };
-                        let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let raw_item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
-                        let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
-                        leaf_align.extend(alignment);
-                        let mut hash_inputs = bytes_to_wires(b"mdn:lh");
-                        hash_inputs.extend(item_vals);
+                        let hash_pair: Vec<CircuitVal> = match op {
+                            LedgerOp::MerkleTreeInsertHash
+                            | LedgerOp::MerkleTreeInsertHashIndex => {
+                                self.lower_expr(&args[0], param_vals, locals, guard)
+                            }
+                            _ => {
+                                let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
+                                let raw_item_vals = if *op == LedgerOp::MerkleTreeInsertIndexDefault
+                                {
+                                    self.lower_default(elem_ty)
+                                } else {
+                                    self.lower_expr(&args[0], param_vals, locals, guard)
+                                };
+                                let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
+                                let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
+                                leaf_align.extend(alignment);
+                                let mut hash_inputs = bytes_to_wires(b"mdn:lh");
+                                hash_inputs.extend(item_vals);
 
-                        let bytes_var = self.fresh_var("bytes");
-                        self.instructions.push(CircuitInstr::PersistentHash {
-                            alignment: leaf_align,
-                            inputs: hash_inputs,
-                            output: bytes_var,
-                        });
-                        let lo = self.fresh_var("hash");
-                        let hi = self.fresh_var("hash");
-                        self.instructions.push(CircuitInstr::BytesIntoNatives {
-                            bytes: bytes_var,
-                            outputs: vec![lo, hi],
-                        });
+                                let bytes_var = self.fresh_var("bytes");
+                                self.instructions.push(CircuitInstr::PersistentHash {
+                                    alignment: leaf_align,
+                                    inputs: hash_inputs,
+                                    output: bytes_var,
+                                });
+                                let lo = self.fresh_var("hash");
+                                let hi = self.fresh_var("hash");
+                                self.instructions.push(CircuitInstr::BytesIntoNatives {
+                                    bytes: bytes_var,
+                                    outputs: vec![lo, hi],
+                                });
+                                vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+                            }
+                        };
+                        let explicit_idx: Option<CircuitVal> = match op {
+                            LedgerOp::MerkleTreeInsertIndex
+                            | LedgerOp::MerkleTreeInsertHashIndex => self
+                                .lower_expr(&args[1], param_vals, locals, guard)
+                                .into_iter()
+                                .next(),
+                            LedgerOp::MerkleTreeInsertIndexDefault => self
+                                .lower_expr(&args[0], param_vals, locals, guard)
+                                .into_iter()
+                                .next(),
+                            _ => None,
+                        };
 
                         self.emit_impact(
                             guard,
@@ -3244,22 +3443,35 @@ impl<'a> CircuitLowerer<'a> {
                                 path: vec![PathSegment::Static(0)],
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Idx {
-                                cached: false,
-                                push_path: false,
-                                path: vec![PathSegment::Static(1)],
-                            },
-                        );
+                        if let Some(idx_val) = explicit_idx {
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Push {
+                                    storage: false,
+                                    value: ImpactStateValue::Cell {
+                                        alignment: vec![AlignmentAtom::Bytes(8)],
+                                        values: vec![idx_val],
+                                    },
+                                },
+                            );
+                        } else {
+                            self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Idx {
+                                    cached: false,
+                                    push_path: false,
+                                    path: vec![PathSegment::Static(1)],
+                                },
+                            );
+                        }
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Push {
                                 storage: true,
                                 value: ImpactStateValue::Cell {
                                     alignment: vec![AlignmentAtom::Bytes(32)],
-                                    values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                    values: hash_pair,
                                 },
                             },
                         );
@@ -3270,28 +3482,41 @@ impl<'a> CircuitLowerer<'a> {
                                 n: 1,
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Idx {
-                                cached: false,
-                                push_path: true,
-                                path: vec![PathSegment::Static(1)],
-                            },
-                        );
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Addi {
-                                immediate: CircuitVal::Imm(1),
-                            },
-                        );
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Ins {
-                                cached: true,
-                                n: depth + 1,
-                            },
-                        );
+                        if matches!(
+                            op,
+                            LedgerOp::MerkleTreeInsert | LedgerOp::MerkleTreeInsertHash
+                        ) {
+                            self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Idx {
+                                    cached: false,
+                                    push_path: true,
+                                    path: vec![PathSegment::Static(1)],
+                                },
+                            );
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Addi {
+                                    immediate: CircuitVal::Imm(1),
+                                },
+                            );
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Ins {
+                                    cached: true,
+                                    n: depth + 1,
+                                },
+                            );
+                        } else {
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Ins {
+                                    cached: true,
+                                    n: depth + 1,
+                                },
+                            );
+                        }
                         Vec::new()
                     }
                     LedgerOp::MerkleTreeIsFull | LedgerOp::HistoricMerkleTreeIsFull => {
@@ -3390,31 +3615,61 @@ impl<'a> CircuitLowerer<'a> {
                         );
                         vec![CircuitVal::Var(out)]
                     }
-                    LedgerOp::HistoricMerkleTreeInsert => {
+                    LedgerOp::HistoricMerkleTreeInsert
+                    | LedgerOp::HistoricMerkleTreeInsertHash
+                    | LedgerOp::HistoricMerkleTreeInsertIndex
+                    | LedgerOp::HistoricMerkleTreeInsertHashIndex
+                    | LedgerOp::HistoricMerkleTreeInsertIndexDefault => {
                         let LedgerAdt::HistoricMerkleTree { value: elem_ty, .. } = target_adt
                         else {
-                            unreachable!("sema validated HistoricMerkleTreeInsert target");
+                            unreachable!("sema validated HistoricMerkleTree insert target");
                         };
-                        let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
-                        let raw_item_vals = self.lower_expr(&args[0], param_vals, locals, guard);
-                        let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
-                        let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
-                        leaf_align.extend(alignment);
-                        let mut hash_inputs = bytes_to_wires(b"mdn:lh");
-                        hash_inputs.extend(item_vals);
+                        let hash_pair: Vec<CircuitVal> = match op {
+                            LedgerOp::HistoricMerkleTreeInsertHash
+                            | LedgerOp::HistoricMerkleTreeInsertHashIndex => {
+                                self.lower_expr(&args[0], param_vals, locals, guard)
+                            }
+                            _ => {
+                                let alignment = AlignmentAtom::alignment_of(self.program, elem_ty);
+                                let raw_item_vals =
+                                    if *op == LedgerOp::HistoricMerkleTreeInsertIndexDefault {
+                                        self.lower_default(elem_ty)
+                                    } else {
+                                        self.lower_expr(&args[0], param_vals, locals, guard)
+                                    };
+                                let item_vals = self.encode_to_native_wires(elem_ty, raw_item_vals);
+                                let mut leaf_align = vec![AlignmentAtom::Bytes(6)];
+                                leaf_align.extend(alignment);
+                                let mut hash_inputs = bytes_to_wires(b"mdn:lh");
+                                hash_inputs.extend(item_vals);
 
-                        let bytes_var = self.fresh_var("bytes");
-                        self.instructions.push(CircuitInstr::PersistentHash {
-                            alignment: leaf_align,
-                            inputs: hash_inputs,
-                            output: bytes_var,
-                        });
-                        let lo = self.fresh_var("hash");
-                        let hi = self.fresh_var("hash");
-                        self.instructions.push(CircuitInstr::BytesIntoNatives {
-                            bytes: bytes_var,
-                            outputs: vec![lo, hi],
-                        });
+                                let bytes_var = self.fresh_var("bytes");
+                                self.instructions.push(CircuitInstr::PersistentHash {
+                                    alignment: leaf_align,
+                                    inputs: hash_inputs,
+                                    output: bytes_var,
+                                });
+                                let lo = self.fresh_var("hash");
+                                let hi = self.fresh_var("hash");
+                                self.instructions.push(CircuitInstr::BytesIntoNatives {
+                                    bytes: bytes_var,
+                                    outputs: vec![lo, hi],
+                                });
+                                vec![CircuitVal::Var(hi), CircuitVal::Var(lo)]
+                            }
+                        };
+                        let explicit_idx: Option<CircuitVal> = match op {
+                            LedgerOp::HistoricMerkleTreeInsertIndex
+                            | LedgerOp::HistoricMerkleTreeInsertHashIndex => self
+                                .lower_expr(&args[1], param_vals, locals, guard)
+                                .into_iter()
+                                .next(),
+                            LedgerOp::HistoricMerkleTreeInsertIndexDefault => self
+                                .lower_expr(&args[0], param_vals, locals, guard)
+                                .into_iter()
+                                .next(),
+                            _ => None,
+                        };
 
                         self.emit_impact(
                             guard,
@@ -3432,22 +3687,35 @@ impl<'a> CircuitLowerer<'a> {
                                 path: vec![PathSegment::Static(0)],
                             },
                         );
-                        self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Idx {
-                                cached: false,
-                                push_path: false,
-                                path: vec![PathSegment::Static(1)],
-                            },
-                        );
+                        if let Some(idx_val) = explicit_idx {
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Push {
+                                    storage: false,
+                                    value: ImpactStateValue::Cell {
+                                        alignment: vec![AlignmentAtom::Bytes(8)],
+                                        values: vec![idx_val],
+                                    },
+                                },
+                            );
+                        } else {
+                            self.emit_impact(guard, ImpactVmOp::Dup { n: 2 });
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Idx {
+                                    cached: false,
+                                    push_path: false,
+                                    path: vec![PathSegment::Static(1)],
+                                },
+                            );
+                        }
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Push {
                                 storage: true,
                                 value: ImpactStateValue::Cell {
                                     alignment: vec![AlignmentAtom::Bytes(32)],
-                                    values: vec![CircuitVal::Var(hi), CircuitVal::Var(lo)],
+                                    values: hash_pair,
                                 },
                             },
                         );
@@ -3459,21 +3727,27 @@ impl<'a> CircuitLowerer<'a> {
                             },
                         );
                         self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Idx {
-                                cached: false,
-                                push_path: true,
-                                path: vec![PathSegment::Static(1)],
-                            },
-                        );
-                        self.emit_impact(
-                            guard,
-                            ImpactVmOp::Addi {
-                                immediate: CircuitVal::Imm(1),
-                            },
-                        );
-                        self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        if matches!(
+                            op,
+                            LedgerOp::HistoricMerkleTreeInsert
+                                | LedgerOp::HistoricMerkleTreeInsertHash
+                        ) {
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Idx {
+                                    cached: false,
+                                    push_path: true,
+                                    path: vec![PathSegment::Static(1)],
+                                },
+                            );
+                            self.emit_impact(
+                                guard,
+                                ImpactVmOp::Addi {
+                                    immediate: CircuitVal::Imm(1),
+                                },
+                            );
+                            self.emit_impact(guard, ImpactVmOp::Ins { cached: true, n: 1 });
+                        }
                         self.emit_impact(
                             guard,
                             ImpactVmOp::Idx {
@@ -3512,6 +3786,17 @@ impl<'a> CircuitLowerer<'a> {
                                 cached: true,
                                 n: depth + 1,
                             },
+                        );
+                        Vec::new()
+                    }
+                    LedgerOp::HistoricMerkleTreeResetHistory => {
+                        let mut hist_path = full_path;
+                        hist_path.push(PathSegment::Static(2));
+                        self.emit_write_at_path(
+                            hist_path,
+                            ImpactStateValue::EmptyMap,
+                            false,
+                            guard,
                         );
                         Vec::new()
                     }

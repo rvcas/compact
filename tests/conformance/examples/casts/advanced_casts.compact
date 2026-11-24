@@ -1,0 +1,330 @@
+// This file is part of Compact.
+// Copyright (C) 2025 Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import CompactStandardLibrary;
+
+export ledger enum_to_uint_results: Vector<3, Uint<8>>;
+export ledger enum_to_field_results: Vector<3, Field>;
+export ledger uint_to_enum_casts: Boolean;
+export ledger field_to_enum_casts: Boolean;
+export ledger tuple_to_tuple_results: [Uint<16>, Uint<32>, Uint<64>, Uint<128>];
+export ledger tuple_to_vector_results: Vector<3, Uint<8>>;
+
+export ledger test1_result: Field;
+
+export ledger test5_result: Bytes<3>;
+export ledger test8_result: Field;
+export ledger test8_result2: Field;
+
+enum Test4Enum {
+    A, B, C
+}
+
+export ledger test1_var: Map<Field, Test4Enum>;
+
+// Test1: Enum to Uint casting
+export circuit test1(): Vector<3, Uint<8>> {
+    const uint_a = Test4Enum.A as Uint<8>;
+    const uint_b = Test4Enum.B as Uint<8>;
+    const uint_c = Test4Enum.C as Uint<8>;
+
+    const uint_d = (uint_a + uint_b + uint_c) as Test4Enum;
+    test1_var.insert(1 as Field, uint_d);
+    const p = (test1_var.lookup(1 as Field) as Uint<16>) * (test1_var.lookup(1 as Field) as Uint<16>);
+
+    test1_result = (uint_d as Field) + (1 as Field) as Boolean as Field;
+
+    enum_to_uint_results = [uint_a, uint_b, uint_c] as Vector<3, Uint<8>>;
+    return enum_to_uint_results;
+}
+
+// Test2: Enum to Field casting
+export circuit test2(): Vector<3, Field> {
+    const field_0 = Test4Enum.A as Field;
+    const field_1 = Test4Enum.B as Field;
+    const field_2 = Test4Enum.C as Field;
+
+    enum_to_field_results = [field_0, field_1, field_2] as Vector<3, Field>;
+    return enum_to_field_results;
+}
+
+// Test3: Uint to Enum casting
+export circuit test3(): Boolean {
+    const enum_0: Uint<8> = 0;
+    const cast_0 = enum_0 as Test4Enum;
+
+    const enum_1: Uint<8> = 1;
+    const cast_1 = enum_1 as Test4Enum;
+
+    const enum_2: Uint<8> = 2;
+    const cast_2 = enum_2 as Test4Enum;
+
+    // why these works - fails at runtime
+    const enum_3: Uint<8> = 3;
+    const cast_3 = enum_3 as Test4Enum;
+
+    const enum_4: Uint<8> = 4;
+    const cast_4 = enum_4 as Test4Enum;
+
+    assert(cast_0 == Test4Enum.A, "Should be equal");
+    assert(cast_1 == Test4Enum.B, "Should be equal");
+    assert(cast_2 == Test4Enum.C, "Should be equal");
+
+    uint_to_enum_casts = true;
+    return uint_to_enum_casts;
+}
+
+// Test4: Field to Enum casting
+export circuit test4(): Boolean {
+    const enum_0: Field = 0 as Field;
+    const cast_0 = enum_0 as Test4Enum;
+
+    const enum_1: Field = 1 as Field;
+    const cast_1 = enum_1 as Test4Enum;
+
+    const enum_2: Field = 2 as Field;
+    const cast_2 = enum_2 as Test4Enum;
+
+    // why these works - fails at runtime
+    const enum_3: Field = 3 as Field;
+    const cast_3 = enum_3 as Test4Enum;
+
+    const enum_4: Field = 4 as Field;
+    const cast_4 = enum_4 as Test4Enum;
+
+    assert(cast_0 == Test4Enum.A, "Should be equal");
+    assert(cast_1 == Test4Enum.B, "Should be equal");
+    assert(cast_2 == Test4Enum.C, "Should be equal");
+
+    field_to_enum_casts = true;
+    return field_to_enum_casts;
+}
+
+// Test5: Tuple to Tuple casting
+export circuit test5(): [Uint<16>, Uint<32>, Uint<64>, Uint<128>] {
+
+    const original_tuple = [100 as Uint<8>, 1000 as Uint<16>, 10000 as Uint<32>, 100000 as Uint<64>];
+    const cast_tuple = original_tuple as [Uint<16>, Uint<32>, Uint<64>, Uint<128>];
+
+    test5_result = (([1,2,3] as Bytes<3> as Field) * (Bytes[1] as Field)) as Bytes<3>;
+    const test5_cast = test5_result as [Uint<9>, Uint<11>, Uint<13>];
+
+    tuple_to_tuple_results = cast_tuple;
+    return cast_tuple;
+}
+
+// Test6: Tuple to Vector casting
+export circuit test6(): Vector<3, Uint<8>> {
+
+    const tuple_data = [10 as Uint<8>, 20 as Uint<8>, 30 as Uint<8>];
+    const vector_result = tuple_data as Vector<3, Uint<8>>;
+
+    tuple_to_vector_results = vector_result;
+    return tuple_to_vector_results;
+}
+
+module M1_Test7 {
+    export struct TestStruct {
+        a: Field,
+        b: Boolean,
+        c: Vector<4, Uint<8>>
+    }
+
+    export struct TestStruct2 {
+        a: Field,
+        b: Field,
+        c: TestStruct,
+        d: Vector<1, Field>
+    }
+}
+
+module M2_Test7 {
+    export struct TestStruct {
+        a: Field,
+        b: Boolean,
+        c: Vector<4, Uint<8>>
+    }
+
+    export struct TestStruct2 {
+        a: Field,
+        b: Field,
+        c: TestStruct,
+        d: Vector<1, Field>
+    }
+}
+
+module M3_Test7 {
+    export struct TestStruct1 {
+        a1: Field,
+        b1: Boolean,
+        c1: Vector<4, Uint<8>>
+    }
+
+    export struct TestStruct {
+        a: Field,
+        b: Boolean,
+        c: Vector<4, Uint<8>>
+    }
+
+    export struct TestStruct2 {
+        a: Field,
+        b: Field,
+        c: TestStruct,
+        d: Vector<1, Field>
+    }
+}
+
+import M1_Test7 prefix $M1_Test7;
+import M2_Test7 prefix $M2_Test7;
+import M3_Test7 prefix $M3_Test7;
+
+export ledger fancy_struct: $M1_Test7TestStruct;
+export ledger fancy_struct2: $M2_Test7TestStruct;
+export ledger fancy_struct3: $M1_Test7TestStruct2;
+
+// Test7: Struct to Struct casting
+export circuit test7(m1_struct: $M1_Test7TestStruct, m2_struct: $M2_Test7TestStruct, m1_struct2: $M1_Test7TestStruct2): $M2_Test7TestStruct {
+    fancy_struct = disclose(m1_struct) as $M2_Test7TestStruct;
+    // fancy_struct2 = disclose(m2_struct) as $M3_Test7TestStruct1;
+    fancy_struct2 = disclose(m2_struct) as $M3_Test7TestStruct;
+
+    // const a = fancy_struct as $M3_Test7TestStruct as Field;
+
+    fancy_struct3 = disclose(m1_struct2) as $M3_Test7TestStruct2;
+    const p = fancy_struct3.c as $M1_Test7TestStruct;
+    const g = fancy_struct3.c as $M2_Test7TestStruct;
+
+    for(const i of [p as $M1_Test7TestStruct, g as $M2_Test7TestStruct]) {
+      const z = i.a + i.a;
+    }
+
+    return fancy_struct;
+}
+
+module M1_Test8 {
+    export enum TestEnum {
+        A, B, C
+    }
+}
+
+module M2_Test8 {
+    export enum TestEnum {
+        A, B, C
+    }
+}
+
+module M3_Test8 {
+    export enum TestEnum {
+        A, B, C
+    }
+
+    export enum TestEnum2 {
+        E, F, G
+    }
+}
+
+import M1_Test8 prefix $M1_Test8;
+import M2_Test8 prefix $M2_Test8;
+import M3_Test8 prefix $M3_Test8;
+
+export ledger fancy_enum: $M1_Test8TestEnum;
+export ledger fancy_enum2: $M3_Test8TestEnum;
+export ledger fancy_enum3: $M3_Test8TestEnum2;
+
+// Test8: Enum to enum casting
+export circuit test8(m1_enum: $M1_Test8TestEnum, m2_enum: $M1_Test8TestEnum): $M2_Test8TestEnum {
+    fancy_enum = disclose(m1_enum) as $M2_Test8TestEnum;
+    // fancy_enum2 = disclose(m2_enum) as $M3_Test8TestEnum2;
+    fancy_enum2 = disclose(m2_enum) as $M3_Test8TestEnum;
+
+    const fancy_enum3 = fancy_enum2 as $M2_Test8TestEnum as $M1_Test8TestEnum as $M3_Test8TestEnum;
+    test8_result = ((fancy_enum3 as Field) + (fancy_enum3 as Uint<64>) * (fancy_enum3 as Field)) as Field;
+
+    test8_result2 = fancy_enum3 as Uint<32> as Field;
+
+    return fancy_enum;
+}
+
+// commented for now
+// module M1_Test10 {
+//    export ledger tc: TestContract;
+//
+//    export contract TestContract {
+//        circuit testA(a: Field, b: Field, c: Field): Field;
+//        circuit testB(a: Uint<8>, b: Uint<8>, c: Uint<8>): Uint<16>;
+//    }
+// }
+
+// module M2_Test10 {
+//    export ledger tc: TestContract;
+//
+//    export contract TestContract {
+//        circuit testA(a: Field, b: Field, c: Field): Field;
+//        circuit testB(a: Uint<8>, b: Uint<8>, c: Uint<8>): Uint<16>;
+//    }
+// }
+
+// import M1_Test10 prefix $M1_Test10;
+// import M2_Test10 prefix $M2_Test10;
+
+// Test10: Contract to contract casting
+// export circuit test10(): [] {
+
+    // const m1_contract = $M1_Test10tc;
+    // const m2_contract = $M2_Test10tc;
+
+    // convert contract m1 to m2
+    // const fancy_contract_one = disclose(m1_contract) as $M2_Test10TestContract;
+    // const fancy_contract_two = disclose(m2_contract) as $M1_Test10TestContract;
+
+//     return [];
+// }
+
+circuit returnBytes9(): Bytes<1> {
+    return Bytes[1];
+}
+
+circuit returnVector9(flag: Boolean): Vector<1, Bytes<1>> {
+    return [flag ? returnBytes9() : 2 as Bytes<1>];
+}
+
+circuit returnTuple9(): [Uint<1>, Bytes<1>] {
+    return [1 as Uint<1>, returnBytes9()];
+}
+
+circuit returnBytes9(flag: Boolean): Bytes<5> {
+    return flag ? Bytes[1,2,3,4,5] : Bytes[0,0,0,0,0];
+}
+
+circuit returnFancyVector9(flag: Boolean): [Vector<3, Field>, Vector<4, Field>] {
+    return flag ? [[1 as Field, 2 as Field, 3 as Field], default<Vector<4, Field>>] : [default<Vector<3, Field>>, [1 as Field, 2 as Field, 3 as Field, 4 as Field]];
+}
+
+// Test9: Some mixed stuff
+export circuit test9(): [] {
+    const a = Bytes[] as Vector<0, Uint<9>>;
+    const b = (0 as Uint<1>) as Bytes<1>;
+    const c = [1, 2, ...returnBytes9()] as Vector<3, Uint<9>>;
+    const d = returnVector9(true) as Vector<1, Bytes<1>>;
+    const f = returnTuple9() as [Uint<1>, Bytes<1>];
+    const g = Bytes[1,2,3,4,5] as Vector<5, Uint<9>>;
+
+    const z = default<Uint<248>> as Uint<128> as Uint<64> as Uint<32> as Uint<16> as Uint<8> as Uint<4> as Uint<2> as Uint<1>;
+    const x = 1 as Uint<1> as Uint<2> as Uint<4> as Uint<8> as Uint<16> as Uint<32> as Uint<64>;
+
+    const h = returnFancyVector9(true) as [Vector<3, Field>, Vector<4, Field>];
+
+    const y = default<Uint<7>> as Uint<3>;
+}

@@ -10,6 +10,7 @@ use compact_span::{SourceFile, Span};
 struct WitnessOrigin {
     description: String,
     span: Span,
+    is_witness: bool,
 }
 
 /// Abstract taint set for witness-protection-program (WPP) tracking.
@@ -27,7 +28,32 @@ impl Taint {
 
     fn single(description: String, span: Span) -> Self {
         Self {
-            origins: vec![WitnessOrigin { description, span }],
+            origins: vec![WitnessOrigin {
+                description,
+                span,
+                is_witness: false,
+            }],
+        }
+    }
+
+    fn single_witness(description: String, span: Span) -> Self {
+        Self {
+            origins: vec![WitnessOrigin {
+                description,
+                span,
+                is_witness: true,
+            }],
+        }
+    }
+
+    fn witness_only(&self) -> Self {
+        Self {
+            origins: self
+                .origins
+                .iter()
+                .filter(|o| o.is_witness)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -87,7 +113,15 @@ pub fn check_witness_disclosure(
                 )
             })
             .collect();
-        let _ = checker.check_stmts(&circuit.body, &param_taints, &Taint::clean());
+        let ret_taint = checker.check_stmts(&circuit.body, &param_taints, &Taint::clean());
+        let witness_ret = ret_taint.witness_only();
+        if witness_ret.is_tainted() {
+            checker.report_disclosure(
+                circuit.span,
+                &witness_ret,
+                &format!("return value of exported circuit `{}`", circuit.name),
+            );
+        }
     }
 }
 
@@ -108,6 +142,7 @@ impl<'a> WitnessChecker<'a> {
                     first.description
                 ),
             )
+            .with_primary_label("undisclosed witness value used here")
             .with_secondary_label(first.span, "private witness value originates here")
             .with_help("wrap the value explicitly in `disclose(...)` if publishing it is intentional");
             self.diagnostics.push(diag);
@@ -313,18 +348,15 @@ impl<'a> WitnessChecker<'a> {
                     let _ = self.check_expr(a, param_taints, locals, guard_taint);
                 }
                 let w = self.program.witness(*witness);
-                Taint::single(format!("return value of witness `{}`", w.name), expr.span)
+                Taint::single_witness(format!("return value of witness `{}`", w.name), expr.span)
             }
             ExprKind::NativeWitness { kind, args } => {
                 for a in args {
                     let _ = self.check_expr(a, param_taints, locals, guard_taint);
                 }
                 match kind {
-                    compact_hir::NativeWitnessKind::OwnPublicKey => Taint::single(
-                        "return value of native witness `ownPublicKey`".to_owned(),
-                        expr.span,
-                    ),
-                    compact_hir::NativeWitnessKind::CreateZswapInput
+                    compact_hir::NativeWitnessKind::OwnPublicKey
+                    | compact_hir::NativeWitnessKind::CreateZswapInput
                     | compact_hir::NativeWitnessKind::CreateZswapOutput => Taint::clean(),
                 }
             }

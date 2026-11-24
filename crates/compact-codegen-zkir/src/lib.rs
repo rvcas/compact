@@ -903,7 +903,8 @@ mod tests {
               return p.first;
             }
 
-            export circuit inspect(v: Vector<3, Field>, idx: Uint<8>, raw: Bytes<8>): [Field, Vector<2, Field>, Tag<4>] {
+            export circuit inspect(v: Vector<3, Field>, raw: Bytes<8>): [Field, Vector<2, Field>, Tag<4>] {
+              const idx = 2;
               const p: Pair<Field, Field> = Pair<Field, Field>{ first: v[0], second: v[idx] };
               const head = slice<2>(v, 0);
               const tag: Tag<4> = slice<4>(raw, 2) as Tag<4>;
