@@ -12,6 +12,9 @@ pub struct StructId(pub u32);
 pub struct NewTypeId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContractId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LedgerFieldId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,9 +114,11 @@ pub enum LedgerOp {
     ListIsEmpty,
     ListResetToDefault,
     MerkleTreeInsert,
+    MerkleTreeIsFull,
     MerkleTreeCheckRoot,
     MerkleTreeResetToDefault,
     HistoricMerkleTreeInsert,
+    HistoricMerkleTreeIsFull,
     HistoricMerkleTreeCheckRoot,
     HistoricMerkleTreeResetToDefault,
     KernelSelf,
@@ -157,6 +162,7 @@ impl LedgerOp {
             Self::ListPopFront => "popFront",
             Self::ListHead => "head",
             Self::ListLength => "length",
+            Self::MerkleTreeIsFull | Self::HistoricMerkleTreeIsFull => "isFull",
             Self::MerkleTreeCheckRoot | Self::HistoricMerkleTreeCheckRoot => "checkRoot",
             Self::CellResetToDefault
             | Self::CounterResetToDefault
@@ -356,6 +362,9 @@ pub enum Type {
     /// Nominal user-defined `new type Name = Inner;` distinct during type checking,
     /// with the same wire representation as `Inner`.
     NewType(NewTypeId),
+    /// External contract interface reference (`contract Foo { ... }`), represented on-chain
+    /// and in ZKIR as a 32-byte `ContractAddress`.
+    Contract(ContractId),
     /// Standard-library `Maybe<T> { is_some: Boolean, value: T }`.
     Maybe(Box<Type>),
     /// Standard-library `Either<A, B> { is_left: Boolean, left: A, right: B }`.
@@ -408,6 +417,24 @@ pub struct NewTypeDecl {
     pub id: NewTypeId,
     pub name: String,
     pub inner: Type,
+    pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractCircuitSig {
+    pub name: String,
+    pub pure: bool,
+    pub params: Vec<Param>,
+    pub ret_type: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractDecl {
+    pub id: ContractId,
+    pub name: String,
+    pub circuits: Vec<ContractCircuitSig>,
     pub exported: bool,
     pub span: Span,
 }
@@ -538,6 +565,33 @@ pub enum ExprKind {
     CircuitCall {
         circuit: CircuitId,
         args: Vec<Expr>,
+    },
+    /// Cross-contract call (`receiver.method(args...)`).
+    ContractCall {
+        contract: ContractId,
+        receiver: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
+    /// Event emission (`emit(event_struct)`), lowering to an Impact VM `log` (`0x09`) instruction.
+    Emit {
+        event_name: String,
+        event_tag: u8,
+        payload_len: u32,
+        event_ty: Type,
+        value: Box<Expr>,
+    },
+    /// Deterministic serialization (`serialize<len, T>(value) -> Bytes<len>`).
+    Serialize {
+        len: u32,
+        input_ty: Type,
+        value: Box<Expr>,
+    },
+    /// Deterministic deserialization (`deserialize<len, T>(bytes) -> T`).
+    Deserialize {
+        len: u32,
+        target_ty: Type,
+        bytes: Box<Expr>,
     },
     LedgerCall {
         field: LedgerFieldId,
@@ -709,6 +763,7 @@ pub struct Program {
     pub enums: Vec<EnumDecl>,
     pub structs: Vec<StructDecl>,
     pub new_types: Vec<NewTypeDecl>,
+    pub contracts: Vec<ContractDecl>,
     pub ledger_fields: Vec<LedgerField>,
     pub witnesses: Vec<WitnessDecl>,
     pub constructor: Option<Constructor>,
@@ -728,6 +783,10 @@ impl Program {
 
     pub fn new_type_decl(&self, id: NewTypeId) -> &NewTypeDecl {
         &self.new_types[id.0 as usize]
+    }
+
+    pub fn contract_decl(&self, id: ContractId) -> &ContractDecl {
+        &self.contracts[id.0 as usize]
     }
 
     /// Peel any layers of nominal `new type` wrappers to obtain the representation type.
@@ -806,6 +865,7 @@ impl Program {
             Type::Enum(id) => self.enum_decl(*id).name.clone(),
             Type::Struct(id) => self.struct_decl(*id).name.clone(),
             Type::NewType(id) => self.new_type_decl(*id).name.clone(),
+            Type::Contract(id) => self.contract_decl(*id).name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
             Type::Either(left, right) => format!(
                 "Either<{}, {}>",

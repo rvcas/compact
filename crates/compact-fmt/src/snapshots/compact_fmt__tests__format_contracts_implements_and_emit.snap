@@ -1,0 +1,27 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+import CompactStandardLibrary;
+export contract Inner{circuit add(v:Field):Field;circuit ping():[];}
+contract Empty{}
+contract implements Empty;
+export ledger inner:Inner;
+export circuit go(n:Bytes<32>):Field{emit(ShieldedSpend{nullifier:disclose(n)});return inner.add(1);}
+===
+import CompactStandardLibrary;
+
+export contract Inner {
+  circuit add(v: Field): Field;
+  circuit ping(): [];
+}
+
+contract Empty { }
+
+contract implements Empty;
+
+export ledger inner: Inner;
+
+export circuit go(n: Bytes<32>): Field {
+  emit(ShieldedSpend{ nullifier: disclose(n) });
+  return inner.add(1);
+}

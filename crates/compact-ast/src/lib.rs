@@ -78,7 +78,9 @@ pub enum TokenTag {
     Default,
     As,
     Contract,
+    Implements,
     Constructor,
+    Emit,
 
     // Identifiers and literals
     Ident,
@@ -153,7 +155,9 @@ impl TokenTag {
             Self::Default => "default",
             Self::As => "as",
             Self::Contract => "contract",
+            Self::Implements => "implements",
             Self::Constructor => "constructor",
+            Self::Emit => "emit",
             Self::Ident => "identifier",
             Self::Nat => "integer literal",
             Self::String => "string literal",
@@ -272,6 +276,16 @@ pub enum NodeTag {
     StructDecl,
     /// `<name>: <type>` inside a struct declaration — `main_token = name_tok`, `data = (type_node, 0)`.
     StructField,
+    /// `[export] contract <name> { ([pure] circuit <name>(<params>): <ret>; ...)* }[;]`
+    /// `main_token = contract`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+4] = [name_tok, circuits_start, circuits_end, rbrace_tok]`.
+    ContractDecl,
+    /// `[pure] circuit <name>(<params>): <ret>` inside a `ContractDecl`
+    /// `main_token = circuit`, `data = (extra_start, flags)`,
+    /// `extra_data[extra_start..+4] = [name_tok, params_start, params_end, ret_type_node]`.
+    ContractCircuit,
+    /// `contract implements <type>;` — `main_token = contract`, `data = (type_node, semi_tok)`.
+    ContractImplementsDecl,
     /// `[export] [sealed] ledger <name>: <type>;`
     /// `main_token = ledger`, `data = (extra_start, flags)`,
     /// `extra_data[extra_start..+2] = [name_tok, type_node]`.
@@ -376,6 +390,8 @@ pub enum NodeTag {
     AssertExpr,
     /// `disclose(<expr>)` — `main_token = disclose`, `data = (expr_node, rparen_tok)`.
     DiscloseExpr,
+    /// `emit(<expr>)` — `main_token = emit`, `data = (expr_node, rparen_tok)`.
+    EmitExpr,
     /// Struct literal `<Type> { (<field>: <expr> | ...<expr>), ... }`
     /// `main_token = '{'`, `data = (extra_start, rbrace_tok)`,
     /// `extra_data[extra_start..+3] = [type_node, fields_start, fields_end]`.
@@ -513,6 +529,33 @@ pub struct StructDecl {
 pub struct StructField {
     pub name_token: TokenIndex,
     pub type_node: NodeIndex,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContractDecl {
+    pub contract_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub circuits_start: u32,
+    pub circuits_end: u32,
+    pub rbrace_token: TokenIndex,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContractCircuit {
+    pub circuit_token: TokenIndex,
+    pub name_token: TokenIndex,
+    pub params_start: u32,
+    pub params_end: u32,
+    pub ret_type: NodeIndex,
+    pub pure: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContractImplementsDecl {
+    pub contract_token: TokenIndex,
+    pub type_node: NodeIndex,
+    pub semi_token: TokenIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -920,6 +963,44 @@ impl Ast {
         }
     }
 
+    pub fn contract_decl(&self, node: NodeIndex) -> ContractDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ContractDecl);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ContractDecl {
+            contract_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            circuits_start: self.extra_data[base + 1],
+            circuits_end: self.extra_data[base + 2],
+            rbrace_token: TokenIndex(self.extra_data[base + 3]),
+            exported: (data.rhs & decl_flags::EXPORT) != 0,
+        }
+    }
+
+    pub fn contract_circuit(&self, node: NodeIndex) -> ContractCircuit {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ContractCircuit);
+        let data = self.node_data(node);
+        let base = data.lhs as usize;
+        ContractCircuit {
+            circuit_token: self.node_main_token(node),
+            name_token: TokenIndex(self.extra_data[base]),
+            params_start: self.extra_data[base + 1],
+            params_end: self.extra_data[base + 2],
+            ret_type: NodeIndex(self.extra_data[base + 3]),
+            pure: (data.rhs & decl_flags::PURE) != 0,
+        }
+    }
+
+    pub fn contract_implements_decl(&self, node: NodeIndex) -> ContractImplementsDecl {
+        debug_assert_eq!(self.node_tag(node), NodeTag::ContractImplementsDecl);
+        let data = self.node_data(node);
+        ContractImplementsDecl {
+            contract_token: self.node_main_token(node),
+            type_node: NodeIndex(data.lhs),
+            semi_token: TokenIndex(data.rhs),
+        }
+    }
+
     pub fn if_stmt(&self, node: NodeIndex) -> IfStmt {
         debug_assert_eq!(self.node_tag(node), NodeTag::IfStmt);
         let data = self.node_data(node);
@@ -1252,6 +1333,15 @@ impl Ast {
             NodeTag::StructField | NodeTag::StructLitField => {
                 main.merge(self.node_span(NodeIndex(data.lhs)))
             }
+            NodeTag::ContractDecl => {
+                let decl = self.contract_decl(node);
+                main.merge(self.token_span(decl.rbrace_token))
+            }
+            NodeTag::ContractCircuit => {
+                let cc = self.contract_circuit(node);
+                main.merge(self.node_span(cc.ret_type))
+            }
+            NodeTag::ContractImplementsDecl => main.merge(self.token_span(TokenIndex(data.rhs))),
             NodeTag::Param => {
                 if let Some(ty) = NodeIndex(data.lhs).into_option() {
                     main.merge(self.node_span(ty))
@@ -1372,7 +1462,9 @@ impl Ast {
                 let a = self.assert_expr(node);
                 main.merge(self.token_span(a.rparen_token))
             }
-            NodeTag::DiscloseExpr => main.merge(self.token_span(TokenIndex(data.rhs))),
+            NodeTag::DiscloseExpr | NodeTag::EmitExpr => {
+                main.merge(self.token_span(TokenIndex(data.rhs)))
+            }
             NodeTag::StructLitExpr => {
                 let lit = self.struct_lit_expr(node);
                 self.node_span(lit.type_node)
@@ -1582,6 +1674,38 @@ impl Ast {
                 )
                 .unwrap();
                 self.dump_node(field.type_node, source, indent + 1, out);
+            }
+            NodeTag::ContractDecl => {
+                let decl = self.contract_decl(node);
+                let mods_str = if decl.exported { "[export] " } else { "" };
+                writeln!(
+                    out,
+                    "{pad}ContractDecl {mods_str}{}",
+                    self.token_text(decl.name_token, source)
+                )
+                .unwrap();
+                for cc in self.extra_nodes(decl.circuits_start, decl.circuits_end) {
+                    self.dump_node(cc, source, indent + 1, out);
+                }
+            }
+            NodeTag::ContractCircuit => {
+                let cc = self.contract_circuit(node);
+                let pure_str = if cc.pure { "[pure] " } else { "" };
+                writeln!(
+                    out,
+                    "{pad}ContractCircuit {pure_str}{}",
+                    self.token_text(cc.name_token, source)
+                )
+                .unwrap();
+                for p in self.extra_nodes(cc.params_start, cc.params_end) {
+                    self.dump_node(p, source, indent + 1, out);
+                }
+                self.dump_node(cc.ret_type, source, indent + 1, out);
+            }
+            NodeTag::ContractImplementsDecl => {
+                let decl = self.contract_implements_decl(node);
+                writeln!(out, "{pad}ContractImplementsDecl").unwrap();
+                self.dump_node(decl.type_node, source, indent + 1, out);
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ledger_decl(node);
@@ -1946,6 +2070,10 @@ impl Ast {
             }
             NodeTag::DiscloseExpr => {
                 writeln!(out, "{pad}DiscloseExpr").unwrap();
+                self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
+            }
+            NodeTag::EmitExpr => {
+                writeln!(out, "{pad}EmitExpr").unwrap();
                 self.dump_node(NodeIndex(data.lhs), source, indent + 1, out);
             }
             NodeTag::StructLitExpr => {

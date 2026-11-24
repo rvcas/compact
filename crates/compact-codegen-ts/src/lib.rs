@@ -260,6 +260,23 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 let decl = self.input.program.new_type_decl(*id);
                 self.ts_type_ref(&decl.name, None)
             }
+            Type::Contract(_) => {
+                let mut members = ArenaVec::with_capacity_in(1, self);
+                members.push(TSSignature::new_ts_property_signature(
+                    SPAN,
+                    false,
+                    false,
+                    false,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        SPAN,
+                        self.ident("bytes"),
+                        self,
+                    )),
+                    Some(self.ts_type_annotation(self.ts_type_ref("Uint8Array", None))),
+                    self,
+                ));
+                TSType::new_ts_type_literal(SPAN, members, self)
+            }
             Type::Maybe(inner) => {
                 let mut targs = ArenaVec::with_capacity_in(1, self);
                 targs.push(self.hir_type_to_ts(inner));
@@ -297,6 +314,15 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         visit_expr(a, out);
                     }
                 }
+                ExprKind::ContractCall { receiver, args, .. } => {
+                    visit_expr(receiver, out);
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+                ExprKind::Emit { value, .. } => visit_expr(value, out),
+                ExprKind::Serialize { value, .. } => visit_expr(value, out),
+                ExprKind::Deserialize { bytes, .. } => visit_expr(bytes, out),
                 ExprKind::Tuple(es) | ExprKind::Vector(es) | ExprKind::BytesPack(es) => {
                     for e in es {
                         visit_expr(e, out);
@@ -2078,6 +2104,24 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                 let inner = &self.input.program.new_type_decl(*id).inner;
                 self.default_expr_for_type(span, inner)
             }
+            Type::Contract(_) => {
+                let mut props = ArenaVec::with_capacity_in(1, self);
+                props.push(ObjectPropertyKind::new_object_property(
+                    span,
+                    PropertyKind::Init,
+                    PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                        span,
+                        self.ident("bytes"),
+                        self,
+                    )),
+                    self.default_expr_for_type(span, &Type::Bytes(32)),
+                    false,
+                    false,
+                    false,
+                    self,
+                ));
+                Expression::new_object_expression(span, props, self)
+            }
             Type::Struct(_)
             | Type::Maybe(_)
             | Type::Either(_, _)
@@ -2239,6 +2283,7 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                         self.input.program.underlying_type(&lhs.ty),
                         Type::Bytes(_)
                             | Type::CurvePoint(_)
+                            | Type::Contract(_)
                             | Type::Vector(_, _)
                             | Type::Tuple(_)
                             | Type::Struct(_)
@@ -2926,6 +2971,111 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                     call_args,
                 )
             }
+            ExprKind::ContractCall {
+                contract,
+                receiver,
+                method,
+                args,
+            } => {
+                let decl = self.input.program.contract_decl(*contract);
+                let recv_expr = self.lower_expr(params, receiver, locals);
+                let mut dec_args = ArenaVec::with_capacity_in(1, self);
+                dec_args.push(Argument::from(self.expr_member(span, recv_expr, "bytes")));
+                let callee_addr = self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "decodeContractAddress",
+                    ),
+                    dec_args,
+                );
+                let mut arg_elems = ArenaVec::with_capacity_in(args.len(), self);
+                for a in args {
+                    arg_elems.push(ArrayExpressionElement::from(
+                        self.lower_expr(params, a, locals),
+                    ));
+                }
+                let args_arr = Expression::new_array_expression(span, arg_elems, self);
+                let mut props = ArenaVec::with_capacity_in(5, self);
+                let push_prop = |props: &mut ArenaVec<'a, ObjectPropertyKind<'a>>,
+                                 key: &str,
+                                 val: Expression<'a>| {
+                    props.push(ObjectPropertyKind::new_object_property(
+                        span,
+                        PropertyKind::Init,
+                        PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                            span,
+                            self.ident(key),
+                            self,
+                        )),
+                        val,
+                        false,
+                        false,
+                        false,
+                        self,
+                    ));
+                };
+                push_prop(&mut props, "context", self.expr_ident(span, "context"));
+                push_prop(&mut props, "interfaceName", self.expr_str(span, &decl.name));
+                push_prop(&mut props, "calleeCircuitId", self.expr_str(span, method));
+                push_prop(&mut props, "calleeAddress", callee_addr);
+                push_prop(&mut props, "args", args_arr);
+                let opts = Expression::new_object_expression(span, props, self);
+                let mut call_args = ArenaVec::with_capacity_in(1, self);
+                call_args.push(Argument::from(opts));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "crossContractCall",
+                    ),
+                    call_args,
+                )
+            }
+            ExprKind::Emit {
+                event_tag,
+                payload_len,
+                value,
+                ..
+            } => {
+                let mut call_args = ArenaVec::with_capacity_in(5, self);
+                call_args.push(Argument::from(self.expr_ident(span, "context")));
+                call_args.push(Argument::from(self.expr_num(span, 1.0)));
+                call_args.push(Argument::from(self.expr_num(span, *event_tag as f64)));
+                call_args.push(Argument::from(self.expr_num(span, *payload_len as f64)));
+                call_args.push(Argument::from(self.lower_expr(params, value, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "emitEvent"),
+                    call_args,
+                )
+            }
+            ExprKind::Serialize { len, value, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.expr_num(span, *len as f64)));
+                call_args.push(Argument::from(self.lower_expr(params, value, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(span, self.expr_ident(span, "__compactRuntime"), "serialize"),
+                    call_args,
+                )
+            }
+            ExprKind::Deserialize { len, bytes, .. } => {
+                let mut call_args = ArenaVec::with_capacity_in(2, self);
+                call_args.push(Argument::from(self.expr_num(span, *len as f64)));
+                call_args.push(Argument::from(self.lower_expr(params, bytes, locals)));
+                self.expr_call(
+                    span,
+                    self.expr_member(
+                        span,
+                        self.expr_ident(span, "__compactRuntime"),
+                        "deserialize",
+                    ),
+                    call_args,
+                )
+            }
             ExprKind::LedgerCall {
                 field,
                 key_path,
@@ -3046,8 +3196,10 @@ impl<'a, 'b> TsEmitter<'a, 'b> {
                             LedgerOp::ListLength => "listLength",
                             LedgerOp::ListIsEmpty => "listIsEmpty",
                             LedgerOp::MerkleTreeInsert => "merkleTreeInsert",
+                            LedgerOp::MerkleTreeIsFull => "merkleTreeIsFull",
                             LedgerOp::MerkleTreeCheckRoot => "merkleTreeCheckRoot",
                             LedgerOp::HistoricMerkleTreeInsert => "historicMerkleTreeInsert",
+                            LedgerOp::HistoricMerkleTreeIsFull => "historicMerkleTreeIsFull",
                             LedgerOp::HistoricMerkleTreeCheckRoot => "historicMerkleTreeCheckRoot",
                             LedgerOp::CellResetToDefault
                             | LedgerOp::CounterResetToDefault
@@ -3462,6 +3614,14 @@ mod tests {
     fn codegen_crypto_curves_and_signatures() {
         assert_compact_snapshot!(
             file: include_str!("../../../examples/crypto_curves.compact"),
+            compile_ts_bundle
+        );
+    }
+
+    #[test]
+    fn codegen_composable_contracts_and_events() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/composable_events.compact"),
             compile_ts_bundle
         );
     }

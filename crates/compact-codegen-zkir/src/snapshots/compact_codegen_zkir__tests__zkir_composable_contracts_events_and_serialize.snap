@@ -1,0 +1,389 @@
+---
+source: crates/compact-codegen-zkir/src/lib.rs
+---
+pragma language_version >= 0.28;
+
+import CompactStandardLibrary;
+
+export contract Inner {
+  circuit add(value: Field): Field;
+  circuit notify(nullifier: Bytes<32>): [];
+}
+
+contract SelfApi {
+  circuit relay_add(value: Field): Field;
+}
+
+contract implements SelfApi;
+
+export ledger inner: Inner;
+export ledger registry: Map<Field, Inner>;
+export ledger tree: MerkleTree<2, Inner>;
+export ledger last_total: Field;
+
+constructor(initial: Inner) {
+  inner = disclose(initial);
+}
+
+export circuit relay_add(value: Field): Field {
+  const result = inner.add(disclose(value));
+  last_total = result;
+  return result;
+}
+
+export circuit emit_and_forward(nullifier: Bytes<32>, amount: Uint<128>): [] {
+  emit(ShieldedSpend { nullifier: disclose(nullifier) });
+  emit(ShieldedBurn {
+    nullifier: disclose(nullifier),
+    amount: some<Uint<128>>(disclose(amount))
+  });
+  emit(Paused {});
+  inner.notify(disclose(nullifier));
+}
+
+export circuit register_and_call(key: Field, target: Inner, v: Field): Field {
+  registry.insert(disclose(key), disclose(target));
+  tree.insert(disclose(target));
+  assert(!tree.isFull(), "tree full");
+  const saved = registry.lookup(disclose(key));
+  return saved.add(disclose(v));
+}
+
+export circuit roundtrip_serialize(x: Uint<32>, flag: Boolean): [Uint<32>, Boolean] {
+  const raw = serialize<8, [Uint<32>, Boolean]>([x, flag]);
+  const [rx, rflag] = deserialize<8, [Uint<32>, Boolean]>(raw);
+  last_total = disclose(rx as Field);
+  return [rx, rflag];
+}
+===
+=== relay_add.zkir ===
+{
+  "version": {"major":3,"minor":1},
+  "do_communications_commitment": true,
+  "inputs": [
+    {"name":"%value.0","type":"Scalar<BLS12-381>"}
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%inner.1"},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%inner.2"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0c","0x01","0x20","%inner.1","%inner.2"]},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%result.3"},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%cc_rand.4"},
+    {"op":"transient_hash","inputs":["%cc_rand.4","%value.0","%result.3"],"output":"%comm.5"},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]},
+    {"op":"impact","guard":"0x01","inputs":["0x80","0x01","0x01","0x03"]},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x04"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x03","0x20","0x20","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%inner.1","%inner.2","0x09","0x825fb739fa394b48682db8f0add427f5dc4519e7fcd055651170aa35458d69","%comm.5"]},
+    {"op":"impact","guard":"0x01","inputs":["0x17","0xa0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa2"]},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x03"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%result.3"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"output","vals":["%result.3"]}
+  ]
+}
+
+=== emit_and_forward.zkir ===
+{
+  "version": {"major":3,"minor":1},
+  "do_communications_commitment": true,
+  "inputs": [
+    {"name":"%nullifier.0","type":"Scalar<BLS12-381>"},
+    {"name":"%nullifier.1","type":"Scalar<BLS12-381>"},
+    {"name":"%amount.2","type":"Scalar<BLS12-381>"}
+  ],
+  "outputs": [
+  ],
+  "instructions": [
+    {"op":"constrain_bits","val":"%nullifier.0","bits":8},
+    {"op":"constrain_bits","val":"%nullifier.1","bits":248},
+    {"op":"constrain_bits","val":"%amount.2","bits":128},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x33","0x01","0x01","0x04","0x01","0x01","0x01","0x01","0x00","0x01","0x01","0x20","%nullifier.0","%nullifier.1"]},
+    {"op":"impact","guard":"0x01","inputs":["0x09"]},
+    {"op":"div_mod_power_of_two","val":"%nullifier.1","bits":8,"outputs":["%quo.3","%byte.4"]},
+    {"op":"div_mod_power_of_two","val":"%quo.3","bits":8,"outputs":["%quo.5","%byte.6"]},
+    {"op":"div_mod_power_of_two","val":"%quo.5","bits":8,"outputs":["%quo.7","%byte.8"]},
+    {"op":"div_mod_power_of_two","val":"%quo.7","bits":8,"outputs":["%quo.9","%byte.10"]},
+    {"op":"div_mod_power_of_two","val":"%quo.9","bits":8,"outputs":["%quo.11","%byte.12"]},
+    {"op":"div_mod_power_of_two","val":"%quo.11","bits":8,"outputs":["%quo.13","%byte.14"]},
+    {"op":"div_mod_power_of_two","val":"%quo.13","bits":8,"outputs":["%quo.15","%byte.16"]},
+    {"op":"div_mod_power_of_two","val":"%quo.15","bits":8,"outputs":["%quo.17","%byte.18"]},
+    {"op":"div_mod_power_of_two","val":"%quo.17","bits":8,"outputs":["%quo.19","%byte.20"]},
+    {"op":"div_mod_power_of_two","val":"%quo.19","bits":8,"outputs":["%quo.21","%byte.22"]},
+    {"op":"div_mod_power_of_two","val":"%quo.21","bits":8,"outputs":["%quo.23","%byte.24"]},
+    {"op":"div_mod_power_of_two","val":"%quo.23","bits":8,"outputs":["%quo.25","%byte.26"]},
+    {"op":"div_mod_power_of_two","val":"%quo.25","bits":8,"outputs":["%quo.27","%byte.28"]},
+    {"op":"div_mod_power_of_two","val":"%quo.27","bits":8,"outputs":["%quo.29","%byte.30"]},
+    {"op":"div_mod_power_of_two","val":"%quo.29","bits":8,"outputs":["%quo.31","%byte.32"]},
+    {"op":"div_mod_power_of_two","val":"%quo.31","bits":8,"outputs":["%quo.33","%byte.34"]},
+    {"op":"div_mod_power_of_two","val":"%quo.33","bits":8,"outputs":["%quo.35","%byte.36"]},
+    {"op":"div_mod_power_of_two","val":"%quo.35","bits":8,"outputs":["%quo.37","%byte.38"]},
+    {"op":"div_mod_power_of_two","val":"%quo.37","bits":8,"outputs":["%quo.39","%byte.40"]},
+    {"op":"div_mod_power_of_two","val":"%quo.39","bits":8,"outputs":["%quo.41","%byte.42"]},
+    {"op":"div_mod_power_of_two","val":"%quo.41","bits":8,"outputs":["%quo.43","%byte.44"]},
+    {"op":"div_mod_power_of_two","val":"%quo.43","bits":8,"outputs":["%quo.45","%byte.46"]},
+    {"op":"div_mod_power_of_two","val":"%quo.45","bits":8,"outputs":["%quo.47","%byte.48"]},
+    {"op":"div_mod_power_of_two","val":"%quo.47","bits":8,"outputs":["%quo.49","%byte.50"]},
+    {"op":"div_mod_power_of_two","val":"%quo.49","bits":8,"outputs":["%quo.51","%byte.52"]},
+    {"op":"div_mod_power_of_two","val":"%quo.51","bits":8,"outputs":["%quo.53","%byte.54"]},
+    {"op":"div_mod_power_of_two","val":"%quo.53","bits":8,"outputs":["%quo.55","%byte.56"]},
+    {"op":"div_mod_power_of_two","val":"%quo.55","bits":8,"outputs":["%quo.57","%byte.58"]},
+    {"op":"div_mod_power_of_two","val":"%quo.57","bits":8,"outputs":["%quo.59","%byte.60"]},
+    {"op":"div_mod_power_of_two","val":"%quo.59","bits":8,"outputs":["%quo.61","%byte.62"]},
+    {"op":"div_mod_power_of_two","val":"%amount.2","bits":8,"outputs":["%quo.63","%byte.64"]},
+    {"op":"div_mod_power_of_two","val":"%quo.63","bits":8,"outputs":["%quo.65","%byte.66"]},
+    {"op":"div_mod_power_of_two","val":"%quo.65","bits":8,"outputs":["%quo.67","%byte.68"]},
+    {"op":"div_mod_power_of_two","val":"%quo.67","bits":8,"outputs":["%quo.69","%byte.70"]},
+    {"op":"div_mod_power_of_two","val":"%quo.69","bits":8,"outputs":["%quo.71","%byte.72"]},
+    {"op":"div_mod_power_of_two","val":"%quo.71","bits":8,"outputs":["%quo.73","%byte.74"]},
+    {"op":"div_mod_power_of_two","val":"%quo.73","bits":8,"outputs":["%quo.75","%byte.76"]},
+    {"op":"div_mod_power_of_two","val":"%quo.75","bits":8,"outputs":["%quo.77","%byte.78"]},
+    {"op":"div_mod_power_of_two","val":"%quo.77","bits":8,"outputs":["%quo.79","%byte.80"]},
+    {"op":"div_mod_power_of_two","val":"%quo.79","bits":8,"outputs":["%quo.81","%byte.82"]},
+    {"op":"div_mod_power_of_two","val":"%quo.81","bits":8,"outputs":["%quo.83","%byte.84"]},
+    {"op":"div_mod_power_of_two","val":"%quo.83","bits":8,"outputs":["%quo.85","%byte.86"]},
+    {"op":"div_mod_power_of_two","val":"%quo.85","bits":8,"outputs":["%quo.87","%byte.88"]},
+    {"op":"div_mod_power_of_two","val":"%quo.87","bits":8,"outputs":["%quo.89","%byte.90"]},
+    {"op":"div_mod_power_of_two","val":"%quo.89","bits":8,"outputs":["%quo.91","%byte.92"]},
+    {"op":"mul","a":"%quo.91","b":"0x0001","output":"%t.93"},
+    {"op":"add","a":"%t.93","b":"%byte.92","output":"%t.94"},
+    {"op":"mul","a":"%t.94","b":"0x0001","output":"%t.95"},
+    {"op":"add","a":"%t.95","b":"%byte.90","output":"%t.96"},
+    {"op":"mul","a":"%t.96","b":"0x0001","output":"%t.97"},
+    {"op":"add","a":"%t.97","b":"%byte.88","output":"%t.98"},
+    {"op":"mul","a":"%t.98","b":"0x0001","output":"%t.99"},
+    {"op":"add","a":"%t.99","b":"%byte.86","output":"%t.100"},
+    {"op":"mul","a":"%t.100","b":"0x0001","output":"%t.101"},
+    {"op":"add","a":"%t.101","b":"%byte.84","output":"%t.102"},
+    {"op":"mul","a":"%t.102","b":"0x0001","output":"%t.103"},
+    {"op":"add","a":"%t.103","b":"%byte.82","output":"%t.104"},
+    {"op":"mul","a":"%t.104","b":"0x0001","output":"%t.105"},
+    {"op":"add","a":"%t.105","b":"%byte.80","output":"%t.106"},
+    {"op":"mul","a":"%t.106","b":"0x0001","output":"%t.107"},
+    {"op":"add","a":"%t.107","b":"%byte.78","output":"%t.108"},
+    {"op":"mul","a":"%t.108","b":"0x0001","output":"%t.109"},
+    {"op":"add","a":"%t.109","b":"%byte.76","output":"%t.110"},
+    {"op":"mul","a":"%t.110","b":"0x0001","output":"%t.111"},
+    {"op":"add","a":"%t.111","b":"%byte.74","output":"%t.112"},
+    {"op":"mul","a":"%t.112","b":"0x0001","output":"%t.113"},
+    {"op":"add","a":"%t.113","b":"%byte.72","output":"%t.114"},
+    {"op":"mul","a":"%t.114","b":"0x0001","output":"%t.115"},
+    {"op":"add","a":"%t.115","b":"%byte.70","output":"%t.116"},
+    {"op":"mul","a":"%t.116","b":"0x0001","output":"%t.117"},
+    {"op":"add","a":"%t.117","b":"%byte.68","output":"%t.118"},
+    {"op":"mul","a":"%t.118","b":"0x0001","output":"%t.119"},
+    {"op":"add","a":"%t.119","b":"%byte.66","output":"%t.120"},
+    {"op":"mul","a":"%t.120","b":"0x0001","output":"%t.121"},
+    {"op":"add","a":"%t.121","b":"%byte.64","output":"%t.122"},
+    {"op":"mul","a":"%t.122","b":"0x0001","output":"%t.123"},
+    {"op":"add","a":"%t.123","b":"0x01","output":"%t.124"},
+    {"op":"mul","a":"%t.124","b":"0x0001","output":"%t.125"},
+    {"op":"add","a":"%t.125","b":"%nullifier.0","output":"%t.126"},
+    {"op":"mul","a":"%quo.61","b":"0x0001","output":"%t.127"},
+    {"op":"add","a":"%t.127","b":"%byte.62","output":"%t.128"},
+    {"op":"mul","a":"%t.128","b":"0x0001","output":"%t.129"},
+    {"op":"add","a":"%t.129","b":"%byte.60","output":"%t.130"},
+    {"op":"mul","a":"%t.130","b":"0x0001","output":"%t.131"},
+    {"op":"add","a":"%t.131","b":"%byte.58","output":"%t.132"},
+    {"op":"mul","a":"%t.132","b":"0x0001","output":"%t.133"},
+    {"op":"add","a":"%t.133","b":"%byte.56","output":"%t.134"},
+    {"op":"mul","a":"%t.134","b":"0x0001","output":"%t.135"},
+    {"op":"add","a":"%t.135","b":"%byte.54","output":"%t.136"},
+    {"op":"mul","a":"%t.136","b":"0x0001","output":"%t.137"},
+    {"op":"add","a":"%t.137","b":"%byte.52","output":"%t.138"},
+    {"op":"mul","a":"%t.138","b":"0x0001","output":"%t.139"},
+    {"op":"add","a":"%t.139","b":"%byte.50","output":"%t.140"},
+    {"op":"mul","a":"%t.140","b":"0x0001","output":"%t.141"},
+    {"op":"add","a":"%t.141","b":"%byte.48","output":"%t.142"},
+    {"op":"mul","a":"%t.142","b":"0x0001","output":"%t.143"},
+    {"op":"add","a":"%t.143","b":"%byte.46","output":"%t.144"},
+    {"op":"mul","a":"%t.144","b":"0x0001","output":"%t.145"},
+    {"op":"add","a":"%t.145","b":"%byte.44","output":"%t.146"},
+    {"op":"mul","a":"%t.146","b":"0x0001","output":"%t.147"},
+    {"op":"add","a":"%t.147","b":"%byte.42","output":"%t.148"},
+    {"op":"mul","a":"%t.148","b":"0x0001","output":"%t.149"},
+    {"op":"add","a":"%t.149","b":"%byte.40","output":"%t.150"},
+    {"op":"mul","a":"%t.150","b":"0x0001","output":"%t.151"},
+    {"op":"add","a":"%t.151","b":"%byte.38","output":"%t.152"},
+    {"op":"mul","a":"%t.152","b":"0x0001","output":"%t.153"},
+    {"op":"add","a":"%t.153","b":"%byte.36","output":"%t.154"},
+    {"op":"mul","a":"%t.154","b":"0x0001","output":"%t.155"},
+    {"op":"add","a":"%t.155","b":"%byte.34","output":"%t.156"},
+    {"op":"mul","a":"%t.156","b":"0x0001","output":"%t.157"},
+    {"op":"add","a":"%t.157","b":"%byte.32","output":"%t.158"},
+    {"op":"mul","a":"%t.158","b":"0x0001","output":"%t.159"},
+    {"op":"add","a":"%t.159","b":"%byte.30","output":"%t.160"},
+    {"op":"mul","a":"%t.160","b":"0x0001","output":"%t.161"},
+    {"op":"add","a":"%t.161","b":"%byte.28","output":"%t.162"},
+    {"op":"mul","a":"%t.162","b":"0x0001","output":"%t.163"},
+    {"op":"add","a":"%t.163","b":"%byte.26","output":"%t.164"},
+    {"op":"mul","a":"%t.164","b":"0x0001","output":"%t.165"},
+    {"op":"add","a":"%t.165","b":"%byte.24","output":"%t.166"},
+    {"op":"mul","a":"%t.166","b":"0x0001","output":"%t.167"},
+    {"op":"add","a":"%t.167","b":"%byte.22","output":"%t.168"},
+    {"op":"mul","a":"%t.168","b":"0x0001","output":"%t.169"},
+    {"op":"add","a":"%t.169","b":"%byte.20","output":"%t.170"},
+    {"op":"mul","a":"%t.170","b":"0x0001","output":"%t.171"},
+    {"op":"add","a":"%t.171","b":"%byte.18","output":"%t.172"},
+    {"op":"mul","a":"%t.172","b":"0x0001","output":"%t.173"},
+    {"op":"add","a":"%t.173","b":"%byte.16","output":"%t.174"},
+    {"op":"mul","a":"%t.174","b":"0x0001","output":"%t.175"},
+    {"op":"add","a":"%t.175","b":"%byte.14","output":"%t.176"},
+    {"op":"mul","a":"%t.176","b":"0x0001","output":"%t.177"},
+    {"op":"add","a":"%t.177","b":"%byte.12","output":"%t.178"},
+    {"op":"mul","a":"%t.178","b":"0x0001","output":"%t.179"},
+    {"op":"add","a":"%t.179","b":"%byte.10","output":"%t.180"},
+    {"op":"mul","a":"%t.180","b":"0x0001","output":"%t.181"},
+    {"op":"add","a":"%t.181","b":"%byte.8","output":"%t.182"},
+    {"op":"mul","a":"%t.182","b":"0x0001","output":"%t.183"},
+    {"op":"add","a":"%t.183","b":"%byte.6","output":"%t.184"},
+    {"op":"mul","a":"%t.184","b":"0x0001","output":"%t.185"},
+    {"op":"add","a":"%t.185","b":"%byte.4","output":"%t.186"},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x33","0x01","0x01","0x04","0x01","0x01","0x01","0x01","0x03","0x01","0x01","0x31","%t.126","%t.186"]},
+    {"op":"impact","guard":"0x01","inputs":["0x09"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x33","0x01","0x01","0x04","0x01","0x01","0x01","0x01","0x08","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x09"]},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%inner.187"},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%inner.188"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0c","0x01","0x20","%inner.187","%inner.188"]},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%cc_rand.189"},
+    {"op":"transient_hash","inputs":["%cc_rand.189","%nullifier.0","%nullifier.1"],"output":"%comm.190"},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]},
+    {"op":"impact","guard":"0x01","inputs":["0x80","0x01","0x01","0x03"]},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x04"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x03","0x20","0x20","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%inner.187","%inner.188","0x0c","0x77dd43b2cbdaa5754c629f36c56c9c6e35b322cb308376de00474a4cab8121","%comm.190"]},
+    {"op":"impact","guard":"0x01","inputs":["0x17","0xa0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa2"]},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]}
+  ]
+}
+
+=== register_and_call.zkir ===
+{
+  "version": {"major":3,"minor":1},
+  "do_communications_commitment": true,
+  "inputs": [
+    {"name":"%key.0","type":"Scalar<BLS12-381>"},
+    {"name":"%target.1","type":"Scalar<BLS12-381>"},
+    {"name":"%target.2","type":"Scalar<BLS12-381>"},
+    {"name":"%v.3","type":"Scalar<BLS12-381>"}
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    {"op":"constrain_bits","val":"%target.1","bits":8},
+    {"op":"constrain_bits","val":"%target.2","bits":248},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%key.0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0x20","%target.1","%target.2"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa1"]},
+    {"op":"persistent_hash","alignment":[{"tag":"atom","value":{"tag":"bytes","length":6}},{"tag":"atom","value":{"tag":"bytes","length":32}}],"inputs":["0x6d646e3a6c68","%target.1","%target.2"],"output":"%bytes.4"},
+    {"op":"bytes_into_natives","bytes":"%bytes.4","outputs":["%hash.5","%hash.6"]},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x02"]},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0x32"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0x20","%hash.6","%hash.5"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa1"]},
+    {"op":"impact","guard":"0x01","inputs":["0x70","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0e","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa2"]},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.7"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x02"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x08","0x04"]},
+    {"op":"impact","guard":"0x01","inputs":["0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x08"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0d","0x01","0x01","%t.7"]},
+    {"op":"cond_select","bit":"%t.7","a":"0x00","b":"0x01","output":"%t.8"},
+    {"op":"assert","cond":"%t.8"},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.9"},
+    {"op":"public_input","guard":null,"type":"Scalar<BLS12-381>","output":"%t.10"},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0x01","0x01"]},
+    {"op":"impact","guard":"0x01","inputs":["0x50","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%key.0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x0c","0x01","0x20","%t.9","%t.10"]},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%cc.11"},
+    {"op":"private_input","guard":null,"type":"Scalar<BLS12-381>","output":"%cc_rand.12"},
+    {"op":"transient_hash","inputs":["%cc_rand.12","%v.3","%cc.11"],"output":"%comm.13"},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]},
+    {"op":"impact","guard":"0x01","inputs":["0x80","0x01","0x01","0x03"]},
+    {"op":"impact","guard":"0x01","inputs":["0x30"]},
+    {"op":"impact","guard":"0x01","inputs":["0x04"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x03","0x20","0x20","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%t.9","%t.10","0x09","0x825fb739fa394b48682db8f0add427f5dc4519e7fcd055651170aa35458d69","%comm.13"]},
+    {"op":"impact","guard":"0x01","inputs":["0x17","0xa0"]},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x00"]},
+    {"op":"impact","guard":"0x01","inputs":["0xa2"]},
+    {"op":"impact","guard":"0x01","inputs":["0x40"]},
+    {"op":"output","vals":["%cc.11"]}
+  ]
+}
+
+=== roundtrip_serialize.zkir ===
+{
+  "version": {"major":3,"minor":1},
+  "do_communications_commitment": true,
+  "inputs": [
+    {"name":"%x.0","type":"Scalar<BLS12-381>"},
+    {"name":"%flag.1","type":"Scalar<BLS12-381>"}
+  ],
+  "outputs": [
+    "Scalar<BLS12-381>",
+    "Scalar<BLS12-381>"
+  ],
+  "instructions": [
+    {"op":"constrain_bits","val":"%x.0","bits":32},
+    {"op":"constrain_to_boolean","val":"%flag.1"},
+    {"op":"div_mod_power_of_two","val":"%x.0","bits":8,"outputs":["%quo.2","%byte.3"]},
+    {"op":"div_mod_power_of_two","val":"%quo.2","bits":8,"outputs":["%quo.4","%byte.5"]},
+    {"op":"div_mod_power_of_two","val":"%quo.4","bits":8,"outputs":["%quo.6","%byte.7"]},
+    {"op":"mul","a":"0x00","b":"0x0001","output":"%t.8"},
+    {"op":"add","a":"%t.8","b":"0x00","output":"%t.9"},
+    {"op":"mul","a":"%t.9","b":"0x0001","output":"%t.10"},
+    {"op":"add","a":"%t.10","b":"0x00","output":"%t.11"},
+    {"op":"mul","a":"%t.11","b":"0x0001","output":"%t.12"},
+    {"op":"add","a":"%t.12","b":"%flag.1","output":"%t.13"},
+    {"op":"mul","a":"%t.13","b":"0x0001","output":"%t.14"},
+    {"op":"add","a":"%t.14","b":"%quo.6","output":"%t.15"},
+    {"op":"mul","a":"%t.15","b":"0x0001","output":"%t.16"},
+    {"op":"add","a":"%t.16","b":"%byte.7","output":"%t.17"},
+    {"op":"mul","a":"%t.17","b":"0x0001","output":"%t.18"},
+    {"op":"add","a":"%t.18","b":"%byte.5","output":"%t.19"},
+    {"op":"mul","a":"%t.19","b":"0x0001","output":"%t.20"},
+    {"op":"add","a":"%t.20","b":"%byte.3","output":"%t.21"},
+    {"op":"div_mod_power_of_two","val":"%t.21","bits":8,"outputs":["%quo.22","%byte.23"]},
+    {"op":"div_mod_power_of_two","val":"%quo.22","bits":8,"outputs":["%quo.24","%byte.25"]},
+    {"op":"div_mod_power_of_two","val":"%quo.24","bits":8,"outputs":["%quo.26","%byte.27"]},
+    {"op":"div_mod_power_of_two","val":"%quo.26","bits":8,"outputs":["%quo.28","%byte.29"]},
+    {"op":"div_mod_power_of_two","val":"%quo.28","bits":8,"outputs":["%quo.30","%byte.31"]},
+    {"op":"div_mod_power_of_two","val":"%quo.30","bits":8,"outputs":["%quo.32","%byte.33"]},
+    {"op":"div_mod_power_of_two","val":"%quo.32","bits":8,"outputs":["%quo.34","%byte.35"]},
+    {"op":"mul","a":"%byte.29","b":"0x0001","output":"%t.36"},
+    {"op":"add","a":"%t.36","b":"%byte.27","output":"%t.37"},
+    {"op":"mul","a":"%t.37","b":"0x0001","output":"%t.38"},
+    {"op":"add","a":"%t.38","b":"%byte.25","output":"%t.39"},
+    {"op":"mul","a":"%t.39","b":"0x0001","output":"%t.40"},
+    {"op":"add","a":"%t.40","b":"%byte.23","output":"%t.41"},
+    {"op":"test_eq","a":"%byte.31","b":"0x01","output":"%t.42"},
+    {"op":"impact","guard":"0x01","inputs":["0x10","0x01","0x01","0x01","0x03"]},
+    {"op":"impact","guard":"0x01","inputs":["0x11","0x01","0x01","0xfffffffffefffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed73","%t.41"]},
+    {"op":"impact","guard":"0x01","inputs":["0x91"]},
+    {"op":"output","vals":["%t.41","%t.42"]}
+  ]
+}

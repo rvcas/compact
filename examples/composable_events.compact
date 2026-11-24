@@ -1,0 +1,54 @@
+pragma language_version >= 0.28;
+
+import CompactStandardLibrary;
+
+export contract Inner {
+  circuit add(value: Field): Field;
+  circuit notify(nullifier: Bytes<32>): [];
+}
+
+contract SelfApi {
+  circuit relay_add(value: Field): Field;
+}
+
+contract implements SelfApi;
+
+export ledger inner: Inner;
+export ledger registry: Map<Field, Inner>;
+export ledger tree: MerkleTree<2, Inner>;
+export ledger last_total: Field;
+
+constructor(initial: Inner) {
+  inner = disclose(initial);
+}
+
+export circuit relay_add(value: Field): Field {
+  const result = inner.add(disclose(value));
+  last_total = result;
+  return result;
+}
+
+export circuit emit_and_forward(nullifier: Bytes<32>, amount: Uint<128>): [] {
+  emit(ShieldedSpend { nullifier: disclose(nullifier) });
+  emit(ShieldedBurn {
+    nullifier: disclose(nullifier),
+    amount: some<Uint<128>>(disclose(amount))
+  });
+  emit(Paused {});
+  inner.notify(disclose(nullifier));
+}
+
+export circuit register_and_call(key: Field, target: Inner, v: Field): Field {
+  registry.insert(disclose(key), disclose(target));
+  tree.insert(disclose(target));
+  assert(!tree.isFull(), "tree full");
+  const saved = registry.lookup(disclose(key));
+  return saved.add(disclose(v));
+}
+
+export circuit roundtrip_serialize(x: Uint<32>, flag: Boolean): [Uint<32>, Boolean] {
+  const raw = serialize<8, [Uint<32>, Boolean]>([x, flag]);
+  const [rx, rflag] = deserialize<8, [Uint<32>, Boolean]>(raw);
+  last_total = disclose(rx as Field);
+  return [rx, rflag];
+}

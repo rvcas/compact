@@ -104,6 +104,14 @@ impl<'a> Formatter<'a> {
                     main
                 }
             }
+            NodeTag::ContractDecl => {
+                let d = self.ast.contract_decl(node);
+                if d.exported {
+                    TokenIndex(main.0.saturating_sub(1))
+                } else {
+                    main
+                }
+            }
             NodeTag::WitnessDecl => {
                 let d = self.ast.witness_decl(node);
                 if d.exported {
@@ -373,6 +381,54 @@ impl<'a> Formatter<'a> {
                     self.out.push_str(";\n");
                 }
                 write!(self.out, "{pad}}}").unwrap();
+            }
+            NodeTag::ContractDecl => {
+                let decl = self.ast.contract_decl(node);
+                self.out.push_str(&pad);
+                if decl.exported {
+                    self.out.push_str("export ");
+                }
+                write!(
+                    self.out,
+                    "contract {} {{",
+                    self.ast.token_text(decl.name_token, self.source)
+                )
+                .unwrap();
+                let circuits: Vec<_> = self
+                    .ast
+                    .extra_nodes(decl.circuits_start, decl.circuits_end)
+                    .collect();
+                if circuits.is_empty() {
+                    self.out.push_str(" }");
+                } else {
+                    self.out.push('\n');
+                    for cc_node in circuits {
+                        let cc = self.ast.contract_circuit(cc_node);
+                        self.out.push_str(&pad);
+                        self.out.push_str("  ");
+                        if cc.pure {
+                            self.out.push_str("pure ");
+                        }
+                        write!(
+                            self.out,
+                            "circuit {}(",
+                            self.ast.token_text(cc.name_token, self.source)
+                        )
+                        .unwrap();
+                        self.format_params(cc.params_start, cc.params_end);
+                        self.out.push_str("): ");
+                        self.format_type(cc.ret_type);
+                        self.out.push_str(";\n");
+                    }
+                    write!(self.out, "{pad}}}").unwrap();
+                }
+            }
+            NodeTag::ContractImplementsDecl => {
+                let decl = self.ast.contract_implements_decl(node);
+                self.out.push_str(&pad);
+                self.out.push_str("contract implements ");
+                self.format_type(decl.type_node);
+                self.out.push(';');
             }
             NodeTag::LedgerDecl => {
                 let decl = self.ast.ledger_decl(node);
@@ -744,6 +800,11 @@ impl<'a> Formatter<'a> {
                 self.format_expr(NodeIndex(data.lhs));
                 self.out.push(')');
             }
+            NodeTag::EmitExpr => {
+                self.out.push_str("emit(");
+                self.format_expr(NodeIndex(data.lhs));
+                self.out.push(')');
+            }
             NodeTag::StructLitExpr => {
                 let lit = self.ast.struct_lit_expr(node);
                 self.format_type(lit.type_node);
@@ -987,6 +1048,21 @@ mod tests {
               ops-=1;
               return [next.x+ext[2],rev];
             }
+            "#,
+            fmt
+        );
+    }
+
+    #[test]
+    fn format_contracts_implements_and_emit() {
+        assert_compact_snapshot!(
+            r#"
+            import CompactStandardLibrary;
+            export contract Inner{circuit add(v:Field):Field;circuit ping():[];}
+            contract Empty{}
+            contract implements Empty;
+            export ledger inner:Inner;
+            export circuit go(n:Bytes<32>):Field{emit(ShieldedSpend{nullifier:disclose(n)});return inner.add(1);}
             "#,
             fmt
         );

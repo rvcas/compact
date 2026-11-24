@@ -1,0 +1,365 @@
+---
+source: crates/compact-artifacts/src/lib.rs
+---
+pragma language_version >= 0.28;
+
+import CompactStandardLibrary;
+
+export contract Inner {
+  circuit add(value: Field): Field;
+  circuit notify(nullifier: Bytes<32>): [];
+}
+
+contract SelfApi {
+  circuit relay_add(value: Field): Field;
+}
+
+contract implements SelfApi;
+
+export ledger inner: Inner;
+export ledger registry: Map<Field, Inner>;
+export ledger tree: MerkleTree<2, Inner>;
+export ledger last_total: Field;
+
+constructor(initial: Inner) {
+  inner = disclose(initial);
+}
+
+export circuit relay_add(value: Field): Field {
+  const result = inner.add(disclose(value));
+  last_total = result;
+  return result;
+}
+
+export circuit emit_and_forward(nullifier: Bytes<32>, amount: Uint<128>): [] {
+  emit(ShieldedSpend { nullifier: disclose(nullifier) });
+  emit(ShieldedBurn {
+    nullifier: disclose(nullifier),
+    amount: some<Uint<128>>(disclose(amount))
+  });
+  emit(Paused {});
+  inner.notify(disclose(nullifier));
+}
+
+export circuit register_and_call(key: Field, target: Inner, v: Field): Field {
+  registry.insert(disclose(key), disclose(target));
+  tree.insert(disclose(target));
+  assert(!tree.isFull(), "tree full");
+  const saved = registry.lookup(disclose(key));
+  return saved.add(disclose(v));
+}
+
+export circuit roundtrip_serialize(x: Uint<32>, flag: Boolean): [Uint<32>, Boolean] {
+  const raw = serialize<8, [Uint<32>, Boolean]>([x, flag]);
+  const [rx, rflag] = deserialize<8, [Uint<32>, Boolean]>(raw);
+  last_total = disclose(rx as Field);
+  return [rx, rflag];
+}
+===
+{
+  "compiler-version": "0.36.108-dev",
+  "compiler-commit": "",
+  "language-version": "0.28.0",
+  "runtime-version": "0.15.0",
+  "circuits": [
+    {
+      "name": "relay_add",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "value",
+          "type": {
+            "type-name": "Field"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Field"
+      }
+    },
+    {
+      "name": "emit_and_forward",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "nullifier",
+          "type": {
+            "length": 32,
+            "type-name": "Bytes"
+          }
+        },
+        {
+          "name": "amount",
+          "type": {
+            "maxval": "340282366920938463463374607431768211455",
+            "type-name": "Uint"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": []
+      }
+    },
+    {
+      "name": "register_and_call",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "key",
+          "type": {
+            "type-name": "Field"
+          }
+        },
+        {
+          "name": "target",
+          "type": {
+            "circuits": [
+              {
+                "argument-types": [
+                  {
+                    "type-name": "Field"
+                  }
+                ],
+                "name": "add",
+                "result-type": {
+                  "type-name": "Field"
+                }
+              },
+              {
+                "argument-types": [
+                  {
+                    "length": 32,
+                    "type-name": "Bytes"
+                  }
+                ],
+                "name": "notify",
+                "result-type": {
+                  "type-name": "Tuple",
+                  "types": []
+                }
+              }
+            ],
+            "name": "Inner",
+            "type-name": "Contract"
+          }
+        },
+        {
+          "name": "v",
+          "type": {
+            "type-name": "Field"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Field"
+      }
+    },
+    {
+      "name": "roundtrip_serialize",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "x",
+          "type": {
+            "maxval": "4294967295",
+            "type-name": "Uint"
+          }
+        },
+        {
+          "name": "flag",
+          "type": {
+            "type-name": "Boolean"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+          {
+            "maxval": "4294967295",
+            "type-name": "Uint"
+          },
+          {
+            "type-name": "Boolean"
+          }
+        ]
+      }
+    }
+  ],
+  "witnesses": [],
+  "contracts": [
+    {
+      "circuits": [
+        {
+          "argument-types": [
+            {
+              "type-name": "Field"
+            }
+          ],
+          "name": "add",
+          "result-type": {
+            "type-name": "Field"
+          }
+        },
+        {
+          "argument-types": [
+            {
+              "length": 32,
+              "type-name": "Bytes"
+            }
+          ],
+          "name": "notify",
+          "result-type": {
+            "type-name": "Tuple",
+            "types": []
+          }
+        }
+      ],
+      "name": "Inner"
+    },
+    {
+      "circuits": [
+        {
+          "argument-types": [
+            {
+              "type-name": "Field"
+            }
+          ],
+          "name": "relay_add",
+          "result-type": {
+            "type-name": "Field"
+          }
+        }
+      ],
+      "name": "SelfApi"
+    }
+  ],
+  "ledger": [
+    {
+      "exported": true,
+      "index": 0,
+      "name": "inner",
+      "storage": "Cell",
+      "type": {
+        "circuits": [
+          {
+            "argument-types": [
+              {
+                "type-name": "Field"
+              }
+            ],
+            "name": "add",
+            "result-type": {
+              "type-name": "Field"
+            }
+          },
+          {
+            "argument-types": [
+              {
+                "length": 32,
+                "type-name": "Bytes"
+              }
+            ],
+            "name": "notify",
+            "result-type": {
+              "type-name": "Tuple",
+              "types": []
+            }
+          }
+        ],
+        "name": "Inner",
+        "type-name": "Contract"
+      }
+    },
+    {
+      "exported": true,
+      "index": 1,
+      "key": {
+        "type-name": "Field"
+      },
+      "name": "registry",
+      "storage": "Map",
+      "value": {
+        "circuits": [
+          {
+            "argument-types": [
+              {
+                "type-name": "Field"
+              }
+            ],
+            "name": "add",
+            "result-type": {
+              "type-name": "Field"
+            }
+          },
+          {
+            "argument-types": [
+              {
+                "length": 32,
+                "type-name": "Bytes"
+              }
+            ],
+            "name": "notify",
+            "result-type": {
+              "type-name": "Tuple",
+              "types": []
+            }
+          }
+        ],
+        "name": "Inner",
+        "type-name": "Contract"
+      }
+    },
+    {
+      "depth": 2,
+      "exported": true,
+      "index": 2,
+      "name": "tree",
+      "storage": "MerkleTree",
+      "type": {
+        "circuits": [
+          {
+            "argument-types": [
+              {
+                "type-name": "Field"
+              }
+            ],
+            "name": "add",
+            "result-type": {
+              "type-name": "Field"
+            }
+          },
+          {
+            "argument-types": [
+              {
+                "length": 32,
+                "type-name": "Bytes"
+              }
+            ],
+            "name": "notify",
+            "result-type": {
+              "type-name": "Tuple",
+              "types": []
+            }
+          }
+        ],
+        "name": "Inner",
+        "type-name": "Contract"
+      }
+    },
+    {
+      "exported": true,
+      "index": 3,
+      "name": "last_total",
+      "storage": "Cell",
+      "type": {
+        "type-name": "Field"
+      }
+    }
+  ]
+}

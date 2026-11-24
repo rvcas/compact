@@ -416,4 +416,62 @@ export circuit ed25519Verify<#n>(
   ]) as Curve25519Scalar;
   return ecMulGenerator(s) == ecAdd(r, ecMul(pk, k));
 }
+
+export struct ShieldedSpend {
+  nullifier: Bytes<32>;
+}
+
+export struct ShieldedReceive {
+  commitment: Bytes<32>;
+  ciphertext: Maybe<Bytes<512>>;
+  contractAddress: Maybe<Bytes<32>>;
+}
+
+export struct ShieldedMint {
+  commitment: Bytes<32>;
+  domainSep: Bytes<32>;
+  amount: Maybe<Uint<128>>;
+}
+
+export struct ShieldedBurn {
+  nullifier: Bytes<32>;
+  amount: Maybe<Uint<128>>;
+}
+
+export struct UnshieldedSpend {
+  sender: Either<ZswapCoinPublicKey, ContractAddress>;
+  domainSep: Bytes<32>;
+  tokenType: Bytes<32>;
+  amount: Uint<128>;
+}
+
+export struct UnshieldedReceive {
+  recipient: Either<ZswapCoinPublicKey, ContractAddress>;
+  domainSep: Bytes<32>;
+  tokenType: Bytes<32>;
+  amount: Uint<128>;
+}
+
+export struct UnshieldedMint {
+  domainSep: Bytes<32>;
+  tokenType: Bytes<32>;
+  amount: Uint<128>;
+}
+
+export struct UnshieldedBurn {
+  sender: Either<ZswapCoinPublicKey, ContractAddress>;
+  tokenType: Bytes<32>;
+  amount: Uint<128>;
+}
+
+export struct Paused {
+}
+
+export struct Unpaused {
+}
+
+export struct Misc {
+  name: Bytes<32>;
+  payload: Bytes<256>;
+}
 "#;

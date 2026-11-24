@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "compact-hir",
  "compact-span",
+ "sha2 0.11.1",
 ]
 
 [[package]]

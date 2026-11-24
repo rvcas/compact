@@ -107,6 +107,9 @@ impl<'a> Parser<'a> {
             TokenTag::Include => self.parse_include_decl(),
             TokenTag::Import => self.parse_import_decl(),
             TokenTag::Export if self.peek_at(1) == TokenTag::LBrace => self.parse_export_list(),
+            TokenTag::Contract if self.peek_at(1) == TokenTag::Implements => {
+                self.parse_contract_implements_decl()
+            }
             TokenTag::Constructor => self.parse_constructor_decl(),
             TokenTag::Export
             | TokenTag::Module
@@ -118,7 +121,8 @@ impl<'a> Parser<'a> {
             | TokenTag::Circuit
             | TokenTag::Witness
             | TokenTag::Enum
-            | TokenTag::Struct => self.parse_decl(),
+            | TokenTag::Struct
+            | TokenTag::Contract => self.parse_decl(),
             other => {
                 let tok = self.current_tok();
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -366,6 +370,7 @@ impl<'a> Parser<'a> {
             TokenTag::Type => self.parse_type_decl(flags),
             TokenTag::Enum => self.parse_enum_decl(flags),
             TokenTag::Struct => self.parse_struct_decl(flags),
+            TokenTag::Contract => self.parse_contract_decl(flags),
             TokenTag::Ledger => self.parse_ledger_decl(flags),
             TokenTag::Witness => self.parse_witness_decl(flags),
             TokenTag::Circuit => self.parse_circuit_decl(flags),
@@ -462,6 +467,65 @@ impl<'a> Parser<'a> {
         Some(self.ast.push_node(
             NodeTag::StructDecl,
             struct_tok,
+            NodeData::new(extra_start, flags),
+        ))
+    }
+
+    fn parse_contract_implements_decl(&mut self) -> Option<NodeIndex> {
+        let contract_tok = self.expect(TokenTag::Contract)?;
+        self.expect(TokenTag::Implements)?;
+        let ty = self.parse_type()?;
+        let semi_tok = self.expect(TokenTag::Semi)?;
+        Some(self.ast.push_node(
+            NodeTag::ContractImplementsDecl,
+            contract_tok,
+            NodeData::new(ty.0, semi_tok.0),
+        ))
+    }
+
+    fn parse_contract_decl(&mut self, flags: u32) -> Option<NodeIndex> {
+        let contract_tok = self.expect(TokenTag::Contract)?;
+        let name_tok = self.expect(TokenTag::Ident)?;
+        self.expect(TokenTag::LBrace)?;
+        let mut circuits = Vec::new();
+        while self.peek() != TokenTag::RBrace && self.peek() != TokenTag::Eof {
+            let mut cflags = decl_flags::NONE;
+            if self.peek() == TokenTag::Pure {
+                self.advance();
+                cflags |= decl_flags::PURE;
+            }
+            let circuit_tok = self.expect(TokenTag::Circuit)?;
+            let cname_tok = self.expect(TokenTag::Ident)?;
+            let params = self.parse_param_list()?;
+            self.expect(TokenTag::Colon)?;
+            let ret_type = self.parse_type()?;
+            let (params_start, params_end) = self.ast.push_extra_slice(&params);
+            let (cc_extra, _) =
+                self.ast
+                    .push_extra_slice(&[cname_tok.0, params_start, params_end, ret_type.0]);
+            let cc_node = self.ast.push_node(
+                NodeTag::ContractCircuit,
+                circuit_tok,
+                NodeData::new(cc_extra, cflags),
+            );
+            circuits.push(cc_node.0);
+            if matches!(self.peek(), TokenTag::Semi | TokenTag::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let rbrace_tok = self.expect(TokenTag::RBrace)?;
+        if self.peek() == TokenTag::Semi {
+            self.advance();
+        }
+        let (cstart, cend) = self.ast.push_extra_slice(&circuits);
+        let (extra_start, _) = self
+            .ast
+            .push_extra_slice(&[name_tok.0, cstart, cend, rbrace_tok.0]);
+        Some(self.ast.push_node(
+            NodeTag::ContractDecl,
+            contract_tok,
             NodeData::new(extra_start, flags),
         ))
     }
@@ -1377,6 +1441,17 @@ impl<'a> Parser<'a> {
                 Some(self.ast.push_node(
                     NodeTag::DiscloseExpr,
                     disclose_tok,
+                    NodeData::new(inner.0, rparen.0),
+                ))
+            }
+            TokenTag::Emit => {
+                let emit_tok = self.advance();
+                self.expect(TokenTag::LParen)?;
+                let inner = self.parse_expr()?;
+                let rparen = self.expect(TokenTag::RParen)?;
+                Some(self.ast.push_node(
+                    NodeTag::EmitExpr,
+                    emit_tok,
                     NodeData::new(inner.0, rparen.0),
                 ))
             }

@@ -938,4 +938,12 @@ mod tests {
             compile_all_zkir
         );
     }
+
+    #[test]
+    fn zkir_composable_contracts_events_and_serialize() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/composable_events.compact"),
+            compile_all_zkir
+        );
+    }
 }

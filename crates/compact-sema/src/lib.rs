@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use compact_ast::{Ast, NodeIndex, NodeTag, TokenIndex, TokenTag};
 use compact_diagnostics::{CompactDiagnostic, DiagnosticBag};
 use compact_hir::{
-    BinaryOp, Circuit, CircuitId, Constructor, CurveFieldKind, CurveKind, EnumDecl, EnumId, Expr,
-    ExprKind, LedgerAdt, LedgerField, LedgerFieldId, LedgerOp, LocalId, NativeWitnessKind,
-    NewTypeDecl, NewTypeId, Param, ParamId, Program, Stmt, StructDecl, StructField, StructId, Type,
-    UnaryOp, WitnessDecl, WitnessId,
+    BinaryOp, Circuit, CircuitId, Constructor, ContractCircuitSig, ContractDecl, ContractId,
+    CurveFieldKind, CurveKind, EnumDecl, EnumId, Expr, ExprKind, LedgerAdt, LedgerField,
+    LedgerFieldId, LedgerOp, LocalId, NativeWitnessKind, NewTypeDecl, NewTypeId, Param, ParamId,
+    Program, Stmt, StructDecl, StructField, StructId, Type, UnaryOp, WitnessDecl, WitnessId,
 };
 use compact_span::{SourceFile, Span};
 
@@ -64,6 +64,8 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         enums: Vec::new(),
         structs: Vec::new(),
         new_types: Vec::new(),
+        contracts: Vec::new(),
+        pending_implements: Vec::new(),
         ledger_fields: Vec::new(),
         witnesses: Vec::new(),
         constructor_node: None,
@@ -92,6 +94,7 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         enums: analyzer.enums,
         structs: analyzer.structs,
         new_types: analyzer.new_types,
+        contracts: analyzer.contracts,
         ledger_fields: analyzer.ledger_fields,
         witnesses: analyzer.witnesses,
         constructor: analyzer.constructor,
@@ -106,6 +109,13 @@ pub fn check_with_loader(file: &SourceFile, ast: &Ast, loader: &dyn ModuleLoader
         &analyzer.circuit_sigs,
         &mut analyzer.diagnostics,
     );
+    check_contract_implements(
+        file,
+        &program,
+        &analyzer.pending_implements,
+        &mut analyzer.diagnostics,
+    );
+    reject_constructor_forbidden_ops(file, &program, &mut analyzer.diagnostics);
     if !analyzer.diagnostics.has_errors() {
         witness::check_witness_disclosure(file, &program, &mut analyzer.diagnostics);
     }
@@ -203,6 +213,7 @@ struct ScopeEnv {
     type_aliases: HashMap<String, usize>,
     new_types: HashMap<String, NewTypeId>,
     generic_new_types: HashMap<String, usize>,
+    contracts: HashMap<String, ContractId>,
     ledger_fields: HashMap<String, LedgerFieldId>,
     witnesses: HashMap<String, WitnessId>,
     circuits: HashMap<String, CircuitId>,
@@ -220,6 +231,7 @@ struct ModuleExports {
     type_aliases: HashMap<String, usize>,
     new_types: HashMap<String, NewTypeId>,
     generic_new_types: HashMap<String, usize>,
+    contracts: HashMap<String, ContractId>,
     ledger_fields: HashMap<String, LedgerFieldId>,
     witnesses: HashMap<String, WitnessId>,
     circuits: HashMap<String, CircuitId>,
@@ -310,6 +322,8 @@ struct Analyzer<'a> {
     enums: Vec<EnumDecl>,
     structs: Vec<StructDecl>,
     new_types: Vec<NewTypeDecl>,
+    contracts: Vec<ContractDecl>,
+    pending_implements: Vec<(Type, Span)>,
     ledger_fields: Vec<LedgerField>,
     witnesses: Vec<WitnessDecl>,
     constructor_node: Option<(UnitId, NodeIndex, ScopeEnv)>,
@@ -620,6 +634,8 @@ impl<'a> Analyzer<'a> {
         let mut created_modules: Vec<usize> = Vec::new();
         let mut pending_new_types: Vec<(UnitId, NodeIndex, NewTypeId)> = Vec::new();
         let mut pending_structs: Vec<(UnitId, NodeIndex, StructId)> = Vec::new();
+        let mut pending_contracts: Vec<(UnitId, NodeIndex, ContractId)> = Vec::new();
+        let mut pending_implements_nodes: Vec<(UnitId, NodeIndex)> = Vec::new();
 
         // Pass 1a-0: register module templates first so imports can reference modules in any order.
         for &(du, decl) in &decls {
@@ -754,6 +770,27 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
+                NodeTag::ContractDecl => {
+                    let cd = self.units.ast().contract_decl(decl);
+                    let local_name = self.text(cd.name_token).to_owned();
+                    let cid = ContractId(self.contracts.len() as u32);
+                    let hir_name = mangle_name(mangle_prefix, &local_name);
+                    self.contracts.push(ContractDecl {
+                        id: cid,
+                        name: hir_name,
+                        circuits: Vec::new(),
+                        exported: !is_module_instance && cd.exported,
+                        span: self.units.ast().node_span(decl),
+                    });
+                    self.scope.contracts.insert(local_name.clone(), cid);
+                    if cd.exported {
+                        exports.contracts.insert(local_name, cid);
+                    }
+                    pending_contracts.push((du, decl, cid));
+                }
+                NodeTag::ContractImplementsDecl => {
+                    pending_implements_nodes.push((du, decl));
+                }
                 _ => {}
             }
             self.units.switch(prev);
@@ -810,6 +847,20 @@ impl<'a> Analyzer<'a> {
         for &(du, decl, sid) in &pending_structs {
             let prev = self.units.switch(du);
             self.populate_struct_fields(decl, sid);
+            self.units.switch(prev);
+        }
+        for &(du, decl, cid) in &pending_contracts {
+            let prev = self.units.switch(du);
+            self.populate_contract_circuits(decl, cid);
+            self.units.switch(prev);
+        }
+        for &(du, decl) in &pending_implements_nodes {
+            let prev = self.units.switch(du);
+            let impl_decl = self.units.ast().contract_implements_decl(decl);
+            let span = self.units.ast().node_span(decl);
+            if let Some(ty) = self.resolve_type(impl_decl.type_node) {
+                self.pending_implements.push((ty, span));
+            }
             self.units.switch(prev);
         }
 
@@ -939,6 +990,13 @@ impl<'a> Analyzer<'a> {
                 } else {
                     self.new_types[nid.0 as usize].exported = true;
                     self.new_types[nid.0 as usize].name = name;
+                }
+            } else if let Some(&cid) = self.scope.contracts.get(&name) {
+                if is_module_instance {
+                    exports.contracts.insert(name, cid);
+                } else {
+                    self.contracts[cid.0 as usize].exported = true;
+                    self.contracts[cid.0 as usize].name = name;
                 }
             } else if let Some(&aid) = self.scope.type_aliases.get(&name) {
                 if is_module_instance {
@@ -1211,6 +1269,9 @@ impl<'a> Analyzer<'a> {
             for (k, v) in mod_exports.generic_new_types {
                 self.scope.generic_new_types.insert(apply_prefix(&k), v);
             }
+            for (k, v) in mod_exports.contracts {
+                self.scope.contracts.insert(apply_prefix(&k), v);
+            }
             for (k, v) in mod_exports.ledger_fields {
                 self.scope.ledger_fields.insert(apply_prefix(&k), v);
             }
@@ -1252,6 +1313,10 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(&v) = mod_exports.generic_new_types.get(&orig) {
                     self.scope.generic_new_types.insert(target.clone(), v);
+                    found = true;
+                }
+                if let Some(&v) = mod_exports.contracts.get(&orig) {
+                    self.scope.contracts.insert(target.clone(), v);
                     found = true;
                 }
                 if let Some(&v) = mod_exports.ledger_fields.get(&orig) {
@@ -1977,6 +2042,8 @@ impl<'a> Analyzer<'a> {
                             Some(Type::Struct(sid))
                         } else if let Some(&nid) = self.scope.new_types.get(&name) {
                             Some(Type::NewType(nid))
+                        } else if let Some(&cid) = self.scope.contracts.get(&name) {
+                            Some(Type::Contract(cid))
                         } else if let Some(&aid) = self.scope.type_aliases.get(&name) {
                             self.expand_type_alias(aid, &[], self.units.ast().token_span(tok))
                         } else {
@@ -2244,6 +2311,7 @@ impl<'a> Analyzer<'a> {
             Type::Enum(id) => self.enums[id.0 as usize].name.clone(),
             Type::Struct(id) => self.structs[id.0 as usize].name.clone(),
             Type::NewType(id) => self.new_types[id.0 as usize].name.clone(),
+            Type::Contract(id) => self.contracts[id.0 as usize].name.clone(),
             Type::Maybe(inner) => format!("Maybe<{}>", self.format_type(inner)),
             Type::Either(left, right) => format!(
                 "Either<{}, {}>",
@@ -2256,6 +2324,152 @@ impl<'a> Analyzer<'a> {
                 format!("MerkleTreePath<{depth}, {}>", self.format_type(leaf))
             }
         }
+    }
+
+    fn populate_contract_circuits(&mut self, node: NodeIndex, cid: ContractId) {
+        let decl = self.units.ast().contract_decl(node);
+        let cc_nodes: Vec<_> = self
+            .units
+            .ast()
+            .extra_nodes(decl.circuits_start, decl.circuits_end)
+            .collect();
+        let mut circuits = Vec::with_capacity(cc_nodes.len());
+        let mut seen = HashSet::new();
+        for cc_node in cc_nodes {
+            let cc = self.units.ast().contract_circuit(cc_node);
+            let cname = self.text(cc.name_token).to_owned();
+            let cspan = self.units.ast().node_span(cc_node);
+            if !seen.insert(cname.clone()) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    self.units.ast().token_span(cc.name_token),
+                    format!("duplicate circuit `{cname}` in contract declaration"),
+                ));
+                continue;
+            }
+            let params = self.resolve_params(cc.params_start, cc.params_end);
+            let Some(ret_type) = self.resolve_type(cc.ret_type) else {
+                continue;
+            };
+            circuits.push(ContractCircuitSig {
+                name: cname,
+                pure: cc.pure,
+                params,
+                ret_type,
+                span: cspan,
+            });
+        }
+        self.contracts[cid.0 as usize].circuits = circuits;
+    }
+
+    fn serialized_byte_len(&self, ty: &Type) -> Option<u32> {
+        match self.underlying_type(ty) {
+            Type::Boolean => Some(1),
+            Type::Field | Type::CurveField(_) => Some(32),
+            Type::Uint(bits) => {
+                if *bits == 0 {
+                    Some(0)
+                } else {
+                    Some((*bits).div_ceil(8))
+                }
+            }
+            Type::Bytes(len) => Some(*len),
+            Type::Enum(id) => {
+                let count = self.enums[id.0 as usize].variants.len() as u32;
+                let maxval = count.saturating_sub(1);
+                if maxval == 0 {
+                    Some(0)
+                } else {
+                    Some((u32::BITS - maxval.leading_zeros()).div_ceil(8))
+                }
+            }
+            Type::Vector(len, elem) => self.serialized_byte_len(elem)?.checked_mul(*len),
+            Type::Tuple(elems) => {
+                let mut total = 0u32;
+                for e in elems {
+                    total = total.checked_add(self.serialized_byte_len(e)?)?;
+                }
+                Some(total)
+            }
+            Type::Struct(_)
+            | Type::Maybe(_)
+            | Type::Either(_, _)
+            | Type::MerkleTreeDigest
+            | Type::MerkleTreePathEntry
+            | Type::MerkleTreePath(_, _) => {
+                let mut total = 0u32;
+                for (_, fty) in self.struct_fields_of(ty)? {
+                    total = total.checked_add(self.serialized_byte_len(&fty)?)?;
+                }
+                Some(total)
+            }
+            Type::CurvePoint(_) | Type::Contract(_) | Type::Opaque(_) => None,
+            Type::NewType(_) => unreachable!("underlying_type peeled all NewType layers"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_contract_call(
+        &mut self,
+        cid: ContractId,
+        receiver: Expr,
+        method_name: &str,
+        method_span: Span,
+        arg_nodes: &[NodeIndex],
+        call_span: Span,
+        scope: &HashMap<String, ValueBinding>,
+    ) -> Option<Expr> {
+        let decl = self.contracts[cid.0 as usize].clone();
+        let Some(sig) = decl.circuits.iter().find(|c| c.name == method_name) else {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                method_span,
+                format!("contract `{}` has no circuit `{method_name}`", decl.name),
+            ));
+            return None;
+        };
+        if arg_nodes.len() != sig.params.len() {
+            self.diagnostics.push(CompactDiagnostic::error(
+                self.units.file(),
+                call_span,
+                format!(
+                    "`{}.{method_name}` expects {} argument(s), found {}",
+                    decl.name,
+                    sig.params.len(),
+                    arg_nodes.len()
+                ),
+            ));
+            return None;
+        }
+        let mut args = Vec::with_capacity(arg_nodes.len());
+        for (&anode, param) in arg_nodes.iter().zip(&sig.params) {
+            let mut arg = self.check_expr(anode, scope, Some(&param.ty))?;
+            if !self.coerce_or_check(&mut arg, &param.ty) {
+                self.diagnostics.push(CompactDiagnostic::error(
+                    self.units.file(),
+                    arg.span,
+                    format!(
+                        "`{}.{method_name}` argument `{}` mismatch: expected `{}`, found `{}`",
+                        decl.name,
+                        param.name,
+                        self.format_type(&param.ty),
+                        self.format_type(&arg.ty)
+                    ),
+                ));
+                return None;
+            }
+            args.push(arg);
+        }
+        Some(Expr {
+            kind: ExprKind::ContractCall {
+                contract: cid,
+                receiver: Box::new(receiver),
+                method: method_name.to_owned(),
+                args,
+            },
+            ty: sig.ret_type.clone(),
+            span: call_span,
+        })
     }
 
     fn check_constructor(&mut self, node: NodeIndex) {
@@ -4467,21 +4681,61 @@ impl<'a> Analyzer<'a> {
                     return None;
                 }
 
-                // 2. Ledger ADT method call (supporting arbitrary nested `map.lookup(k)...method(...)`).
+                // 2. Ledger ADT method call (or cross-contract call on a ledger cell / expression).
                 if self.units.ast().node_tag(call.callee) == NodeTag::MemberExpr {
                     let mdata = self.units.ast().node_data(call.callee);
                     let recv = NodeIndex(mdata.lhs);
                     let method_tok = TokenIndex(mdata.rhs);
+                    let method_name = self.text(method_tok).to_owned();
+                    let method_span = self.units.ast().token_span(method_tok);
                     if let Some((field_id, key_path, target_adt)) =
                         self.try_extract_ledger_chain(recv, scope)
                     {
-                        let method_name = self.text(method_tok).to_owned();
+                        // If the ledger target is a Cell holding a Contract reference and the
+                        // method is not a Cell operation, auto-read the cell and make a cross-contract call.
+                        if let LedgerAdt::Cell(ref cell_ty) = target_adt
+                            && !matches!(method_name.as_str(), "read" | "write" | "resetToDefault")
+                            && let Type::Contract(cid) = *self.underlying_type(cell_ty)
+                        {
+                            let recv_expr = Expr {
+                                kind: ExprKind::LedgerCall {
+                                    field: field_id,
+                                    key_path,
+                                    target_adt: target_adt.clone(),
+                                    op: LedgerOp::CellRead,
+                                    args: Vec::new(),
+                                },
+                                ty: (**cell_ty).clone(),
+                                span: self.units.ast().node_span(recv),
+                            };
+                            return self.check_contract_call(
+                                cid,
+                                recv_expr,
+                                &method_name,
+                                method_span,
+                                &arg_nodes,
+                                span,
+                                scope,
+                            );
+                        }
                         return self.check_ledger_call(
                             field_id,
                             key_path,
                             target_adt,
                             &method_name,
-                            self.units.ast().token_span(method_tok),
+                            method_span,
+                            &arg_nodes,
+                            span,
+                            scope,
+                        );
+                    }
+                    let recv_expr = self.check_expr(recv, scope, None)?;
+                    if let Type::Contract(cid) = *self.underlying_type(&recv_expr.ty) {
+                        return self.check_contract_call(
+                            cid,
+                            recv_expr,
+                            &method_name,
+                            method_span,
                             &arg_nodes,
                             span,
                             scope,
@@ -4495,6 +4749,52 @@ impl<'a> Analyzer<'a> {
                     "unsupported call target",
                 ));
                 None
+            }
+            NodeTag::EmitExpr => {
+                let data = self.units.ast().node_data(node);
+                let val = self.check_expr(NodeIndex(data.lhs), scope, None)?;
+                let event_ty = val.ty.clone();
+                let event_name = match self.underlying_type(&event_ty) {
+                    Type::Struct(sid) => self.structs[sid.0 as usize].name.clone(),
+                    _ => {
+                        self.diagnostics.push(CompactDiagnostic::error(
+                            self.units.file(),
+                            val.span,
+                            format!(
+                                "`emit` expects a declared event struct, found `{}`",
+                                self.format_type(&event_ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                };
+                let Some(event_tag) = event_tag_of(&event_name) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        val.span,
+                        format!("`{event_name}` is not a declared Midnight event type"),
+                    ));
+                    return None;
+                };
+                let Some(payload_len) = self.serialized_byte_len(&event_ty) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        val.span,
+                        format!("event type `{event_name}` is not serializable"),
+                    ));
+                    return None;
+                };
+                Some(Expr {
+                    kind: ExprKind::Emit {
+                        event_name,
+                        event_tag,
+                        payload_len,
+                        event_ty,
+                        value: Box::new(val),
+                    },
+                    ty: Type::unit(),
+                    span,
+                })
             }
             _ => {
                 self.diagnostics.push(CompactDiagnostic::error(
@@ -5356,6 +5656,115 @@ impl<'a> Analyzer<'a> {
                         arg: Box::new(arg),
                     },
                     ty: Type::CurvePoint(CurveKind::Jubjub),
+                    span: call_span,
+                })
+            }
+            "serialize" => {
+                if targ_nodes.len() != 2 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`serialize<N, T>(value)` expects 2 type arguments and 1 value argument",
+                    ));
+                    return None;
+                }
+                let len = self.expect_type_nat(targ_nodes, 0, "serialize", call_span)?;
+                let input_ty = self.resolve_type(targ_nodes[1])?;
+                let Some(actual_len) = self.serialized_byte_len(&input_ty) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!("type `{}` is not serializable", self.format_type(&input_ty)),
+                    ));
+                    return None;
+                };
+                if actual_len > len {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "actual serialized size {actual_len} exceeds specified length {len} for `{}`",
+                            self.format_type(&input_ty)
+                        ),
+                    ));
+                    return None;
+                }
+                let mut val = self.check_expr(arg_nodes[0], scope, Some(&input_ty))?;
+                if !self.coerce_or_check(&mut val, &input_ty) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        val.span,
+                        format!(
+                            "`serialize` argument mismatch: expected `{}`, found `{}`",
+                            self.format_type(&input_ty),
+                            self.format_type(&val.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Serialize {
+                        len,
+                        input_ty,
+                        value: Box::new(val),
+                    },
+                    ty: Type::Bytes(len),
+                    span: call_span,
+                })
+            }
+            "deserialize" => {
+                if targ_nodes.len() != 2 || arg_nodes.len() != 1 {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        "`deserialize<N, T>(bytes)` expects 2 type arguments and 1 value argument",
+                    ));
+                    return None;
+                }
+                let len = self.expect_type_nat(targ_nodes, 0, "deserialize", call_span)?;
+                let target_ty = self.resolve_type(targ_nodes[1])?;
+                let Some(actual_len) = self.serialized_byte_len(&target_ty) else {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "type `{}` is not deserializable",
+                            self.format_type(&target_ty)
+                        ),
+                    ));
+                    return None;
+                };
+                if actual_len > len {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        call_span,
+                        format!(
+                            "actual serialized size {actual_len} exceeds specified length {len} for `{}`",
+                            self.format_type(&target_ty)
+                        ),
+                    ));
+                    return None;
+                }
+                let expected_bytes = Type::Bytes(len);
+                let mut bytes = self.check_expr(arg_nodes[0], scope, Some(&expected_bytes))?;
+                if !self.coerce_or_check(&mut bytes, &expected_bytes) {
+                    self.diagnostics.push(CompactDiagnostic::error(
+                        self.units.file(),
+                        bytes.span,
+                        format!(
+                            "`deserialize` expects `Bytes<{len}>`, found `{}`",
+                            self.format_type(&bytes.ty)
+                        ),
+                    ));
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Deserialize {
+                        len,
+                        target_ty: target_ty.clone(),
+                        bytes: Box::new(bytes),
+                    },
+                    ty: target_ty,
                     span: call_span,
                 })
             }
@@ -6375,6 +6784,26 @@ impl<'a> Analyzer<'a> {
                             target_adt,
                         )
                     }
+                    "isFull" => {
+                        if !arg_nodes.is_empty() {
+                            self.diagnostics.push(CompactDiagnostic::error(
+                                self.units.file(),
+                                call_span,
+                                format!("`{adt_name}.isFull` takes 0 arguments"),
+                            ));
+                            return None;
+                        }
+                        make_call(
+                            if historic {
+                                LedgerOp::HistoricMerkleTreeIsFull
+                            } else {
+                                LedgerOp::MerkleTreeIsFull
+                            },
+                            Vec::new(),
+                            Type::Boolean,
+                            target_adt,
+                        )
+                    }
                     "checkRoot" => {
                         if arg_nodes.len() != 1 {
                             self.diagnostics.push(CompactDiagnostic::error(
@@ -6589,6 +7018,19 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
             }
             (l, w)
         }
+        ExprKind::ContractCall { receiver, args, .. } => {
+            let mut w = expr_effects(receiver, calls).1;
+            for a in args {
+                w |= expr_effects(a, calls).1;
+            }
+            (true, w)
+        }
+        ExprKind::Emit { value, .. } => {
+            let (_, w) = expr_effects(value, calls);
+            (true, w)
+        }
+        ExprKind::Serialize { value, .. } => expr_effects(value, calls),
+        ExprKind::Deserialize { bytes, .. } => expr_effects(bytes, calls),
         ExprKind::Tuple(elems) | ExprKind::Vector(elems) | ExprKind::BytesPack(elems) => {
             let (mut l, mut w) = (false, false);
             for e in elems {
@@ -6676,6 +7118,296 @@ fn expr_effects(expr: &Expr, calls: &mut Vec<CircuitId>) -> (bool, bool) {
         | ExprKind::LocalRef(_)
         | ExprKind::EnumVariant { .. }
         | ExprKind::MaybeNone(_) => (false, false),
+    }
+}
+
+fn event_tag_of(name: &str) -> Option<u8> {
+    match name {
+        "ShieldedSpend" => Some(0),
+        "ShieldedReceive" => Some(1),
+        "ShieldedMint" => Some(2),
+        "ShieldedBurn" => Some(3),
+        "UnshieldedSpend" => Some(4),
+        "UnshieldedReceive" => Some(5),
+        "UnshieldedMint" => Some(6),
+        "UnshieldedBurn" => Some(7),
+        "Paused" => Some(8),
+        "Unpaused" => Some(9),
+        "Misc" => Some(10),
+        _ => None,
+    }
+}
+
+fn check_contract_implements(
+    file: &SourceFile,
+    program: &Program,
+    implements: &[(Type, Span)],
+    diagnostics: &mut DiagnosticBag,
+) {
+    for (ty, span) in implements {
+        let Type::Contract(cid) = *program.underlying_type(ty) else {
+            diagnostics.push(CompactDiagnostic::error(
+                file,
+                *span,
+                format!(
+                    "non-contract type `{}` in `contract implements` declaration",
+                    program.format_type(ty)
+                ),
+            ));
+            continue;
+        };
+        let decl = program.contract_decl(cid);
+        for req in &decl.circuits {
+            let Some(found) = program
+                .circuits
+                .iter()
+                .find(|c| c.exported && c.name == req.name)
+            else {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    *span,
+                    format!(
+                        "contract implements `{}` failure: this contract does not export a circuit named `{}`",
+                        decl.name, req.name
+                    ),
+                ));
+                continue;
+            };
+            if found.pure {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    *span,
+                    format!(
+                        "contract implements `{}` failure: exported circuit `{}` is pure, but circuits in a contract interface must have a proof",
+                        decl.name, req.name
+                    ),
+                ));
+            }
+            if found.params.len() != req.params.len() {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    *span,
+                    format!(
+                        "contract implements `{}` failure: circuit `{}` takes {} argument(s) rather than {}",
+                        decl.name,
+                        req.name,
+                        found.params.len(),
+                        req.params.len()
+                    ),
+                ));
+                continue;
+            }
+            for (i, (fp, rp)) in found.params.iter().zip(&req.params).enumerate() {
+                if fp.ty != rp.ty {
+                    diagnostics.push(CompactDiagnostic::error(
+                        file,
+                        *span,
+                        format!(
+                            "contract implements `{}` failure: argument {} of circuit `{}` has type `{}` rather than `{}`",
+                            decl.name,
+                            i + 1,
+                            req.name,
+                            program.format_type(&fp.ty),
+                            program.format_type(&rp.ty)
+                        ),
+                    ));
+                }
+            }
+            if found.ret_type != req.ret_type {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    *span,
+                    format!(
+                        "contract implements `{}` failure: circuit `{}` returns `{}` rather than `{}`",
+                        decl.name,
+                        req.name,
+                        program.format_type(&found.ret_type),
+                        program.format_type(&req.ret_type)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn reject_constructor_forbidden_ops(
+    file: &SourceFile,
+    program: &Program,
+    diagnostics: &mut DiagnosticBag,
+) {
+    fn visit_stmts(
+        stmts: &[Stmt],
+        program: &Program,
+        file: &SourceFile,
+        diagnostics: &mut DiagnosticBag,
+        visited: &mut HashSet<CircuitId>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Const { init, .. } => visit_expr(init, program, file, diagnostics, visited),
+                Stmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    visit_expr(cond, program, file, diagnostics, visited);
+                    visit_stmts(then_branch, program, file, diagnostics, visited);
+                    visit_stmts(else_branch, program, file, diagnostics, visited);
+                }
+                Stmt::ForRange { body, .. } => {
+                    visit_stmts(body, program, file, diagnostics, visited)
+                }
+                Stmt::ForEach { iter, body, .. } => {
+                    visit_expr(iter, program, file, diagnostics, visited);
+                    visit_stmts(body, program, file, diagnostics, visited);
+                }
+                Stmt::Expr(e) => visit_expr(e, program, file, diagnostics, visited),
+                Stmt::Return { value: Some(e), .. } => {
+                    visit_expr(e, program, file, diagnostics, visited)
+                }
+                Stmt::Return { value: None, .. } => {}
+            }
+        }
+    }
+    fn visit_expr(
+        expr: &Expr,
+        program: &Program,
+        file: &SourceFile,
+        diagnostics: &mut DiagnosticBag,
+        visited: &mut HashSet<CircuitId>,
+    ) {
+        match &expr.kind {
+            ExprKind::ContractCall {
+                receiver,
+                args,
+                method,
+                ..
+            } => {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    expr.span,
+                    format!("cross-contract call `{method}` is not permitted inside a constructor"),
+                ));
+                visit_expr(receiver, program, file, diagnostics, visited);
+                for a in args {
+                    visit_expr(a, program, file, diagnostics, visited);
+                }
+            }
+            ExprKind::Emit {
+                value, event_name, ..
+            } => {
+                diagnostics.push(CompactDiagnostic::error(
+                    file,
+                    expr.span,
+                    format!("`emit({event_name})` is not permitted inside a constructor"),
+                ));
+                visit_expr(value, program, file, diagnostics, visited);
+            }
+            ExprKind::CircuitCall { circuit, args } => {
+                for a in args {
+                    visit_expr(a, program, file, diagnostics, visited);
+                }
+                if visited.insert(*circuit) {
+                    visit_stmts(
+                        &program.circuit(*circuit).body,
+                        program,
+                        file,
+                        diagnostics,
+                        visited,
+                    );
+                }
+            }
+            ExprKind::Tuple(es)
+            | ExprKind::Vector(es)
+            | ExprKind::BytesPack(es)
+            | ExprKind::WitnessCall { args: es, .. }
+            | ExprKind::NativeWitness { args: es, .. } => {
+                for e in es {
+                    visit_expr(e, program, file, diagnostics, visited);
+                }
+            }
+            ExprKind::Block { stmts, tail } => {
+                visit_stmts(stmts, program, file, diagnostics, visited);
+                visit_expr(tail, program, file, diagnostics, visited);
+            }
+            ExprKind::StructLit { fields } => {
+                for (_, e) in fields {
+                    visit_expr(e, program, file, diagnostics, visited);
+                }
+            }
+            ExprKind::LedgerCall { key_path, args, .. } => {
+                for k in key_path {
+                    visit_expr(k, program, file, diagnostics, visited);
+                }
+                for a in args {
+                    visit_expr(a, program, file, diagnostics, visited);
+                }
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::Assert { cond: operand, .. }
+            | ExprKind::Disclose(operand)
+            | ExprKind::PersistentHash { arg: operand, .. }
+            | ExprKind::Keccak256 { arg: operand, .. }
+            | ExprKind::Sha512 { arg: operand, .. }
+            | ExprKind::TransientHash { arg: operand, .. }
+            | ExprKind::DegradeToTransient(operand)
+            | ExprKind::UpgradeFromTransient(operand)
+            | ExprKind::FieldInv(operand)
+            | ExprKind::EcNeg(operand)
+            | ExprKind::EcMulGenerator(operand)
+            | ExprKind::HashToCurve { arg: operand, .. }
+            | ExprKind::PointCoord { point: operand, .. }
+            | ExprKind::Serialize { value: operand, .. }
+            | ExprKind::Deserialize { bytes: operand, .. }
+            | ExprKind::MerkleTreePathRoot { path: operand, .. }
+            | ExprKind::FieldAccess { base: operand, .. }
+            | ExprKind::Slice { base: operand, .. }
+            | ExprKind::MaybeSome(operand) => {
+                visit_expr(operand, program, file, diagnostics, visited)
+            }
+            ExprKind::PersistentCommit {
+                value: a, rand: b, ..
+            }
+            | ExprKind::TransientCommit {
+                value: a, rand: b, ..
+            }
+            | ExprKind::Index { base: a, index: b }
+            | ExprKind::Binary { lhs: a, rhs: b, .. }
+            | ExprKind::EcAdd { lhs: a, rhs: b }
+            | ExprKind::EcMul {
+                point: a,
+                scalar: b,
+            }
+            | ExprKind::ConstructJubjubPoint { x: a, y: b } => {
+                visit_expr(a, program, file, diagnostics, visited);
+                visit_expr(b, program, file, diagnostics, visited);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                visit_expr(cond, program, file, diagnostics, visited);
+                visit_expr(then_branch, program, file, diagnostics, visited);
+                visit_expr(else_branch, program, file, diagnostics, visited);
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::BytesLit(_)
+            | ExprKind::Default(_)
+            | ExprKind::DefaultAdt(_)
+            | ExprKind::ParamRef(_)
+            | ExprKind::LocalRef(_)
+            | ExprKind::EnumVariant { .. }
+            | ExprKind::MaybeNone(_) => {}
+        }
+    }
+
+    if let Some(ctor) = &program.constructor {
+        let mut visited = HashSet::new();
+        visit_stmts(&ctor.body, program, file, diagnostics, &mut visited);
     }
 }
 
@@ -7148,6 +7880,101 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("arithmetic operator")),
             "expected arithmetic operator rejection on curve points, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_contract_implements_signature_mismatch() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            contract Foo {
+              circuit add(x: Field): Field;
+            }
+            contract implements Foo;
+            export ledger v: Field;
+            export circuit add(x: Uint<64>): Field {
+              v = disclose(x as Field);
+              return v;
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked
+                .diagnostics
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("contract implements")),
+            "expected contract implements error, got: {:?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_contract_call_and_emit_inside_constructor() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            contract Inner {
+              circuit ping(): [];
+            }
+            constructor(i: Inner) {
+              disclose(i).ping();
+              emit(Paused {});
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        let msgs: Vec<_> = checked
+            .diagnostics
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("cross-contract call"))
+                && msgs.iter().any(|m| m.contains("emit")),
+            "expected constructor errors for contract call and emit, got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_undisclosed_witness_in_contract_call_and_emit() {
+        let mut sm = SourceMap::new();
+        let src = r#"
+            import CompactStandardLibrary;
+            contract Inner {
+              circuit send(n: Bytes<32>): [];
+            }
+            export ledger target: Inner;
+            export circuit bad(n: Bytes<32>): [] {
+              emit(ShieldedSpend { nullifier: n });
+              target.send(n);
+            }
+        "#;
+        let id = sm.add_file("test.compact", src);
+        let file = sm.get(id);
+        let parsed = parse(file);
+        assert!(!parsed.diagnostics.has_errors());
+        let checked = check(file, &parsed.ast);
+        assert!(checked.diagnostics.has_errors());
+        assert!(
+            checked.diagnostics.diagnostics.len() >= 2
+                && checked
+                    .diagnostics
+                    .diagnostics
+                    .iter()
+                    .all(|d| d.message.contains("disclose")),
+            "expected WPP errors for emit and contract call, got: {:?}",
             checked.diagnostics
         );
     }

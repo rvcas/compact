@@ -246,6 +246,8 @@ impl<'a> WitnessChecker<'a> {
             | ExprKind::EcMulGenerator(operand)
             | ExprKind::HashToCurve { arg: operand, .. }
             | ExprKind::PointCoord { point: operand, .. }
+            | ExprKind::Serialize { value: operand, .. }
+            | ExprKind::Deserialize { bytes: operand, .. }
             | ExprKind::MerkleTreePathRoot { path: operand, .. }
             | ExprKind::FieldAccess { base: operand, .. }
             | ExprKind::Slice { base: operand, .. }
@@ -333,6 +335,60 @@ impl<'a> WitnessChecker<'a> {
                     .collect();
                 let callee = self.program.circuit(*circuit);
                 self.check_stmts(&callee.body, &arg_taints, guard_taint)
+            }
+            ExprKind::ContractCall {
+                contract,
+                receiver,
+                method,
+                args,
+            } => {
+                let cname = &self.program.contract_decl(*contract).name;
+                if guard_taint.is_tainted() {
+                    self.report_disclosure(
+                        expr.span,
+                        guard_taint,
+                        &format!("contract call `{cname}.{method}` guarded by witness condition"),
+                    );
+                }
+                let recv_taint = self.check_expr(receiver, param_taints, locals, guard_taint);
+                if recv_taint.is_tainted() {
+                    self.report_disclosure(
+                        receiver.span,
+                        &recv_taint,
+                        &format!("contract call receiver for `{cname}.{method}`"),
+                    );
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_taint = self.check_expr(arg, param_taints, locals, guard_taint);
+                    if arg_taint.is_tainted() {
+                        self.report_disclosure(
+                            arg.span,
+                            &arg_taint,
+                            &format!("argument {} of contract call `{cname}.{method}`", i + 1),
+                        );
+                    }
+                }
+                Taint::clean()
+            }
+            ExprKind::Emit {
+                event_name, value, ..
+            } => {
+                if guard_taint.is_tainted() {
+                    self.report_disclosure(
+                        expr.span,
+                        guard_taint,
+                        &format!("`emit({event_name})` guarded by witness condition"),
+                    );
+                }
+                let val_taint = self.check_expr(value, param_taints, locals, guard_taint);
+                if val_taint.is_tainted() {
+                    self.report_disclosure(
+                        value.span,
+                        &val_taint,
+                        &format!("payload of `emit({event_name})`"),
+                    );
+                }
+                Taint::clean()
             }
             ExprKind::LedgerCall {
                 field,
@@ -469,6 +525,15 @@ fn collect_calls_expr(expr: &Expr, out: &mut Vec<(CircuitId, Span)>) {
                 collect_calls_expr(a, out);
             }
         }
+        ExprKind::ContractCall { receiver, args, .. } => {
+            collect_calls_expr(receiver, out);
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
+        ExprKind::Emit { value, .. } => collect_calls_expr(value, out),
+        ExprKind::Serialize { value, .. } => collect_calls_expr(value, out),
+        ExprKind::Deserialize { bytes, .. } => collect_calls_expr(bytes, out),
         ExprKind::LedgerCall { key_path, args, .. } => {
             for k in key_path {
                 collect_calls_expr(k, out);

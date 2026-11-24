@@ -337,7 +337,9 @@ fn keyword_or_ident(text: &str) -> TokenTag {
         "default" => TokenTag::Default,
         "as" => TokenTag::As,
         "contract" => TokenTag::Contract,
+        "implements" => TokenTag::Implements,
         "constructor" => TokenTag::Constructor,
+        "emit" => TokenTag::Emit,
         _ => TokenTag::Ident,
     }
 }

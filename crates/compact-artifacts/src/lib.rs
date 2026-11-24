@@ -160,6 +160,12 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
         Type::NewType(id) => {
             return type_to_json(program, &program.new_type_decl(*id).inner);
         }
+        Type::Contract(id) => {
+            let decl = program.contract_decl(*id);
+            map.insert("type-name".into(), Value::String("Contract".into()));
+            map.insert("name".into(), Value::String(decl.name.clone()));
+            map.insert("circuits".into(), contract_circuits_to_json(program, decl));
+        }
         Type::Maybe(_)
         | Type::Either(_, _)
         | Type::MerkleTreeDigest
@@ -189,6 +195,36 @@ fn type_to_json(program: &Program, ty: &Type) -> Value {
             map.insert("elements".into(), Value::Array(elements));
         }
     }
+    Value::Object(map)
+}
+
+fn contract_circuits_to_json(program: &Program, decl: &compact_hir::ContractDecl) -> Value {
+    Value::Array(
+        decl.circuits
+            .iter()
+            .map(|c| {
+                let mut m = Map::new();
+                m.insert("name".into(), Value::String(c.name.clone()));
+                m.insert(
+                    "argument-types".into(),
+                    Value::Array(
+                        c.params
+                            .iter()
+                            .map(|p| type_to_json(program, &p.ty))
+                            .collect(),
+                    ),
+                );
+                m.insert("result-type".into(), type_to_json(program, &c.ret_type));
+                Value::Object(m)
+            })
+            .collect(),
+    )
+}
+
+fn contract_decl_to_json(program: &Program, decl: &compact_hir::ContractDecl) -> Value {
+    let mut map = Map::new();
+    map.insert("name".into(), Value::String(decl.name.clone()));
+    map.insert("circuits".into(), contract_circuits_to_json(program, decl));
     Value::Object(map)
 }
 
@@ -312,6 +348,12 @@ pub fn render_contract_info(program: &Program) -> String {
         .map(|f| ledger_field_to_json(program, f))
         .collect();
 
+    let contracts = program
+        .contracts
+        .iter()
+        .map(|c| contract_decl_to_json(program, c))
+        .collect();
+
     let info = ContractInfo {
         compiler_version: COMPILER_VERSION,
         compiler_commit: COMPILER_COMMIT,
@@ -319,7 +361,7 @@ pub fn render_contract_info(program: &Program) -> String {
         runtime_version: RUNTIME_VERSION,
         circuits,
         witnesses,
-        contracts: Vec::new(),
+        contracts,
         ledger,
     };
 
@@ -526,6 +568,14 @@ mod tests {
             ledger hmt: HistoricMerkleTree<10, Bytes<32>>;
             export ledger nested: Map<Field, Map<Field, Counter>>;
             "#,
+            contract_info_for
+        );
+    }
+
+    #[test]
+    fn contract_info_composable_events() {
+        assert_compact_snapshot!(
+            file: include_str!("../../../examples/composable_events.compact"),
             contract_info_for
         );
     }
