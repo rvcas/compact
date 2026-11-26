@@ -947,4 +947,103 @@ mod tests {
             compile_all_zkir
         );
     }
+
+    #[test]
+    fn optimizer_reduces_instructions_and_halo2_rows() {
+        let contracts: &[(&str, &str)] = &[
+            (
+                "cse_and_folding",
+                r#"
+                import CompactStandardLibrary;
+                export circuit check_hash(a: Field, b: Field, flag: Boolean): Field {
+                  const h1 = transientHash<Vector<2, Field>>([a + 0, b * 1]);
+                  const h2 = transientHash<Vector<2, Field>>([a, b]);
+                  const dead = degradeToTransient(persistentHash<Field>(a + b));
+                  const redundant_cmp = (flag == true) && !(flag == false);
+                  assert(redundant_cmp || !redundant_cmp, "tautology");
+                  return (h1 == h2) ? (h1 + (3 * 4)) : dead;
+                }
+                "#,
+            ),
+            (
+                "functional_patterns",
+                include_str!("../../../examples/functional_patterns.compact"),
+            ),
+            (
+                "token_vault",
+                include_str!("../../../examples/token_vault.compact"),
+            ),
+            (
+                "election",
+                include_str!("../../../examples/election.compact"),
+            ),
+            (
+                "zerocash",
+                include_str!("../../../examples/zerocash.compact"),
+            ),
+        ];
+
+        let mut total_unopt_instrs = 0usize;
+        let mut total_opt_instrs = 0usize;
+
+        for &(label, src) in contracts {
+            let mut sm = SourceMap::new();
+            let id = sm.add_file(format!("{label}.compact"), src);
+            let file = sm.get(id);
+            let parsed = parse(file);
+            assert!(!parsed.diagnostics.has_errors(), "{:?}", parsed.diagnostics);
+            let checked = check(file, &parsed.ast);
+            assert!(
+                !checked.diagnostics.has_errors(),
+                "{:?}",
+                checked.diagnostics
+            );
+
+            let unopt = compact_circuit::lower_to_circuits_unoptimized(&checked.program);
+            let opt = compact_circuit::lower_to_circuits(&checked.program);
+            assert_eq!(unopt.circuits.len(), opt.circuits.len());
+
+            for (uc, oc) in unopt.circuits.iter().zip(opt.circuits.iter()) {
+                total_unopt_instrs += uc.instructions.len();
+                total_opt_instrs += oc.instructions.len();
+                assert!(
+                    oc.instructions.len() <= uc.instructions.len(),
+                    "{label}::{}: optimizer increased instructions ({} -> {})",
+                    oc.name,
+                    uc.instructions.len(),
+                    oc.instructions.len()
+                );
+
+                // Verify Halo2 synthesis on the fast CSE/folding & token_vault circuits.
+                if label == "cse_and_folding" || label == "token_vault" {
+                    let u_zkir = generate_zkir(uc).unwrap();
+                    let o_zkir = generate_zkir(oc).unwrap();
+                    let u_model = analyze_model(&u_zkir.ir);
+                    let o_model = analyze_model(&o_zkir.ir);
+                    assert!(
+                        o_model.rows <= u_model.rows && o_model.k <= u_model.k,
+                        "{label}::{}: optimizer regressed Halo2 model (rows {} -> {}, k {} -> {})",
+                        oc.name,
+                        u_model.rows,
+                        o_model.rows,
+                        u_model.k,
+                        o_model.k
+                    );
+                    if label == "cse_and_folding" {
+                        assert!(
+                            o_model.rows < u_model.rows,
+                            "expected strict Halo2 row reduction on cse_and_folding (rows {} -> {})",
+                            u_model.rows,
+                            o_model.rows
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            total_opt_instrs < total_unopt_instrs,
+            "expected strict overall instruction reduction ({total_unopt_instrs} -> {total_opt_instrs})"
+        );
+    }
 }

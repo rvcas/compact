@@ -92,16 +92,11 @@ export circuit seed_and_check(batch: Vector<3, Field>, a: Uint<32>, b: Uint<32>,
     {"op":"mul","a":"%a.3","b":"%b.4","output":"%t.6"},
     {"op":"less_than","a":"%a.3","b":"%b.4","bits":32,"output":"%t.7"},
     {"op":"less_than","a":"%b.4","b":"%a.3","bits":32,"output":"%t.8"},
-    {"op":"cond_select","bit":"%t.8","a":"0x00","b":"0x01","output":"%t.9"},
+    {"op":"not","a":"%t.8","output":"%t.9"},
     {"op":"cond_select","bit":"%t.7","a":"%t.9","b":"0x00","output":"%t.10"},
-    {"op":"less_than","a":"%a.3","b":"%b.4","bits":32,"output":"%t.11"},
-    {"op":"cond_select","bit":"%t.10","a":"%t.11","b":"0x00","output":"%t.12"},
-    {"op":"less_than","a":"%b.4","b":"%a.3","bits":32,"output":"%t.13"},
-    {"op":"cond_select","bit":"%t.13","a":"0x00","b":"0x01","output":"%t.14"},
-    {"op":"cond_select","bit":"%t.12","a":"%t.14","b":"0x00","output":"%t.15"},
-    {"op":"less_than","a":"%limit.5","b":"%t.6","bits":64,"output":"%t.16"},
-    {"op":"cond_select","bit":"%t.16","a":"0x00","b":"0x01","output":"%t.17"},
-    {"op":"cond_select","bit":"%t.15","a":"%t.17","b":"0x00","output":"%t.18"},
-    {"op":"output","vals":["%t.18"]}
+    {"op":"less_than","a":"%limit.5","b":"%t.6","bits":64,"output":"%t.11"},
+    {"op":"not","a":"%t.11","output":"%t.12"},
+    {"op":"cond_select","bit":"%t.10","a":"%t.12","b":"0x00","output":"%t.13"},
+    {"op":"output","vals":["%t.13"]}
   ]
 }

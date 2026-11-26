@@ -1,4 +1,8 @@
+pub mod optimize;
+
 use std::collections::HashMap;
+
+pub use optimize::{optimize_circuit, optimize_program};
 
 use compact_hir::{
     BinaryOp, Circuit, CurveFieldKind, CurveKind, Expr, ExprKind, LedgerAdt, LedgerOp, LocalId,
@@ -888,12 +892,18 @@ pub struct CircuitProgram {
     pub circuits: Vec<ProofCircuit>,
 }
 
-pub fn lower_to_circuits(program: &Program) -> CircuitProgram {
+pub fn lower_to_circuits_unoptimized(program: &Program) -> CircuitProgram {
     let circuits = program
         .proof_circuits()
         .map(|circuit| CircuitLowerer::new(program).lower_root_circuit(circuit))
         .collect();
     CircuitProgram { circuits }
+}
+
+pub fn lower_to_circuits(program: &Program) -> CircuitProgram {
+    let mut lowered = lower_to_circuits_unoptimized(program);
+    optimize_program(&mut lowered);
+    lowered
 }
 
 struct CircuitLowerer<'a> {
