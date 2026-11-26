@@ -1,18 +1,21 @@
+pub mod keygen;
+
 use std::fmt::Write as _;
 
 use compact_circuit::{
     AlignmentAtom, CircuitInstr, CircuitVal, CircuitVar, ProofCircuit, WireType,
 };
-use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
+pub use keygen::{
+    CachedParamsProvider, compile_keys_with_cached_params, default_keygen_jobs, prefetch_params,
+    run_bounded_parallel, schedule_lpt,
+};
 use midnight_base_crypto::fab::{Alignment, AlignmentAtom as FabAlignmentAtom, AlignmentSegment};
 use midnight_serialize::tagged_serialize;
 use midnight_transient_crypto::curve::Fr;
-use midnight_transient_crypto::proofs::Zkir;
 use midnight_zkir::ir::Operand;
 use midnight_zkir::ir_types::IrType;
 use midnight_zkir::{Identifier, Instruction, IrSource};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -121,42 +124,13 @@ pub fn compile_keys(ir: &IrSource) -> Result<CompiledKeys, ZkirError> {
     compile_keys_with_model(ir, analyze_model(ir))
 }
 
-/// Compile proving and verifier keys using a precomputed [`CircuitModelSummary`] to avoid
-/// running Halo2 model synthesis twice.
+/// Compile proving and verifier keys using a precomputed [`CircuitModelSummary`].
 pub fn compile_keys_with_model(
     ir: &IrSource,
     model: CircuitModelSummary,
 ) -> Result<CompiledKeys, ZkirError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(ZkirError::Runtime)?;
-
-    let (pk, vk) = rt.block_on(async {
-        let provider = MidnightDataProvider::new(FetchMode::OnDemand, OutputMode::Log, vec![])
-            .map_err(|e| ZkirError::DataProvider(e.to_string()))?;
-        ir.keygen(&provider)
-            .await
-            .map_err(|e| ZkirError::Keygen(e.to_string()))
-    })?;
-
-    let mut prover_key = Vec::new();
-    tagged_serialize(&pk, &mut prover_key)
-        .map_err(|e| ZkirError::SerializeProverKey(e.to_string()))?;
-
-    let mut verifier_key = Vec::new();
-    tagged_serialize(&vk, &mut verifier_key)
-        .map_err(|e| ZkirError::SerializeVerifierKey(e.to_string()))?;
-
-    let verifier_key_sha256 = hex::encode(Sha256::digest(&verifier_key));
-
-    Ok(CompiledKeys {
-        prover_key,
-        verifier_key,
-        verifier_key_sha256,
-        k: model.k,
-        rows: model.rows,
-    })
+    let params = prefetch_params([model.k])?;
+    compile_keys_with_cached_params(ir, model, &params)
 }
 
 #[derive(Serialize)]

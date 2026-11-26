@@ -1,16 +1,19 @@
 pub mod status;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use compact_artifacts::{render_contract_info, render_contract_manifest};
 use compact_ast::Ast;
 use compact_circuit::lower_to_circuits;
 use compact_codegen_ts::{TsCodegenError, TsCodegenInput, generate_ts};
-use compact_codegen_zkir::{ZkirError, analyze_model, compile_keys_with_model, generate_zkir};
+use compact_codegen_zkir::{
+    ZkirError, analyze_model, compile_keys_with_cached_params, default_keygen_jobs, generate_zkir,
+    prefetch_params, run_bounded_parallel, schedule_lpt,
+};
 use compact_diagnostics::DiagnosticBag;
 use compact_fixup::fixup_source as run_fixup_source;
 pub use compact_fixup::{FixupOptions, FixupOutput};
@@ -127,6 +130,8 @@ pub struct BuildOptions {
     pub source: PathBuf,
     pub target: PathBuf,
     pub skip_zk: bool,
+    /// Maximum number of circuits to keygen concurrently (`None` uses [`default_keygen_jobs`]).
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,34 +234,69 @@ pub fn build_with_reporter(
         }
 
         if !options.skip_zk {
-            let compiled_keys = zkir_outputs
+            // Stage 1: Analyze Halo2 cost models in parallel (`rayon`) to discover all `(k, rows)`.
+            let analyzed: Vec<(usize, compact_codegen_zkir::CircuitModelSummary)> = zkir_outputs
                 .par_iter()
-                .map(|z| {
-                    let model = analyze_model(&z.ir);
-                    reporter.status(
-                        "Keygen",
-                        &format!("{} (k={}, {} rows)", z.name, model.k, model.rows),
-                    );
-                    compile_keys_with_model(&z.ir, model).map(|keys| (z.name.clone(), keys))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .enumerate()
+                .map(|(idx, z)| (idx, analyze_model(&z.ir)))
+                .collect();
 
+            // Stage 2: Deduplicate `k` values and prefetch KZG SRS params ONCE via a single
+            // short-lived Tokio runtime (dropped before CPU keygen begins).
+            let unique_ks: BTreeSet<u8> = analyzed.iter().map(|(_, m)| m.k).collect();
+            let k_list: Vec<String> = unique_ks.iter().map(|k| k.to_string()).collect();
+            reporter.status(
+                "Fetching",
+                &format!("KZG parameters for k={{{}}}", k_list.join(", ")),
+            );
+            let cached_params = prefetch_params(unique_ks)?;
+
+            // Stage 3: LPT-scheduled bounded-concurrency keygen (`std::thread::scope`) sharing
+            // the zero-copy `CachedParamsProvider` (`Arc<ParamsKZG>`) and streaming `.prover` /
+            // `.verifier` directly to disk so key buffers are dropped immediately on completion.
             let keys_dir = options.target.join("keys");
             fs::create_dir_all(&keys_dir).map_err(|source| DriverError::PrepareDir {
                 path: keys_dir.clone(),
                 source,
             })?;
 
-            for (name, keys) in compiled_keys {
-                let pk_path = keys_dir.join(format!("{name}.prover"));
-                write_file(&pk_path, &keys.prover_key)?;
+            let scheduled = schedule_lpt(analyzed, |(_, m)| (m.k, m.rows));
+            let total = scheduled.len();
+            let jobs = options
+                .jobs
+                .unwrap_or_else(|| default_keygen_jobs(total))
+                .max(1);
+            let started_count = AtomicUsize::new(0);
+
+            let key_artifacts = run_bounded_parallel(
+                scheduled,
+                jobs,
+                |&(idx, model), _| -> Result<(String, String, PathBuf, PathBuf), DriverError> {
+                    let z = &zkir_outputs[idx];
+                    let seq = started_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    reporter.status(
+                        "Keygen",
+                        &format!(
+                            "{} (k={}, {} rows) [{seq}/{total}]",
+                            z.name, model.k, model.rows
+                        ),
+                    );
+                    let keys = compile_keys_with_cached_params(&z.ir, model, &cached_params)?;
+
+                    let pk_path = keys_dir.join(format!("{}.prover", z.name));
+                    write_file(&pk_path, &keys.prover_key)?;
+
+                    let vk_path = keys_dir.join(format!("{}.verifier", z.name));
+                    write_file(&vk_path, &keys.verifier_key)?;
+
+                    Ok((z.name.clone(), keys.verifier_key_sha256, pk_path, vk_path))
+                },
+            )?;
+
+            for (name, sha256, pk_path, vk_path) in key_artifacts {
                 written_files.push(pk_path);
-
-                let vk_path = keys_dir.join(format!("{name}.verifier"));
-                write_file(&vk_path, &keys.verifier_key)?;
                 written_files.push(vk_path);
-
-                verifier_key_hashes.insert(name, keys.verifier_key_sha256);
+                verifier_key_hashes.insert(name, sha256);
             }
         }
     }
@@ -485,6 +525,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -552,6 +593,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -605,6 +647,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -674,6 +717,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -726,6 +770,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -795,6 +840,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -847,6 +893,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -895,6 +942,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -952,6 +1000,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )
@@ -1011,6 +1060,7 @@ mod tests {
                 source: src_path.clone(),
                 target: out_dir.clone(),
                 skip_zk: true,
+                jobs: None,
             },
             &build_reporter,
         )

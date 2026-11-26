@@ -139,6 +139,7 @@ fn conformance_positive_corpus() {
                     source: path.clone(),
                     target: out_dir,
                     skip_zk: true,
+                    jobs: None,
                 },
                 &SilentReporter,
             )
@@ -201,6 +202,7 @@ fn conformance_test_contracts() {
                     source: path.clone(),
                     target: dir.path().join("out"),
                     skip_zk: true,
+                    jobs: None,
                 },
                 &SilentReporter,
             )
@@ -224,6 +226,7 @@ fn conformance_test_contracts() {
                     source: path.clone(),
                     target: dir.path().join("out"),
                     skip_zk: true,
+                    jobs: None,
                 },
                 &SilentReporter,
             )
