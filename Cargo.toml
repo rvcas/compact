@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100.0"
+repository = "https://github.com/rvcas/compact"
 
 [workspace.dependencies]
 # Internal crates
@@ -51,3 +52,8 @@ soa-rs = "1.0"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
