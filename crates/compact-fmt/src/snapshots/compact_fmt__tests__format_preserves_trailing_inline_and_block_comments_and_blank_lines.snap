@@ -1,0 +1,50 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+// License header line 1
+// License header line 2
+
+import CompactStandardLibrary; // stdlib import
+
+struct Config {
+  // Threshold comment
+  threshold: Uint<64>; // inline field comment
+  owner: Bytes<32>;
+}
+
+export circuit run(x: Field): Field {
+  const a = x + 1; // keep trailing
+
+  // Section 2
+  const b = a * 2;
+  if (x == 0) {
+    /* keep inside empty block */
+  }
+  return b; // final return
+  // trailing inside block
+}
+// EOF comment
+===
+// License header line 1
+// License header line 2
+
+import CompactStandardLibrary; // stdlib import
+
+struct Config {
+  // Threshold comment
+  threshold: Uint<64>; // inline field comment
+  owner: Bytes<32>;
+}
+
+export circuit run(x: Field): Field {
+  const a = x + 1; // keep trailing
+
+  // Section 2
+  const b = a * 2;
+  if (x == 0) {
+    /* keep inside empty block */
+  }
+  return b; // final return
+  // trailing inside block
+}
+// EOF comment

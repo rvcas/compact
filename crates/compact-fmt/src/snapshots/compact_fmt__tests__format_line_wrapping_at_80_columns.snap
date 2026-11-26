@@ -1,0 +1,42 @@
+---
+source: crates/compact-fmt/src/lib.rs
+---
+import CompactStandardLibrary;
+export { Maybe, Either, ShieldedCoinInfo, QualifiedShieldedCoinInfo, ContractAddress, ZswapCoinPublicKey }
+export circuit compute_tiered_bonus_score(user_account_balance: Uint<64>, transaction_total_amount: Uint<64>, accumulated_loyalty_points: Uint<64>, account_age_in_months: Uint<64>): Uint<64> {
+  const total = (user_account_balance + transaction_total_amount) + accumulated_loyalty_points + account_age_in_months;
+  const ok = user_account_balance > 0 && transaction_total_amount > 0 && accumulated_loyalty_points >= 10 && account_age_in_months >= 1;
+  assert(ok, "all bonus eligibility conditions must hold before payout");
+  const res = ok ? total : transaction_total_amount;
+  return res;
+}
+===
+import CompactStandardLibrary;
+
+export {
+  Maybe,
+  Either,
+  ShieldedCoinInfo,
+  QualifiedShieldedCoinInfo,
+  ContractAddress,
+  ZswapCoinPublicKey
+};
+
+export circuit compute_tiered_bonus_score(
+  user_account_balance: Uint<64>,
+  transaction_total_amount: Uint<64>,
+  accumulated_loyalty_points: Uint<64>,
+  account_age_in_months: Uint<64>
+): Uint<64> {
+  const total = user_account_balance +
+    transaction_total_amount +
+    accumulated_loyalty_points +
+    account_age_in_months;
+  const ok = user_account_balance > 0 &&
+    transaction_total_amount > 0 &&
+    accumulated_loyalty_points >= 10 &&
+    account_age_in_months >= 1;
+  assert(ok, "all bonus eligibility conditions must hold before payout");
+  const res = ok ? total : transaction_total_amount;
+  return res;
+}

@@ -267,24 +267,28 @@ fn conformance_formatter_corpus_idempotent() {
     let inputs = collect_compact_files(&corpus_root().join("examples/formatter/input"));
     assert_eq!(inputs.len(), 14, "unexpected formatter corpus input count");
     for path in &inputs {
-        let first = format_file(&FormatFileOptions {
-            source: path.clone(),
-            target: None,
-            line_length: 80,
-        })
-        .unwrap_or_else(|e| panic!("failed to format {}: {e}", path.display()));
-        let second = compact_driver::format_source(path, &first, 80).unwrap_or_else(|e| {
-            panic!(
-                "formatted output failed to re-parse {}: {e}",
+        for width in [40usize, 80, 100] {
+            let first = format_file(&FormatFileOptions {
+                source: path.clone(),
+                target: None,
+                line_length: width,
+            })
+            .unwrap_or_else(|e| {
+                panic!("failed to format {} at width {width}: {e}", path.display())
+            });
+            let second = compact_driver::format_source(path, &first, width).unwrap_or_else(|e| {
+                panic!(
+                    "formatted output failed to re-parse {} at width {width}: {e}",
+                    path.display()
+                )
+            });
+            assert_eq!(
+                first,
+                second,
+                "formatter not idempotent on {} at width {width}",
                 path.display()
-            )
-        });
-        assert_eq!(
-            first,
-            second,
-            "formatter not idempotent on {}",
-            path.display()
-        );
+            );
+        }
     }
 }
 

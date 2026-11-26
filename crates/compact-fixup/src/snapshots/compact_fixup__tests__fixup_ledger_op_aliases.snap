@@ -46,9 +46,16 @@ constructor() {
   counter.resetToDefault();
   items.insertCoin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
   items.isEmpty();
-  map_items.insertCoin(1 as Field, default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  map_items.insertCoin(
+    1 as Field,
+    default<ShieldedCoinInfo>,
+    default<Either<ZswapCoinPublicKey, ContractAddress>>
+  );
   map_items.insertDefault(2 as Field);
-  list_items.pushFrontCoin(default<ShieldedCoinInfo>, default<Either<ZswapCoinPublicKey, ContractAddress>>);
+  list_items.pushFrontCoin(
+    default<ShieldedCoinInfo>,
+    default<Either<ZswapCoinPublicKey, ContractAddress>>
+  );
   list_items.popFront();
   hmt.checkRoot(default<MerkleTreeDigest>);
   hmt.insertHash(default<Bytes<32>>);
