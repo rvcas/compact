@@ -1,0 +1,34 @@
+{
+  "name": "@rvcas/midnight-native",
+  "version": "0.1.0",
+  "description": "Native napi-rs engine (Impact VM, crypto, and multi-core Halo2 ZKIR prover) for @rvcas/midnight",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rvcas/compact.git",
+    "directory": "packages/native"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "napi": {
+    "binaryName": "midnight-native",
+    "packageName": "@rvcas/midnight-native",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  }
+}

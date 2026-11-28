@@ -2,3 +2,8 @@
 target/
 compact-scheme/
 out/
+node_modules/
+packages/*/dist/
+packages/native/*.node
+packages/native/index.js
+packages/native/index.d.ts

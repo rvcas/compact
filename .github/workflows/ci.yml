@@ -64,3 +64,29 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  sdk:
+    name: SDK Build, Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+          echo "::add-matcher::.github/rust-matcher.json"
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1.22.0
+        with:
+          cache: true
+      - name: Install JS dependencies
+        run: vp install
+      - name: Build native addon and SDK
+        run: vp run -r build
+      - name: Build Compact CLI for e2e
+        run: vp run build:cli
+      - name: Vite+ Check
+        run: vp check
+      - name: Vite+ Test
+        run: vp test

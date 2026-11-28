@@ -1,0 +1,53 @@
+{
+  "name": "@rvcas/midnight",
+  "version": "0.1.0",
+  "description": "Pure-ESM TypeScript SDK for Midnight with embedded native (napi-rs) and WASM proving, Impact VM, and Compact contract runtime",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rvcas/compact.git",
+    "directory": "packages/midnight"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./compact": {
+      "types": "./dist/compact.d.mts",
+      "default": "./dist/compact.mjs"
+    },
+    "./node": {
+      "types": "./dist/node.d.mts",
+      "default": "./dist/node.mjs"
+    },
+    "./wasm": {
+      "types": "./dist/wasm.d.mts",
+      "default": "./dist/wasm.mjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.mts",
+      "default": "./dist/testing.mjs"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.mts",
+      "default": "./dist/vite.mjs"
+    }
+  },
+  "dependencies": {
+    "@rvcas/midnight-native": "workspace:*"
+  },
+  "peerDependencies": {
+    "vite": ">=6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  }
+}
